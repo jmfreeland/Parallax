@@ -1,11 +1,11 @@
-# LQD static fixture workflow
+# LQD snapshot workflow
 
-`src/build_lqd_fixture.py` normalizes the current iShares LQD holdings to a
-compact bond-level schema at `data/fixtures/lqd_bonds.csv`. Run it from the
+`src/build_lqd_snapshot.py` normalizes the current iShares LQD holdings to a
+compact bond-level schema at `data/snapshots/lqd_bonds.csv`. Run it from the
 project root with:
 
 ```powershell
-uv run python -m src.build_lqd_fixture
+uv run python -m src.build_lqd_snapshot
 ```
 
 The output contains only `Fixed Income` records with an ISIN. Coupon, yield,
@@ -16,7 +16,7 @@ ISO-formatted. Source holdings date is included on each row.
 Issuer equity tickers are not inferred directly from bond ISINs. Unique exact
 GLEIF legal-entity to SEC matches are applied automatically; manual mappings
 can be added to `issuer_ticker_map.csv` after review. Parent-company candidates,
-ambiguous matches, and unresolved issuers stay blank in the fixture. The Home
+ambiguous matches, and unresolved issuers stay blank in the snapshot. The Home
 Depot mapping uses ticker `HD` as shown in its [SEC filing](https://www.sec.gov/Archives/edgar/data/354950/000162828026038247/hd-20260503.htm).
 
 To generate issuer-entity and SEC ticker candidates for review, set
@@ -31,7 +31,7 @@ uv run python -m src.resolve_lqd_tickers
 The resolver queries GLEIF by one representative ISIN per issuer name, caches
 those responses under `data/reference/`, and compares GLEIF legal names with
 the SEC company ticker file. A unique exact legal-entity match is written to
-`issuer_ticker_map.csv` as an automated exact match and applied to the fixture.
+`issuer_ticker_map.csv` as an automated exact match and applied to the snapshot.
 If the issuer name has no exact ticker match, the resolver checks the GLEIF
 direct parent and reports any parent ticker as a separate review candidate.
 Ambiguous share classes and parent matches are not applied automatically.
@@ -67,5 +67,5 @@ equity ticker until you enter a manual override.
 
 The generated CSV is an internal static snapshot for the Parallax project.
 Its source URL and `source_as_of_date` are preserved for traceability. Refresh
-it deliberately when a newer test snapshot is wanted; ordinary test runs
+it deliberately when a newer snapshot is wanted; ordinary test runs
 should consume the committed snapshot without making a network request.

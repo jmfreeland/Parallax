@@ -32,7 +32,7 @@ market value summaries:
 python -m src.lqd_inspector
 ```
 
-## Build a Parallax fixture
+## Build a Parallax snapshot
 
 The normalized bond snapshot generator is documented in `data/README.md`.
 It leaves issuer equity tickers blank unless a reviewed mapping is present in

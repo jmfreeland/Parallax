@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.build_lqd_fixture import normalize_issuer_name
+from src.build_lqd_snapshot import normalize_issuer_name
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,7 +112,7 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
     for candidate in candidates.to_dict(orient="records"):
         name = candidate.get("issuer_name", "").strip()
         lei = candidate.get("issuer_lei", "").strip()
-        old = saved_by_name.get(normalize_issuer_name(name)) or saved_by_lei.get(lei, {})
+        old = saved_by_lei.get(lei) or saved_by_name.get(normalize_issuer_name(name), {})
         candidate_status = candidate.get("mapping_status", "unresolved")
         auto_ticker = candidate.get("ticker_candidate", "").strip().upper()
         override = old.get("equity_ticker_override", "").strip().upper()
@@ -284,18 +284,41 @@ class MappingWindow(QMainWindow):
         field = FIELDS[column]
         if field == "equity_ticker_override":
             override = self.table.item(row, column).text().strip().upper()
-            self.table.item(row, column).setText(override)
-            effective_column = FIELDS.index("equity_ticker")
-            candidate_column = FIELDS.index("automated_equity_ticker")
-            candidate_status_column = FIELDS.index("candidate_status")
-            status_column = FIELDS.index("mapping_status")
-            review_column = FIELDS.index("review_status")
-            effective = override
-            if not effective and self.table.item(row, candidate_status_column).text() == "exact_issuer_entity_match_auto":
-                effective = self.table.item(row, candidate_column).text().strip().upper()
-            self._set_cell(row, effective_column, effective)
-            self._set_cell(row, status_column, "manual_override" if override else self.table.item(row, candidate_status_column).text())
-            self._set_cell(row, review_column, "reviewed" if override else ("automated_exact_entity_match" if effective else "unresolved"))
+            self._set_cell(row, column, override)
+
+        shared_fields = {
+            "equity_ticker_override", "equity_exchange", "equity_country",
+            "mapping_source", "confidence", "notes",
+        }
+        if field in shared_fields:
+            lei_column = FIELDS.index("issuer_lei")
+            name_column = FIELDS.index("issuer_name")
+            row_lei = self.table.item(row, lei_column).text().strip()
+            row_name = self.table.item(row, name_column).text()
+            identity = ("LEI", row_lei) if row_lei else ("NAME", normalize_issuer_name(row_name))
+            value = self.table.item(row, column).text()
+            affected = []
+            for peer in range(self.table.rowCount()):
+                peer_lei = self.table.item(peer, lei_column).text().strip()
+                peer_name = self.table.item(peer, name_column).text()
+                peer_identity = ("LEI", peer_lei) if peer_lei else ("NAME", normalize_issuer_name(peer_name))
+                if peer_identity == identity:
+                    self._set_cell(peer, column, value)
+                    affected.append(peer)
+            if field == "equity_ticker_override":
+                effective_column = FIELDS.index("equity_ticker")
+                candidate_column = FIELDS.index("automated_equity_ticker")
+                candidate_status_column = FIELDS.index("candidate_status")
+                status_column = FIELDS.index("mapping_status")
+                review_column = FIELDS.index("review_status")
+                for peer in affected:
+                    override = self.table.item(peer, column).text().strip().upper()
+                    effective = override
+                    if not effective and self.table.item(peer, candidate_status_column).text() == "exact_issuer_entity_match_auto":
+                        effective = self.table.item(peer, candidate_column).text().strip().upper()
+                    self._set_cell(peer, effective_column, effective)
+                    self._set_cell(peer, status_column, "manual_override" if override else self.table.item(peer, candidate_status_column).text())
+                    self._set_cell(peer, review_column, "reviewed" if override else ("automated_exact_entity_match" if effective else "unresolved"))
         self.dirty_label.setText("Unsaved changes")
 
     def _set_cell(self, row: int, column: int, text: str) -> None:
@@ -340,7 +363,7 @@ class MappingWindow(QMainWindow):
         frame = pd.DataFrame(rows, columns=FIELDS)
         frame["mapping_source"] = frame["mapping_source"].fillna("")
         legacy = frame[["issuer_name", "equity_ticker", "mapping_source", "review_status"]].copy()
-        # Keep the legacy columns first for compatibility with the fixture builder.
+        # Keep the legacy columns first for compatibility with the snapshot builder.
         for field in FIELDS:
             if field not in legacy:
                 legacy[field] = frame[field]
@@ -355,23 +378,29 @@ class MappingWindow(QMainWindow):
     @staticmethod
     def _sync_fixture(records: list[dict[str, str]]) -> None:
         """Apply saved bond and equity symbols to the static snapshot."""
-        fixture_path = ROOT / "data" / "fixtures" / "lqd_bonds.csv"
+        fixture_path = ROOT / "data" / "snapshots" / "lqd_bonds.csv"
         if not fixture_path.exists():
             return
         fixture = pd.read_csv(fixture_path, dtype="string").fillna("")
-        lookup = {normalize_issuer_name(row["issuer_name"]): row for row in records}
+        by_lei = {row["issuer_lei"]: row for row in records if row["issuer_lei"]}
+        by_name = {normalize_issuer_name(row["issuer_name"]): row for row in records}
 
-        def mapping_for(issuer_name: str) -> dict[str, str]:
-            return lookup.get(normalize_issuer_name(issuer_name), {})
+        def mapping_for(issuer_name: str, issuer_lei: str = "") -> dict[str, str]:
+            return by_lei.get(issuer_lei, by_name.get(normalize_issuer_name(issuer_name), {}))
 
-        fixture["bond_ticker"] = fixture["issuer_name"].map(lambda name: mapping_for(name).get("bond_ticker", ""))
-        fixture["equity_ticker"] = fixture["issuer_name"].map(lambda name: mapping_for(name).get("equity_ticker", ""))
-        fixture["equity_exchange"] = fixture["issuer_name"].map(lambda name: mapping_for(name).get("equity_exchange", ""))
-        fixture["equity_country"] = fixture["issuer_name"].map(lambda name: mapping_for(name).get("equity_country", ""))
-        fixture["ticker_mapping_status"] = fixture["issuer_name"].map(
-            lambda name: "reviewed" if mapping_for(name).get("review_status") == "reviewed"
-            else "exact_entity_match" if mapping_for(name).get("review_status") == "automated_exact_entity_match"
+        if "issuer_lei" not in fixture:
+            fixture["issuer_lei"] = fixture["issuer_name"].map(
+                lambda name: next((row["issuer_lei"] for row in records if row["issuer_name"] == name), "")
+            )
+        fixture["bond_ticker"] = fixture.apply(lambda row: mapping_for(row["issuer_name"], row["issuer_lei"]).get("bond_ticker", ""), axis=1)
+        fixture["equity_ticker"] = fixture.apply(lambda row: mapping_for(row["issuer_name"], row["issuer_lei"]).get("equity_ticker", ""), axis=1)
+        fixture["equity_exchange"] = fixture.apply(lambda row: mapping_for(row["issuer_name"], row["issuer_lei"]).get("equity_exchange", ""), axis=1)
+        fixture["equity_country"] = fixture.apply(lambda row: mapping_for(row["issuer_name"], row["issuer_lei"]).get("equity_country", ""), axis=1)
+        fixture["ticker_mapping_status"] = fixture.apply(
+            lambda row: "reviewed" if mapping_for(row["issuer_name"], row["issuer_lei"]).get("review_status") == "reviewed"
+            else "exact_entity_match" if mapping_for(row["issuer_name"], row["issuer_lei"]).get("review_status") == "automated_exact_entity_match"
             else "unmapped"
+            , axis=1
         )
         _atomic_csv(fixture, fixture_path)
 

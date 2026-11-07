@@ -1,4 +1,4 @@
-"""Build a reviewable issuer-to-equity-ticker candidate file for the LQD fixture.
+"""Build a reviewable issuer-to-equity-ticker candidate file for the LQD snapshot.
 
 GLEIF resolves one representative bond ISIN per issuer name to a legal entity.
 The SEC company file then supplies exact legal-name ticker matches. Unique exact
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -19,13 +20,13 @@ import pandas as pd
 import requests
 
 try:
-    from .build_lqd_fixture import normalize_issuer_name
+    from .build_lqd_snapshot import normalize_issuer_name
 except ImportError:
-    from build_lqd_fixture import normalize_issuer_name
+    from build_lqd_snapshot import normalize_issuer_name
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FIXTURE = ROOT / "data" / "fixtures" / "lqd_bonds.csv"
+DEFAULT_FIXTURE = ROOT / "data" / "snapshots" / "lqd_bonds.csv"
 DEFAULT_CANDIDATES = ROOT / "data" / "issuer_ticker_candidates.csv"
 DEFAULT_CACHE = ROOT / "data" / "reference" / "gleif_issuer_cache.csv"
 DEFAULT_PARENT_CACHE = ROOT / "data" / "reference" / "gleif_parent_cache.csv"
@@ -269,11 +270,19 @@ def main() -> None:
     )
     if "issuer_lei" not in mappings:
         mappings["issuer_lei"] = ""
+    if "equity_exchange" not in mappings:
+        mappings["equity_exchange"] = ""
+    if "equity_country" not in mappings:
+        mappings["equity_country"] = ""
+    if "bond_ticker" not in mappings:
+        mappings["bond_ticker"] = ""
     # Drop prior generated exact matches so improved name rules cannot leave stale assignments.
     mappings = mappings[mappings["review_status"].str.casefold() != "automated_exact_entity_match"].copy()
     existing_keys = {
         f"LEI:{row['issuer_lei']}" if row["issuer_lei"] else f"NAME:{normalize_issuer_name(row['issuer_name'])}"
         for row in mappings.to_dict(orient="records")
+        if row["equity_ticker"].strip()
+        and row["review_status"].casefold() in {"reviewed", "automated_exact_entity_match"}
     }
     # Attach the known LEI to name-based manual rows whenever the candidate name is unambiguous.
     lei_by_normalized_name: dict[str, set[str]] = {}
@@ -303,6 +312,7 @@ def main() -> None:
             "issuer_lei": row["issuer_lei"],
             "equity_ticker": next(iter(tickers)),
             "mapping_source": f"GLEIF exact entity name {row['issuer_lei']}; SEC CIK {row['sec_cik']} ({row['exchange']})",
+            "equity_exchange": row["exchange"],
             "review_status": "automated_exact_entity_match",
         }
         existing_keys.add(key)
@@ -310,7 +320,11 @@ def main() -> None:
 
     lookup = {
         f"LEI:{row['issuer_lei']}" if row["issuer_lei"] else f"NAME:{normalize_issuer_name(row['issuer_name'])}": (
-            row["equity_ticker"].strip().upper(), row["mapping_source"], row["review_status"].strip().casefold()
+            row["equity_ticker"].strip().upper(),
+            row["mapping_source"],
+            row["review_status"].strip().casefold(),
+            row.get("equity_exchange", ""),
+            row.get("equity_country", ""),
         )
         for row in mappings.to_dict(orient="records")
         if row["equity_ticker"].strip()
@@ -318,13 +332,23 @@ def main() -> None:
     }
     candidate_leis = dict(zip(output["issuer_name"], output["issuer_lei"]))
     fixture["issuer_lei"] = fixture["issuer_name"].map(candidate_leis).fillna("")
+    if "bond_ticker" not in fixture:
+        fixture["bond_ticker"] = ""
     fixture["equity_ticker"] = fixture.apply(
-        lambda row: lookup.get(f"LEI:{row['issuer_lei']}" if row["issuer_lei"] else f"NAME:{normalize_issuer_name(row['issuer_name'])}", ("", "", ""))[0],
+        lambda row: lookup.get(f"LEI:{row['issuer_lei']}" if row["issuer_lei"] else f"NAME:{normalize_issuer_name(row['issuer_name'])}", ("", "", "", "", ""))[0],
+        axis=1,
+    )
+    fixture["equity_exchange"] = fixture.apply(
+        lambda row: lookup.get(f"LEI:{row['issuer_lei']}" if row["issuer_lei"] else f"NAME:{normalize_issuer_name(row['issuer_name'])}", ("", "", "", "", ""))[3],
+        axis=1,
+    )
+    fixture["equity_country"] = fixture.apply(
+        lambda row: lookup.get(f"LEI:{row['issuer_lei']}" if row["issuer_lei"] else f"NAME:{normalize_issuer_name(row['issuer_name'])}", ("", "", "", "", ""))[4],
         axis=1,
     )
     fixture["ticker_mapping_status"] = fixture["issuer_name"].map(
-        lambda name: "reviewed" if lookup.get(f"LEI:{candidate_leis.get(name, '')}" if candidate_leis.get(name) else f"NAME:{normalize_issuer_name(name)}", ("", "", ""))[2] == "reviewed"
-        else "exact_entity_match" if lookup.get(f"LEI:{candidate_leis.get(name, '')}" if candidate_leis.get(name) else f"NAME:{normalize_issuer_name(name)}", ("", "", ""))[2] == "automated_exact_entity_match"
+        lambda name: "reviewed" if lookup.get(f"LEI:{candidate_leis.get(name, '')}" if candidate_leis.get(name) else f"NAME:{normalize_issuer_name(name)}", ("", "", "", "", ""))[2] == "reviewed"
+        else "exact_entity_match" if lookup.get(f"LEI:{candidate_leis.get(name, '')}" if candidate_leis.get(name) else f"NAME:{normalize_issuer_name(name)}", ("", "", "", "", ""))[2] == "automated_exact_entity_match"
         else "unmapped"
     )
     fixture.to_csv(args.fixture, index=False, na_rep="")

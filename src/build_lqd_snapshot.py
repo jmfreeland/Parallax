@@ -1,4 +1,4 @@
-"""Export normalized LQD bonds as a compact, static CSV fixture.
+"""Export a normalized static snapshot of LQD bonds.
 
 Issuer equity tickers are supplied through a reviewed issuer-name mapping. A
 bond ISIN identifies the bond itself and is not treated as an equity ticker.
@@ -12,14 +12,14 @@ from pathlib import Path
 
 import pandas as pd
 
-try:  # Project-root invocation: python -m src.build_lqd_fixture
+try:  # Project-root invocation: python -m src.build_lqd_snapshot
     from .lqd_holdings import get_lqd_holdings
-except ImportError:  # src-directory invocation: python -m build_lqd_fixture
+except ImportError:  # src-directory invocation: python -m build_lqd_snapshot
     from lqd_holdings import get_lqd_holdings
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT = ROOT / "data" / "fixtures" / "lqd_bonds.csv"
+DEFAULT_OUTPUT = ROOT / "data" / "snapshots" / "lqd_bonds.csv"
 DEFAULT_TICKER_MAP = ROOT / "data" / "issuer_ticker_map.csv"
 OUTPUT_COLUMNS = [
     "source_as_of_date",
@@ -81,7 +81,18 @@ def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str, str, str]]:
         if not key or not ticker or status not in {"reviewed", "automated_exact_entity_match"}:
             continue
         if key in result:
-            raise ValueError(f"Duplicate reviewed issuer mapping for {row['issuer_name']!r}.")
+            previous = result[key]
+            if previous[0] != ticker:
+                raise ValueError(f"Conflicting ticker mappings for the same issuer identity: {row['issuer_name']!r}.")
+            if status == "reviewed" and previous[2] != "reviewed":
+                result[key] = (
+                    ticker,
+                    row["mapping_source"].strip(),
+                    status,
+                    row.get("equity_exchange", "").strip(),
+                    row.get("equity_country", "").strip(),
+                )
+            continue
         result[key] = (
             ticker,
             row["mapping_source"].strip(),
@@ -92,12 +103,12 @@ def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str, str, str]]:
     return result
 
 
-def build_fixture(
+def build_snapshot(
     holdings: pd.DataFrame,
     ticker_map: dict[str, tuple[str, str, str, str, str]],
     issuer_lei_by_name: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    """Normalize the iShares table into bond-level fixture rows."""
+    """Normalize the iShares table into bond-level snapshot rows."""
     required = {"Name", "ISIN", "Asset Class", "Sector", "Coupon (%)", "Maturity"}
     missing = required.difference(holdings.columns)
     if missing:
@@ -153,12 +164,12 @@ def main() -> None:
     if candidates_path.exists():
         candidates = pd.read_csv(candidates_path, dtype="string").fillna("")
         lei_by_name = dict(zip(candidates["issuer_name"], candidates["issuer_lei"]))
-    fixture = build_fixture(holdings, _load_ticker_map(args.ticker_map), lei_by_name)
+    snapshot = build_snapshot(holdings, _load_ticker_map(args.ticker_map), lei_by_name)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    fixture.to_csv(args.output, index=False, na_rep="")
-    mapped = int(fixture["equity_ticker"].ne("").sum())
-    print(f"Wrote {len(fixture):,} bond rows to {args.output}")
-    print(f"Reviewed issuer tickers: {mapped:,}; unmapped: {len(fixture) - mapped:,}")
+    snapshot.to_csv(args.output, index=False, na_rep="")
+    mapped = int(snapshot["equity_ticker"].ne("").sum())
+    print(f"Wrote {len(snapshot):,} bond rows to {args.output}")
+    print(f"Ticker mappings: {mapped:,}; unmapped: {len(snapshot) - mapped:,}")
 
 
 if __name__ == "__main__":
