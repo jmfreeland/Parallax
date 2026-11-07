@@ -23,6 +23,7 @@ dist/
 
 # Resolver cache of public reference lookups
 data/reference/
+data/trace/
 
 
 # Local editor and operating system files

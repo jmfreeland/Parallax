@@ -54,3 +54,20 @@ Keep the initial structure lightweight and let working code justify new packages
 ## Data and compliance
 
 Before using a source, confirm its terms permit the intended internal use, storage, derived data, and redistribution. Respect provider rate limits and attribution requirements. Do not commit credentials, licensed raw data, or sensitive portfolio information. Keep secrets in approved local configuration and document provenance and retention expectations. Synthetic examples must be conspicuously labelled.
+
+## FINRA TRACE bond history
+
+Launch `Download TRACE history` from `uv run python -m src.launcher` to start
+or resume a five-year history download for the current bond snapshot. The
+window records progress per bond, lets you correct a CUSIP, flags suspicious
+rows for review, and can retry one selected bond. Run state and normalized
+observations are stored in `data/trace/history.duckdb`; completed runs are
+exported as Parquet under `data/trace/parquet/`. Use the viewer's CSV export
+for interchange. These downloaded data files are excluded from source control.
+
+Polars performs the per-bond sanity checks. This single-process Python
+workflow does not need a shared server database. Revisit ClickHouse if the
+history becomes a shared multi-user analytical service, QuestDB if live event
+processing is introduced, or ArcticDB if versioned research datasets need
+branching and revision semantics. Confirm FINRA terms for the intended use
+and retention of any downloaded data.
