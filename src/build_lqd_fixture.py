@@ -25,8 +25,12 @@ OUTPUT_COLUMNS = [
     "source_as_of_date",
     "isin",
     "issuer_name",
+    "issuer_lei",
+    "bond_ticker",
     "equity_ticker",
     "ticker_mapping_status",
+    "equity_exchange",
+    "equity_country",
     "sector",
     "coupon_pct",
     "maturity_date",
@@ -58,8 +62,8 @@ def _numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
-def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str]]:
-    """Load reviewed and high-confidence exact entity mappings by issuer name."""
+def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str, str, str]]:
+    """Load mappings by LEI, falling back to normalized issuer name."""
     if not path.exists():
         return {}
     mappings = pd.read_csv(path, dtype="string").fillna("")
@@ -68,20 +72,31 @@ def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str]]:
     if missing:
         raise ValueError(f"Ticker map is missing required columns: {', '.join(sorted(missing))}")
 
-    result: dict[str, tuple[str, str, str]] = {}
+    result: dict[str, tuple[str, str, str, str, str]] = {}
     for row in mappings.to_dict(orient="records"):
-        key = normalize_issuer_name(row["issuer_name"])
+        lei = row.get("issuer_lei", "").strip().upper()
+        key = f"LEI:{lei}" if lei else f"NAME:{normalize_issuer_name(row['issuer_name'])}"
         ticker = row["equity_ticker"].strip().upper()
         status = row["review_status"].strip().casefold()
         if not key or not ticker or status not in {"reviewed", "automated_exact_entity_match"}:
             continue
         if key in result:
             raise ValueError(f"Duplicate reviewed issuer mapping for {row['issuer_name']!r}.")
-        result[key] = (ticker, row["mapping_source"].strip(), status)
+        result[key] = (
+            ticker,
+            row["mapping_source"].strip(),
+            status,
+            row.get("equity_exchange", "").strip(),
+            row.get("equity_country", "").strip(),
+        )
     return result
 
 
-def build_fixture(holdings: pd.DataFrame, ticker_map: dict[str, tuple[str, str]]) -> pd.DataFrame:
+def build_fixture(
+    holdings: pd.DataFrame,
+    ticker_map: dict[str, tuple[str, str, str, str, str]],
+    issuer_lei_by_name: dict[str, str] | None = None,
+) -> pd.DataFrame:
     """Normalize the iShares table into bond-level fixture rows."""
     required = {"Name", "ISIN", "Asset Class", "Sector", "Coupon (%)", "Maturity"}
     missing = required.difference(holdings.columns)
@@ -96,14 +111,21 @@ def build_fixture(holdings: pd.DataFrame, ticker_map: dict[str, tuple[str, str]]
     result["source_as_of_date"] = holdings.attrs.get("source_as_of_date") or ""
     result["isin"] = bonds["ISIN"].astype("string").str.strip().str.upper()
     result["issuer_name"] = bonds["Name"].astype("string").str.strip()
-    normalized = result["issuer_name"].map(normalize_issuer_name)
-    matched = normalized.map(ticker_map)
+    result["issuer_lei"] = result["issuer_name"].map(issuer_lei_by_name or {}).fillna("")
+    result["bond_ticker"] = bonds["Ticker"].astype("string").str.strip() if "Ticker" in bonds else ""
+    identity_keys = result.apply(
+        lambda row: f"LEI:{row['issuer_lei']}" if row["issuer_lei"] else f"NAME:{normalize_issuer_name(row['issuer_name'])}",
+        axis=1,
+    )
+    matched = identity_keys.map(ticker_map)
     result["equity_ticker"] = matched.map(lambda item: item[0] if isinstance(item, tuple) else "")
     result["ticker_mapping_status"] = matched.map(
         lambda item: "reviewed" if isinstance(item, tuple) and item[2] == "reviewed"
         else "exact_entity_match" if isinstance(item, tuple)
         else "unmapped"
     )
+    result["equity_exchange"] = matched.map(lambda item: item[3] if isinstance(item, tuple) else "")
+    result["equity_country"] = matched.map(lambda item: item[4] if isinstance(item, tuple) else "")
     result["sector"] = bonds["Sector"].astype("string").str.strip()
     result["coupon_pct"] = _numeric(bonds["Coupon (%)"])
     result["maturity_date"] = pd.to_datetime(bonds["Maturity"], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -126,7 +148,12 @@ def main() -> None:
     args = parser.parse_args()
 
     holdings = get_lqd_holdings(isin_only=False)
-    fixture = build_fixture(holdings, _load_ticker_map(args.ticker_map))
+    candidates_path = ROOT / "data" / "issuer_ticker_candidates.csv"
+    lei_by_name: dict[str, str] = {}
+    if candidates_path.exists():
+        candidates = pd.read_csv(candidates_path, dtype="string").fillna("")
+        lei_by_name = dict(zip(candidates["issuer_name"], candidates["issuer_lei"]))
+    fixture = build_fixture(holdings, _load_ticker_map(args.ticker_map), lei_by_name)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fixture.to_csv(args.output, index=False, na_rep="")
     mapped = int(fixture["equity_ticker"].ne("").sum())

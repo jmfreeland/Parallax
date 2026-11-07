@@ -51,6 +51,20 @@ The [issuer LEI report](issuer_lei_candidates.csv) records the first-stage
 ISIN-to-entity matches. In bond terms, 1,324 of 3,219 rows now have an equity
 ticker; parent and ambiguous candidates require review before assignment.
 
+## Mapping desktop app
+
+Install the project requirements and start the local PySide6 mapping editor:
+
+```powershell
+uv pip install -r requirements.txt
+uv run python -m src.mapping_app
+```
+
+The app edits `issuer_ticker_map.csv` only when **Save mappings** is pressed.
+It keeps the bond ticker and issuer equity ticker in separate fields. Automated
+parent candidates are shown as suggestions and do not become the effective
+equity ticker until you enter a manual override.
+
 The generated CSV is an internal static snapshot for the Parallax project.
 Its source URL and `source_as_of_date` are preserved for traceability. Refresh
 it deliberately when a newer test snapshot is wanted; ordinary test runs
