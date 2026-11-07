@@ -9,9 +9,11 @@ uv run python -m src.build_lqd_snapshot
 ```
 
 The output contains only `Fixed Income` records with an ISIN. Coupon, yield,
-duration, market value, and weight retain their source units, with percentages
-stored as percentage points (for example, `5.25` means 5.25%). Maturity is
-ISO-formatted. Source holdings date is included on each row.
+and duration retain their source units, with percentages stored as percentage
+points (for example, `5.25` means 5.25%). Maturity is provided as an
+ISO-formatted date plus separate numeric month and year columns. Market value
+and portfolio weight are omitted from the snapshot. Source holdings date is
+included on each row.
 
 Issuer equity tickers are not inferred directly from bond ISINs. Unique exact
 GLEIF legal-entity to SEC matches are applied automatically; manual mappings
@@ -53,17 +55,39 @@ ticker; parent and ambiguous candidates require review before assignment.
 
 ## Mapping desktop app
 
-Install the project requirements and start the local PySide6 mapping editor:
+Install the project requirements, then start the Parallax launcher:
 
 ```powershell
 uv pip install -r requirements.txt
-uv run python -m src.mapping_app
+uv run python -m src.launcher
 ```
 
+The launcher provides buttons for reviewing mappings, inspecting current
+holdings, refreshing issuer candidates, and building the bond snapshot. Its
+lower panel reports the last successful holdings download, snapshot and map
+version counts, and installed dependency versions. Use **Check latest
+versions** to compare dependencies with PyPI. You can still start the mapping
+editor directly with `uv run python -m src.mapping_app`.
+
 The app edits `issuer_ticker_map.csv` only when **Save mappings** is pressed.
-It keeps the bond ticker and issuer equity ticker in separate fields. Automated
-parent candidates are shown as suggestions and do not become the effective
-equity ticker until you enter a manual override.
+Each save also writes an immutable, timestamped copy under
+`data/mapping_versions/YYYY-MM-DD/`. It keeps the bond ticker and issuer
+equity ticker in separate fields. Automated parent candidates are shown as
+suggestions and do not become the effective equity ticker until you enter a
+manual override. Saving the map does not alter the published bond snapshot.
+The mapping table includes a sortable ISIN count from the current snapshot and
+opens with the highest-count issuers first. Build a fresh snapshot to refresh
+those counts. **Final ticker** shows the automatic candidate after any manual
+override. **Snapshot ticker** and its status show whether the current generated
+CSV has that value; save the map and rebuild the snapshot to apply pending
+changes. A coverage summary above the table counts mapped issuer identities
+that already match the current snapshot. Use the snapshot ticker filter to show
+only rows with a missing or present ticker in the current CSV.
+
+To publish a bond file using the current downloaded LQD holdings and the
+current map, run `uv run python -m src.build_lqd_snapshot`. The map history
+preserves review decisions; the generated snapshot contains the holdings and
+mapping results for that build.
 
 The generated CSV is an internal static snapshot for the Parallax project.
 Its source URL and `source_as_of_date` are preserved for traceability. Refresh

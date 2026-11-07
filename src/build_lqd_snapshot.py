@@ -25,19 +25,19 @@ OUTPUT_COLUMNS = [
     "source_as_of_date",
     "isin",
     "issuer_name",
-    "issuer_lei",
-    "bond_ticker",
     "equity_ticker",
     "ticker_mapping_status",
-    "equity_exchange",
-    "equity_country",
     "sector",
     "coupon_pct",
     "maturity_date",
+    "maturity_month",
+    "maturity_year",
     "yield_to_maturity_pct",
     "modified_duration_years",
-    "market_value_usd",
-    "portfolio_weight_pct",
+    "issuer_lei",
+    "bond_ticker",
+    "equity_exchange",
+    "equity_country",
 ]
 
 
@@ -139,11 +139,12 @@ def build_snapshot(
     result["equity_country"] = matched.map(lambda item: item[4] if isinstance(item, tuple) else "")
     result["sector"] = bonds["Sector"].astype("string").str.strip()
     result["coupon_pct"] = _numeric(bonds["Coupon (%)"])
-    result["maturity_date"] = pd.to_datetime(bonds["Maturity"], errors="coerce").dt.strftime("%Y-%m-%d")
+    maturity_dates = pd.to_datetime(bonds["Maturity"], errors="coerce")
+    result["maturity_date"] = maturity_dates.dt.strftime("%Y-%m-%d")
+    result["maturity_month"] = maturity_dates.dt.month
+    result["maturity_year"] = maturity_dates.dt.year
     result["yield_to_maturity_pct"] = _numeric(bonds["YTM (%)"]) if "YTM (%)" in bonds else pd.NA
     result["modified_duration_years"] = _numeric(bonds["Mod. Duration"]) if "Mod. Duration" in bonds else pd.NA
-    result["market_value_usd"] = _numeric(bonds["Market Value"]) if "Market Value" in bonds else pd.NA
-    result["portfolio_weight_pct"] = _numeric(bonds["Weight (%)"]) if "Weight (%)" in bonds else pd.NA
 
     result = result[OUTPUT_COLUMNS].sort_values("isin").reset_index(drop=True)
     if result["isin"].duplicated().any():

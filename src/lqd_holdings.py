@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import csv
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
 from io import StringIO
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -13,6 +18,30 @@ HOLDINGS_URL = (
     "https://www.ishares.com/us/products/239566/"
     "ishares-iboxx-investment-grade-corporate-bond-etf/latest-holdings.csv"
 )
+ROOT = Path(__file__).resolve().parents[1]
+DOWNLOAD_STATUS_PATH = ROOT / "data" / "reference" / "last_lqd_download.json"
+
+
+def _record_download(source_as_of_date: str | None, holdings: pd.DataFrame) -> None:
+    """Keep local metadata for the launcher diagnostics panel."""
+    DOWNLOAD_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "downloaded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source_as_of_date": source_as_of_date or "",
+        "rows_returned": len(holdings),
+        "rows_with_isin": int(
+            holdings[next(column for column in holdings.columns if column.strip().upper() == "ISIN")]
+            .notna()
+            .sum()
+        ),
+    }
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=DOWNLOAD_STATUS_PATH.parent, delete=False
+    ) as temp:
+        json.dump(payload, temp, indent=2)
+        temp.write("\n")
+        temp_path = Path(temp.name)
+    os.replace(temp_path, DOWNLOAD_STATUS_PATH)
 
 
 def get_lqd_holdings(isin_only: bool = True) -> pd.DataFrame:
@@ -68,7 +97,9 @@ def get_lqd_holdings(isin_only: bool = True) -> pd.DataFrame:
             raise ValueError("The iShares holdings table did not contain an ISIN column.")
         holdings = holdings[holdings[isin_column].notna()]
 
-    return holdings.reset_index(drop=True)
+    holdings = holdings.reset_index(drop=True)
+    _record_download(source_as_of_date, holdings)
+    return holdings
 
 
 if __name__ == "__main__":

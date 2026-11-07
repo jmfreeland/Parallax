@@ -24,13 +24,17 @@ The returned DataFrame includes the other columns supplied by iShares as well.
 
 ## Inspect
 
-Print the latest holdings in a readable table, followed by row counts and any
-available asset class, security type, sector, rating, portfolio weight, and
-market value summaries:
+Open a searchable desktop table of the latest holdings:
 
 ```powershell
 python -m src.lqd_inspector
 ```
+
+Use the search box to filter across columns or **Refresh** to download the
+latest iShares holdings again. Select **Built bond snapshot** to inspect the
+locally generated `data/snapshots/lqd_bonds.csv` in the same viewer; use
+**Refresh** there to reload it after building a new snapshot. Snapshot mode
+also shows how many bond rows have a bond ticker, an equity ticker, and both.
 
 ## Build a Parallax snapshot
 

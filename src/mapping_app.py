@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,8 @@ from src.build_lqd_snapshot import normalize_issuer_name
 ROOT = Path(__file__).resolve().parents[1]
 CANDIDATES_PATH = ROOT / "data" / "issuer_ticker_candidates.csv"
 MAPPINGS_PATH = ROOT / "data" / "issuer_ticker_map.csv"
+MAPPING_VERSIONS_DIR = ROOT / "data" / "mapping_versions"
+SNAPSHOT_PATH = ROOT / "data" / "snapshots" / "lqd_bonds.csv"
 
 FIELDS = [
     "issuer_name",
@@ -52,13 +55,16 @@ FIELDS = [
 ]
 
 HEADERS = [
+    "ISIN count",
     "Issuer / company",
     "Issuer LEI",
     "Representative bond ISIN",
     "Bond ticker",
     "Automated candidate",
     "Manual override",
-    "Effective equity ticker",
+    "Final ticker",
+    "Snapshot ticker",
+    "Snapshot status",
     "Equity exchange",
     "Equity country",
     "Source",
@@ -68,6 +74,14 @@ HEADERS = [
     "Mapping status",
     "Review status",
     "Notes",
+]
+TICKER_FIELD_INDEX = FIELDS.index("equity_ticker")
+TABLE_FIELDS = [
+    "isin_count",
+    *FIELDS[: TICKER_FIELD_INDEX + 1],
+    "snapshot_ticker",
+    "snapshot_status",
+    *FIELDS[TICKER_FIELD_INDEX + 1 :],
 ]
 
 EDITABLE_FIELDS = {
@@ -79,6 +93,13 @@ EDITABLE_FIELDS = {
     "confidence",
     "notes",
 }
+
+
+class CountTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        return int(self.data(Qt.ItemDataRole.UserRole) or 0) < int(
+            other.data(Qt.ItemDataRole.UserRole) or 0
+        )
 
 
 def _candidate_confidence(status: str) -> str:
@@ -98,6 +119,8 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
 
     candidates = pd.read_csv(candidates_path, dtype="string").fillna("")
     saved = pd.read_csv(mappings_path, dtype="string").fillna("") if mappings_path.exists() else pd.DataFrame()
+    isin_counts, _, snapshot_tickers = _load_snapshot_details()
+    has_snapshot = SNAPSHOT_PATH.exists()
     saved_by_name: dict[str, dict[str, str]] = {}
     saved_by_lei: dict[str, dict[str, str]] = {}
     if not saved.empty:
@@ -131,7 +154,14 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
             "automated_exact_entity_match" if effective else "unresolved"
         )
         source = old.get("mapping_source", "").strip() or _candidate_source(candidate)
+        identity_key = f"LEI:{lei}" if lei else f"NAME:{normalize_issuer_name(name)}"
+        snapshot_ticker, snapshot_status = _compare_snapshot_ticker(
+            effective, snapshot_tickers.get(identity_key, set()), has_snapshot
+        )
         record = {
+            "isin_count": str(isin_counts.get(identity_key, 0)),
+            "snapshot_ticker": snapshot_ticker,
+            "snapshot_status": snapshot_status,
             "issuer_name": name,
             "issuer_lei": lei,
             "representative_isin": candidate.get("representative_isin", ""),
@@ -164,7 +194,17 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
             review_status = old.get("review_status", "").strip()
             if not override and review_status == "reviewed":
                 override = old_ticker
+            old_lei = old.get("issuer_lei", "").strip()
+            identity_key = f"LEI:{old_lei}" if old_lei else f"NAME:{normalize_issuer_name(name)}"
+            snapshot_ticker, snapshot_status = _compare_snapshot_ticker(
+                override or old_ticker,
+                snapshot_tickers.get(identity_key, set()),
+                has_snapshot,
+            )
             records.append({
+                "isin_count": str(isin_counts.get(identity_key, 0)),
+                "snapshot_ticker": snapshot_ticker,
+                "snapshot_status": snapshot_status,
                 "issuer_name": name,
                 "issuer_lei": old.get("issuer_lei", ""),
                 "representative_isin": old.get("representative_isin", ""),
@@ -184,6 +224,45 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
             })
 
     return records
+
+
+def _load_snapshot_details() -> tuple[dict[str, int], str, dict[str, set[str]]]:
+    if not SNAPSHOT_PATH.exists():
+        return {}, "unavailable", {}
+    snapshot = pd.read_csv(SNAPSHOT_PATH, dtype="string").fillna("")
+    source_date = snapshot["source_as_of_date"].iloc[0] if not snapshot.empty and "source_as_of_date" in snapshot else "unknown"
+    counts: dict[str, int] = {}
+    tickers: dict[str, set[str]] = {}
+    for row in snapshot.to_dict(orient="records"):
+        if not row.get("isin", "").strip():
+            continue
+        lei = row.get("issuer_lei", "").strip()
+        issuer_name = row.get("issuer_name", "").strip()
+        key = f"LEI:{lei}" if lei else f"NAME:{normalize_issuer_name(issuer_name)}"
+        if key != "NAME:":
+            counts[key] = counts.get(key, 0) + 1
+            tickers.setdefault(key, set()).add(row.get("equity_ticker", "").strip().upper())
+    return counts, str(source_date), tickers
+
+
+def _compare_snapshot_ticker(
+    final_ticker: str, snapshot_tickers: set[str], has_snapshot: bool
+) -> tuple[str, str]:
+    if not has_snapshot:
+        return "", "No snapshot built"
+    display_tickers = sorted(ticker for ticker in snapshot_tickers if ticker)
+    display = ", ".join(display_tickers)
+    if not snapshot_tickers:
+        return "", "No snapshot rows"
+    if final_ticker and snapshot_tickers == {final_ticker}:
+        return display, "Current"
+    if final_ticker and not display_tickers:
+        return "", "Pending build"
+    if final_ticker:
+        return display, "Differs or partial"
+    if display_tickers:
+        return display, "Pending clear"
+    return "", "Blank"
 
 
 def _candidate_source(candidate: dict[str, str]) -> str:
@@ -211,6 +290,8 @@ class MappingWindow(QMainWindow):
         self.setWindowTitle("Parallax — Issuer Ticker Mapping")
         self.resize(1600, 820)
         self.records = load_mapping_records()
+        _, snapshot_date, self.snapshot_tickers = _load_snapshot_details()
+        self.snapshot_exists = SNAPSHOT_PATH.exists()
         self._loading = False
 
         root = QWidget()
@@ -222,15 +303,23 @@ class MappingWindow(QMainWindow):
         self.status_filter = QComboBox()
         self.status_filter.addItem("All statuses")
         self.status_filter.addItems(sorted({record["mapping_status"] for record in self.records}))
+        self.snapshot_filter = QComboBox()
+        self.snapshot_filter.addItems(
+            ["All snapshot tickers", "Missing snapshot ticker", "Has snapshot ticker"]
+        )
         self.save_button = QPushButton("Save mappings")
-        self.dirty_label = QLabel("All changes saved")
+        self.dirty_label = QLabel()
         toolbar.addWidget(self.search, 1)
         toolbar.addWidget(self.status_filter)
+        toolbar.addWidget(self.snapshot_filter)
         toolbar.addWidget(self.dirty_label)
         toolbar.addWidget(self.save_button)
         layout.addLayout(toolbar)
+        self.coverage_label = QLabel()
+        layout.addWidget(self.coverage_label)
 
         self.table = QTableWidget(len(self.records), len(FIELDS))
+        self.table.setColumnCount(len(TABLE_FIELDS))
         self.table.setHorizontalHeaderLabels(HEADERS)
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(False)
@@ -241,47 +330,65 @@ class MappingWindow(QMainWindow):
             | QTableWidget.EditTrigger.AnyKeyPressed
         )
         self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(False)
         layout.addWidget(self.table, 1)
 
         help_text = QLabel(
             "The bond ISIN and optional bond ticker identify the debt security. "
             "Equity ticker is a separate issuer or parent listing. Automated parent matches are suggestions; "
-            "enter an override only when the relationship is clear."
+            "enter an override only when the relationship is clear. Final ticker combines the automatic "
+            "candidate and manual override. Snapshot ticker shows the current CSV; save your map and rebuild "
+            "the snapshot to apply changes."
         )
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
 
         self.setCentralWidget(root)
         self._populate_table()
+        self._update_snapshot_coverage()
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(0, Qt.SortOrder.DescendingOrder)
         self.table.cellChanged.connect(self._on_cell_changed)
         self.search.textChanged.connect(self._apply_filters)
         self.status_filter.currentTextChanged.connect(self._apply_filters)
+        self.snapshot_filter.currentTextChanged.connect(self._apply_filters)
         self.save_button.clicked.connect(self._save)
-        self.statusBar().showMessage(f"Loaded {len(self.records):,} issuer mapping records from local CSV files")
+        self._set_dirty_state(False)
+        self.statusBar().showMessage(
+            f"ISIN counts are from snapshot date {snapshot_date}; build a new snapshot to refresh them."
+        )
 
     def _populate_table(self) -> None:
         self._loading = True
         for row_index, record in enumerate(self.records):
-            for column, field in enumerate(FIELDS):
+            for column, field in enumerate(TABLE_FIELDS):
                 item = QTableWidgetItem(str(record.get(field, "")))
+                if field == "isin_count":
+                    item = CountTableWidgetItem(str(record.get(field, "0")))
+                    item.setData(Qt.ItemDataRole.UserRole, int(record.get(field, "0") or 0))
                 if field not in EDITABLE_FIELDS:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if field == "isin_count":
+                    item.setToolTip("Number of bond ISINs for this issuer in the current snapshot.")
                 if field == "confidence":
                     item.setToolTip("Use high, medium, low, or unrated. This is your confidence in the issuer-to-equity link.")
                 self.table.setItem(row_index, column, item)
         self.table.resizeColumnsToContents()
-        self.table.setColumnWidth(FIELDS.index("issuer_name"), 260)
-        self.table.setColumnWidth(FIELDS.index("issuer_lei"), 190)
-        self.table.setColumnWidth(FIELDS.index("representative_isin"), 180)
-        self.table.setColumnWidth(FIELDS.index("mapping_source"), 320)
-        self.table.setColumnWidth(FIELDS.index("notes"), 240)
+        self.table.setColumnWidth(TABLE_FIELDS.index("isin_count"), 90)
+        self.table.setColumnWidth(TABLE_FIELDS.index("issuer_name"), 260)
+        self.table.setColumnWidth(TABLE_FIELDS.index("issuer_lei"), 190)
+        self.table.setColumnWidth(TABLE_FIELDS.index("representative_isin"), 180)
+        self.table.setColumnWidth(TABLE_FIELDS.index("mapping_source"), 320)
+        self.table.setColumnWidth(TABLE_FIELDS.index("notes"), 240)
+        self.table.setColumnWidth(TABLE_FIELDS.index("snapshot_ticker"), 120)
+        self.table.setColumnWidth(TABLE_FIELDS.index("snapshot_status"), 150)
         self._loading = False
         self._apply_filters()
 
     def _on_cell_changed(self, row: int, column: int) -> None:
         if self._loading:
             return
-        field = FIELDS[column]
+        field = TABLE_FIELDS[column]
         if field == "equity_ticker_override":
             override = self.table.item(row, column).text().strip().upper()
             self._set_cell(row, column, override)
@@ -291,8 +398,8 @@ class MappingWindow(QMainWindow):
             "mapping_source", "confidence", "notes",
         }
         if field in shared_fields:
-            lei_column = FIELDS.index("issuer_lei")
-            name_column = FIELDS.index("issuer_name")
+            lei_column = TABLE_FIELDS.index("issuer_lei")
+            name_column = TABLE_FIELDS.index("issuer_name")
             row_lei = self.table.item(row, lei_column).text().strip()
             row_name = self.table.item(row, name_column).text()
             identity = ("LEI", row_lei) if row_lei else ("NAME", normalize_issuer_name(row_name))
@@ -306,11 +413,11 @@ class MappingWindow(QMainWindow):
                     self._set_cell(peer, column, value)
                     affected.append(peer)
             if field == "equity_ticker_override":
-                effective_column = FIELDS.index("equity_ticker")
-                candidate_column = FIELDS.index("automated_equity_ticker")
-                candidate_status_column = FIELDS.index("candidate_status")
-                status_column = FIELDS.index("mapping_status")
-                review_column = FIELDS.index("review_status")
+                effective_column = TABLE_FIELDS.index("equity_ticker")
+                candidate_column = TABLE_FIELDS.index("automated_equity_ticker")
+                candidate_status_column = TABLE_FIELDS.index("candidate_status")
+                status_column = TABLE_FIELDS.index("mapping_status")
+                review_column = TABLE_FIELDS.index("review_status")
                 for peer in affected:
                     override = self.table.item(peer, column).text().strip().upper()
                     effective = override
@@ -319,7 +426,58 @@ class MappingWindow(QMainWindow):
                     self._set_cell(peer, effective_column, effective)
                     self._set_cell(peer, status_column, "manual_override" if override else self.table.item(peer, candidate_status_column).text())
                     self._set_cell(peer, review_column, "reviewed" if override else ("automated_exact_entity_match" if effective else "unresolved"))
-        self.dirty_label.setText("Unsaved changes")
+                    self._refresh_snapshot_row(peer)
+        self._set_dirty_state(True)
+        self._update_snapshot_coverage()
+
+    def _set_dirty_state(self, dirty: bool) -> None:
+        if dirty:
+            self.dirty_label.setText("Unsaved changes")
+            self.dirty_label.setStyleSheet(
+                "QLabel { background: #fff0c2; color: #704b00; border: 1px solid #d6a83a; "
+                "border-radius: 4px; padding: 4px 8px; font-weight: 700; }"
+            )
+            self.save_button.setStyleSheet("font-weight: 700; border: 2px solid #d6a83a;")
+        else:
+            self.dirty_label.setText("Saved")
+            self.dirty_label.setStyleSheet(
+                "QLabel { background: #e7f3e8; color: #285c32; border: 1px solid #91bd98; "
+                "border-radius: 4px; padding: 4px 8px; font-weight: 600; }"
+            )
+            self.save_button.setStyleSheet("")
+
+    def _refresh_snapshot_row(self, row: int) -> None:
+        lei = self.table.item(row, TABLE_FIELDS.index("issuer_lei")).text().strip()
+        name = self.table.item(row, TABLE_FIELDS.index("issuer_name")).text().strip()
+        key = f"LEI:{lei}" if lei else f"NAME:{normalize_issuer_name(name)}"
+        ticker, status = _compare_snapshot_ticker(
+            self.table.item(row, TABLE_FIELDS.index("equity_ticker")).text().strip().upper(),
+            self.snapshot_tickers.get(key, set()),
+            self.snapshot_exists,
+        )
+        self._set_cell(row, TABLE_FIELDS.index("snapshot_ticker"), ticker)
+        self._set_cell(row, TABLE_FIELDS.index("snapshot_status"), status)
+
+    def _update_snapshot_coverage(self) -> None:
+        identities: dict[str, dict[str, set[str]]] = {}
+        for row in range(self.table.rowCount()):
+            lei = self.table.item(row, TABLE_FIELDS.index("issuer_lei")).text().strip()
+            name = self.table.item(row, TABLE_FIELDS.index("issuer_name")).text().strip()
+            key = f"LEI:{lei}" if lei else f"NAME:{normalize_issuer_name(name)}"
+            state = identities.setdefault(key, {"tickers": set(), "statuses": set()})
+            ticker = self.table.item(row, TABLE_FIELDS.index("equity_ticker")).text().strip().upper()
+            if ticker:
+                state["tickers"].add(ticker)
+            state["statuses"].add(self.table.item(row, TABLE_FIELDS.index("snapshot_status")).text())
+        mapped = [state for state in identities.values() if state["tickers"]]
+        current = sum(
+            state["statuses"] == {"Current"} and len(state["tickers"]) == 1
+            for state in mapped
+        )
+        self.coverage_label.setText(
+            f"Snapshot coverage: {current:,} of {len(mapped):,} mapped issuer identities match the current snapshot. "
+            f"{len(mapped) - current:,} are pending or differ."
+        )
 
     def _set_cell(self, row: int, column: int, text: str) -> None:
         self._loading = True
@@ -329,15 +487,30 @@ class MappingWindow(QMainWindow):
     def _apply_filters(self) -> None:
         query = self.search.text().strip().casefold()
         status = self.status_filter.currentText()
+        snapshot_filter = self.snapshot_filter.currentText()
         for row in range(self.table.rowCount()):
             row_text = " ".join(self.table.item(row, col).text() for col in range(self.table.columnCount())).casefold()
-            status_text = self.table.item(row, FIELDS.index("mapping_status")).text()
-            self.table.setRowHidden(row, (query not in row_text) or (status != "All statuses" and status != status_text))
+            status_text = self.table.item(row, TABLE_FIELDS.index("mapping_status")).text()
+            snapshot_ticker = self.table.item(row, TABLE_FIELDS.index("snapshot_ticker")).text().strip()
+            matches_snapshot_filter = (
+                snapshot_filter == "All snapshot tickers"
+                or (snapshot_filter == "Missing snapshot ticker" and not snapshot_ticker)
+                or (snapshot_filter == "Has snapshot ticker" and bool(snapshot_ticker))
+            )
+            self.table.setRowHidden(
+                row,
+                (query not in row_text)
+                or (status != "All statuses" and status != status_text)
+                or not matches_snapshot_filter,
+            )
 
     def _save(self) -> None:
         rows: list[dict[str, str]] = []
         for row in range(self.table.rowCount()):
-            record = {field: self.table.item(row, col).text().strip() for col, field in enumerate(FIELDS)}
+            record = {
+                field: self.table.item(row, TABLE_FIELDS.index(field)).text().strip()
+                for field in FIELDS
+            }
             override = record["equity_ticker_override"].upper()
             record["automated_equity_ticker"] = record["automated_equity_ticker"].upper()
             record["equity_ticker_override"] = override
@@ -368,41 +541,17 @@ class MappingWindow(QMainWindow):
             if field not in legacy:
                 legacy[field] = frame[field]
         legacy = legacy[["issuer_name", "equity_ticker", "mapping_source", "review_status", *[field for field in FIELDS if field not in {"issuer_name", "equity_ticker", "mapping_source", "review_status"}]]]
+        saved_at = datetime.now().astimezone()
+        version_dir = MAPPING_VERSIONS_DIR / saved_at.strftime("%Y-%m-%d")
+        version_path = version_dir / f"issuer_ticker_map_{saved_at.strftime('%H%M%S_%f%z')}.csv"
+        _atomic_csv(legacy, version_path)
         _atomic_csv(legacy, MAPPINGS_PATH)
-        self._sync_fixture(rows)
 
         self.records = rows
-        self.dirty_label.setText("All changes saved")
-        self.statusBar().showMessage(f"Saved {len(rows):,} mapping records to {MAPPINGS_PATH}", 5000)
-
-    @staticmethod
-    def _sync_fixture(records: list[dict[str, str]]) -> None:
-        """Apply saved bond and equity symbols to the static snapshot."""
-        fixture_path = ROOT / "data" / "snapshots" / "lqd_bonds.csv"
-        if not fixture_path.exists():
-            return
-        fixture = pd.read_csv(fixture_path, dtype="string").fillna("")
-        by_lei = {row["issuer_lei"]: row for row in records if row["issuer_lei"]}
-        by_name = {normalize_issuer_name(row["issuer_name"]): row for row in records}
-
-        def mapping_for(issuer_name: str, issuer_lei: str = "") -> dict[str, str]:
-            return by_lei.get(issuer_lei, by_name.get(normalize_issuer_name(issuer_name), {}))
-
-        if "issuer_lei" not in fixture:
-            fixture["issuer_lei"] = fixture["issuer_name"].map(
-                lambda name: next((row["issuer_lei"] for row in records if row["issuer_name"] == name), "")
-            )
-        fixture["bond_ticker"] = fixture.apply(lambda row: mapping_for(row["issuer_name"], row["issuer_lei"]).get("bond_ticker", ""), axis=1)
-        fixture["equity_ticker"] = fixture.apply(lambda row: mapping_for(row["issuer_name"], row["issuer_lei"]).get("equity_ticker", ""), axis=1)
-        fixture["equity_exchange"] = fixture.apply(lambda row: mapping_for(row["issuer_name"], row["issuer_lei"]).get("equity_exchange", ""), axis=1)
-        fixture["equity_country"] = fixture.apply(lambda row: mapping_for(row["issuer_name"], row["issuer_lei"]).get("equity_country", ""), axis=1)
-        fixture["ticker_mapping_status"] = fixture.apply(
-            lambda row: "reviewed" if mapping_for(row["issuer_name"], row["issuer_lei"]).get("review_status") == "reviewed"
-            else "exact_entity_match" if mapping_for(row["issuer_name"], row["issuer_lei"]).get("review_status") == "automated_exact_entity_match"
-            else "unmapped"
-            , axis=1
+        self._set_dirty_state(False)
+        self.statusBar().showMessage(
+            f"Saved current map and version {version_path.relative_to(ROOT)}", 7000
         )
-        _atomic_csv(fixture, fixture_path)
 
 
 def main() -> None:
