@@ -21,6 +21,9 @@ build/
 dist/
 *.egg-info/
 
+# Resolver cache of public reference lookups
+data/reference/
+
 
 # Local editor and operating system files
 .idea/

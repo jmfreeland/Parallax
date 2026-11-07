@@ -58,8 +58,8 @@ def _numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
-def _load_ticker_map(path: Path) -> dict[str, tuple[str, str]]:
-    """Load reviewed issuer mappings, keyed by normalized issuer name."""
+def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str]]:
+    """Load reviewed and high-confidence exact entity mappings by issuer name."""
     if not path.exists():
         return {}
     mappings = pd.read_csv(path, dtype="string").fillna("")
@@ -68,15 +68,16 @@ def _load_ticker_map(path: Path) -> dict[str, tuple[str, str]]:
     if missing:
         raise ValueError(f"Ticker map is missing required columns: {', '.join(sorted(missing))}")
 
-    result: dict[str, tuple[str, str]] = {}
+    result: dict[str, tuple[str, str, str]] = {}
     for row in mappings.to_dict(orient="records"):
         key = normalize_issuer_name(row["issuer_name"])
         ticker = row["equity_ticker"].strip().upper()
-        if not key or not ticker or row["review_status"].strip().casefold() != "reviewed":
+        status = row["review_status"].strip().casefold()
+        if not key or not ticker or status not in {"reviewed", "automated_exact_entity_match"}:
             continue
         if key in result:
             raise ValueError(f"Duplicate reviewed issuer mapping for {row['issuer_name']!r}.")
-        result[key] = (ticker, row["mapping_source"].strip())
+        result[key] = (ticker, row["mapping_source"].strip(), status)
     return result
 
 
@@ -99,7 +100,9 @@ def build_fixture(holdings: pd.DataFrame, ticker_map: dict[str, tuple[str, str]]
     matched = normalized.map(ticker_map)
     result["equity_ticker"] = matched.map(lambda item: item[0] if isinstance(item, tuple) else "")
     result["ticker_mapping_status"] = matched.map(
-        lambda item: "reviewed" if isinstance(item, tuple) else "unmapped"
+        lambda item: "reviewed" if isinstance(item, tuple) and item[2] == "reviewed"
+        else "exact_entity_match" if isinstance(item, tuple)
+        else "unmapped"
     )
     result["sector"] = bonds["Sector"].astype("string").str.strip()
     result["coupon_pct"] = _numeric(bonds["Coupon (%)"])
