@@ -16,6 +16,12 @@ from typing import Any, Callable, Iterable
 import duckdb
 import polars as pl
 
+from .trace_cleaning import (
+    TRACE_FIELD_POLICIES,
+    clean_trace_value,
+)
+from .data_preprocessing import classify_value
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SNAPSHOT = ROOT / "data" / "snapshots" / "lqd_bonds.csv"
@@ -372,8 +378,14 @@ def _quality_flags(records: list[dict[str, Any]], start_date: date, end_date: da
     if not records:
         return ["no_history"]
     dates = [_as_date(record.get("date")) for record in records]
-    prices = [_optional_float(record.get("price")) for record in records]
-    yields = [_optional_float(record.get("last_sale_yield")) for record in records]
+    raw_prices = [_optional_float(record.get("price")) for record in records]
+    raw_yields = [_optional_float(record.get("last_sale_yield")) for record in records]
+    price_reasons = [classify_value(value, TRACE_FIELD_POLICIES["price"])[1] for value in raw_prices]
+    yield_reasons = [
+        classify_value(value, TRACE_FIELD_POLICIES["last_sale_yield"])[1] for value in raw_yields
+    ]
+    prices = [clean_trace_value("price", value) for value in raw_prices]
+    yields = [clean_trace_value("last_sale_yield", value) for value in raw_yields]
     # TRACE can return sentinel and whole-number values in columns that also
     # contain floats. Give Polars explicit types rather than infer from an early
     # sample of rows.
@@ -387,19 +399,24 @@ def _quality_flags(records: list[dict[str, Any]], start_date: date, end_date: da
         }
     )
     flags: list[str] = []
-    invalid_prices = frame.filter(
-        pl.col("price").is_null()
-        | pl.col("price").is_nan()
-        | (pl.col("price") <= 0)
-        | (pl.col("price") >= 10000)
-    ).height
+    invalid_prices = frame.filter(pl.col("price").is_null()).height
     if invalid_prices:
         flags.append(f"invalid_price:{invalid_prices}")
-    missing_yields = frame.filter(
-        pl.col("last_sale_yield").is_null() | pl.col("last_sale_yield").is_nan()
-    ).height
+    sentinel_prices = price_reasons.count("sentinel")
+    if sentinel_prices:
+        flags.append(f"sentinel_price:{sentinel_prices}")
+    price_limits = price_reasons.count("outside_absolute_limit")
+    if price_limits:
+        flags.append(f"price_outside_limit:{price_limits}")
+    missing_yields = yield_reasons.count("missing") + yield_reasons.count("zero_is_missing")
     if missing_yields:
         flags.append(f"missing_yield:{missing_yields}")
+    sentinel_yields = yield_reasons.count("sentinel")
+    if sentinel_yields:
+        flags.append(f"sentinel_yield:{sentinel_yields}")
+    yield_limits = yield_reasons.count("outside_absolute_limit")
+    if yield_limits:
+        flags.append(f"yield_outside_limit:{yield_limits}")
     missing_dates = frame.filter(pl.col("date").is_null()).height
     if missing_dates:
         flags.append(f"missing_date:{missing_dates}")

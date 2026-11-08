@@ -72,9 +72,23 @@ processing is introduced, or ArcticDB if versioned research datasets need
 branching and revision semantics. Confirm FINRA terms for the intended use
 and retention of any downloaded data.
 
-Use `Inspect TRACE history` in the launcher to chart a bond's daily observed
-yield or price, and compare monthly, quarterly, or annual mean, median,
-interquartile range, and min/max. The partition table also reports trailing
-63- and 252-observation volatility and momentum. Zero yields and zero or
-sentinel prices are excluded from derived statistics; the stored source values
-remain unchanged. Rolling measures use observed trade rows, not calendar days.
+Use `Inspect TRACE history` in the launcher to chart an individual bond's
+observed yield or price, or compare a cross-sectional partition by TRACE market
+product, sector, maturity year, issuer ticker, or bond ticker. Group charts
+show mean, median, interquartile range, min/max, and trailing volatility and
+momentum over selectable time intervals. For multi-day intervals, each bond is
+averaged first so that more frequently traded issues do not dominate the group
+mean. A shared preprocessor excludes zero prices, zero yields, and TRACE
+sentinel/extreme values such as `999999.99` from derived statistics. Stored
+source values remain unchanged, and excluded-value counts are shown in the
+inspector.
+
+Run the preprocessing layer from the launcher or with
+`uv run python -m src.trace_preprocessor`. It writes a clean Parquet derivative
+and a JSON diagnostics report under `data/trace/preprocessed/`, recording the
+policy version, thresholds, input counts, exclusions by reason, and output
+paths. `src.data_preprocessing` is provider-neutral; `src.trace_cleaning`
+defines the FINRA-specific policy. The LQD snapshot is currently the download
+population input, not a canonical security master. See
+[`docs/security_master_plan.md`](docs/security_master_plan.md) for the proposed
+separation of instruments, universe membership, and exclusions.
