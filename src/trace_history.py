@@ -24,6 +24,7 @@ DATABASE_PATH = TRACE_DIR / "history.duckdb"
 DEFAULT_BATCH_SIZE = 20
 LOG_PATH = TRACE_DIR / "downloader.log"
 logger = logging.getLogger("parallax.trace_history")
+_openbb: Any | None = None
 
 JobCallback = Callable[[dict[str, Any]], None]
 ProgressCallback = Callable[[int, int], None]
@@ -49,6 +50,26 @@ def configure_logging() -> Path:
     logger.setLevel(logging.INFO)
     logger.propagate = False
     return resolved
+
+
+def initialize_provider() -> None:
+    """Import OpenBB on the main thread before any worker starts."""
+    global _openbb
+    if _openbb is not None:
+        return
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("Initialize the OpenBB FINRA provider on the main thread first.")
+    logger.info("Initializing OpenBB FINRA provider on the main thread")
+    from openbb import obb
+
+    _openbb = obb
+    logger.info("OpenBB FINRA provider initialized")
+
+
+def _provider_client() -> Any:
+    if _openbb is None:
+        raise RuntimeError("OpenBB provider is not initialized; start the run from the GUI.")
+    return _openbb
 
 
 def connect_database(path: Path = DATABASE_PATH, initialize: bool = True) -> duckdb.DuckDBPyConnection:
@@ -337,8 +358,7 @@ def update_cusip(run_id: str, isin: str, cusip: str, database_path: Path = DATAB
 
 
 def _fetch_history(identifiers: list[str], start_date: date, end_date: date) -> list[dict[str, Any]]:
-    from openbb import obb
-
+    obb = _provider_client()
     response = obb.finra.fixedincome.bond_historical(
         cusip=identifiers,
         start_date=start_date.isoformat(),
@@ -351,28 +371,62 @@ def _fetch_history(identifiers: list[str], start_date: date, end_date: date) -> 
 def _quality_flags(records: list[dict[str, Any]], start_date: date, end_date: date) -> list[str]:
     if not records:
         return ["no_history"]
-    frame = pl.DataFrame(records)
+    dates = [_as_date(record.get("date")) for record in records]
+    prices = [_optional_float(record.get("price")) for record in records]
+    yields = [_optional_float(record.get("last_sale_yield")) for record in records]
+    # TRACE can return sentinel and whole-number values in columns that also
+    # contain floats. Give Polars explicit types rather than infer from an early
+    # sample of rows.
+    frame = pl.DataFrame(
+        {
+            "date": pl.Series("date", dates, dtype=pl.Date, strict=False),
+            "price": pl.Series("price", prices, dtype=pl.Float64, strict=False),
+            "last_sale_yield": pl.Series(
+                "last_sale_yield", yields, dtype=pl.Float64, strict=False
+            ),
+        }
+    )
     flags: list[str] = []
-    if "price" in frame.columns:
-        invalid_prices = frame.filter(pl.col("price").is_null() | pl.col("price").is_nan() | (pl.col("price") <= 0)).height
-        if invalid_prices:
-            flags.append(f"invalid_price:{invalid_prices}")
-    if "last_sale_yield" in frame.columns:
-        missing_yields = frame.filter(
-            pl.col("last_sale_yield").is_null() | pl.col("last_sale_yield").is_nan()
-        ).height
-        if missing_yields:
-            flags.append(f"missing_yield:{missing_yields}")
-    if "date" in frame.columns:
-        outside = frame.filter(
-            (pl.col("date") < start_date) | (pl.col("date") > end_date)
-        ).height
-        if outside:
-            flags.append(f"date_out_of_range:{outside}")
-        duplicates = int(frame.get_column("date").is_duplicated().sum())
-        if duplicates:
-            flags.append(f"duplicate_dates:{duplicates}")
+    invalid_prices = frame.filter(
+        pl.col("price").is_null()
+        | pl.col("price").is_nan()
+        | (pl.col("price") <= 0)
+        | (pl.col("price") >= 10000)
+    ).height
+    if invalid_prices:
+        flags.append(f"invalid_price:{invalid_prices}")
+    missing_yields = frame.filter(
+        pl.col("last_sale_yield").is_null() | pl.col("last_sale_yield").is_nan()
+    ).height
+    if missing_yields:
+        flags.append(f"missing_yield:{missing_yields}")
+    missing_dates = frame.filter(pl.col("date").is_null()).height
+    if missing_dates:
+        flags.append(f"missing_date:{missing_dates}")
+    outside = frame.filter(
+        pl.col("date").is_not_null()
+        & ((pl.col("date") < start_date) | (pl.col("date") > end_date))
+    ).height
+    if outside:
+        flags.append(f"date_out_of_range:{outside}")
+    non_null_dates = frame.filter(pl.col("date").is_not_null()).get_column("date")
+    duplicates = int(non_null_dates.is_duplicated().sum())
+    if duplicates:
+        flags.append(f"duplicate_dates:{duplicates}")
     return flags
+
+
+def _as_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
 
 
 def _deduplicate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -414,17 +468,15 @@ def _store_job_result(
         flags.append(f"cusip_mismatch:{len(mismatched)}")
         status = "review"
 
+    observation_rows = []
     for record in unique_records:
         trade_date = record.get("date")
         if hasattr(trade_date, "isoformat"):
             trade_date = trade_date.isoformat()
         price = _optional_float(record.get("price"))
         sale_yield = _optional_float(record.get("last_sale_yield"))
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
+        observation_rows.append(
+            (
                 job["isin"],
                 trade_date,
                 str(record.get("cusip") or job["cusip"]).strip().upper(),
@@ -435,7 +487,12 @@ def _store_job_result(
                 sale_yield,
                 now,
                 run_id,
-            ],
+            )
+        )
+    if observation_rows:
+        connection.executemany(
+            "INSERT OR REPLACE INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            observation_rows,
         )
 
     dates = [
@@ -528,8 +585,7 @@ def _set_downloading(connection: duckdb.DuckDBPyConnection, run_id: str, jobs: l
 
 
 def _fetch_reference_symbol(cusip: str) -> str | None:
-    from openbb import obb
-
+    obb = _provider_client()
     response = obb.finra.fixedincome.bond_prices(cusip=cusip, provider="finra")
     for record in response.results:
         symbol = getattr(record, "symbol", None)
@@ -633,9 +689,26 @@ def download_run(
                         result["status"] = "failed"
                         result["last_error"] = batch_error
                     connection.commit()
-                except Exception:
+                except Exception as error:
                     connection.rollback()
-                    raise
+                    logger.exception(
+                        "Run %s failed while processing bond %s; continuing",
+                        run_id,
+                        job["isin"],
+                    )
+                    connection.execute(
+                        """UPDATE run_bonds SET status='failed', last_error=?,
+                           updated_at_utc=? WHERE run_id=? AND isin=?""",
+                        [str(error), _now(), run_id, job["isin"]],
+                    )
+                    connection.commit()
+                    result = {
+                        **job,
+                        "status": "failed",
+                        "last_error": str(error),
+                        "observation_count": 0,
+                        "quality_flags": [],
+                    }
                 completed += 1
                 logger.info(
                     "Run %s bond result: isin=%s status=%s rows=%d flags=%s",
@@ -644,6 +717,16 @@ def download_run(
                 )
                 on_job(result)
                 on_progress(completed, int(total))
+
+            if batch_error:
+                # A batch-wide failure is likely systemic (provider startup,
+                # connectivity, or endpoint outage). Stop here so one such
+                # problem does not mark the entire universe failed.
+                logger.error(
+                    "Run %s paused after a batch-wide error; remaining bonds stay resumable",
+                    run_id,
+                )
+                break
 
         pending = connection.execute(
             "SELECT count(*) FROM run_bonds WHERE run_id = ? AND status IN ('pending','downloading','failed')",

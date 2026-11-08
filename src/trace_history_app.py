@@ -111,7 +111,10 @@ class TraceHistoryWindow(QMainWindow):
         controls.addWidget(self.start_date)
         controls.addWidget(QLabel("to"))
         controls.addWidget(self.end_date)
-        self.new_run_button = QPushButton("New download run")
+        self.new_run_button = QPushButton("Create + start new run")
+        self.new_run_button.setToolTip(
+            "Create a fresh run for this date range and start downloading immediately."
+        )
         self.new_run_button.clicked.connect(self._new_run)
         self.resume_button = QPushButton("Start / resume")
         self.resume_button.clicked.connect(self._resume_run)
@@ -197,7 +200,16 @@ class TraceHistoryWindow(QMainWindow):
         if start_date > end_date:
             QMessageBox.warning(self, "Invalid date range", "Start date must be on or before end date.")
             return
+        self.statusBar().showMessage(
+            "Loading the FINRA provider and preparing a new run…"
+            if not resume else "Loading the FINRA provider and looking for a run to resume…"
+        )
+        self._set_controls_enabled(False)
+        QApplication.processEvents()
         try:
+            # OpenBB's first import installs process signal handlers and must
+            # happen on the main thread. The downloader worker reuses this client.
+            trace_history.initialize_provider()
             self.run_id, reused = trace_history.prepare_run(
                 trace_history.DEFAULT_SNAPSHOT,
                 start_date,
@@ -205,8 +217,15 @@ class TraceHistoryWindow(QMainWindow):
                 resume=resume,
             )
         except Exception as error:
+            logger.exception("Could not initialize or prepare a TRACE run")
+            self._set_controls_enabled(True)
             QMessageBox.critical(self, "Could not prepare download", str(error))
+            self.statusBar().showMessage("Run setup failed. See the error dialog.")
             return
+        self.statusBar().showMessage(
+            f"{'Resuming' if reused else 'New'} run {self.run_id}: loading bond list…"
+        )
+        QApplication.processEvents()
         self._refresh_jobs()
         label = "Resuming" if reused else "Starting"
         self.statusBar().showMessage(f"{label} run {self.run_id}")
@@ -284,11 +303,11 @@ class TraceHistoryWindow(QMainWindow):
         item = self.table.item(row, COL_STATUS)
         status = item.text() if item else ""
         colors = {
-            "downloaded": ("#e7f3e8", "#285c32"),
-            "review": ("#fff0c2", "#704b00"),
-            "failed": ("#f9dada", "#7a2424"),
-            "needs_review": ("#f9dada", "#7a2424"),
-            "downloading": ("#dceaf7", "#1d4f7a"),
+            "downloaded": ("#edf4ee", "#405b45"),
+            "review": ("#f7f2e3", "#685b36"),
+            "failed": ("#f5eded", "#704b4b"),
+            "needs_review": ("#f5f0f0", "#704b4b"),
+            "downloading": ("#edf1f5", "#45576b"),
         }
         background, foreground = colors.get(status, ("#ffffff", "#202020"))
         if item:
@@ -338,6 +357,11 @@ class TraceHistoryWindow(QMainWindow):
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(len(jobs))
         for row, job in enumerate(jobs):
+            if row % 100 == 0:
+                self.statusBar().showMessage(
+                    f"Loading bond list into viewer: {row:,} of {len(jobs):,} bonds"
+                )
+                QApplication.processEvents()
             self.row_by_isin[str(job["isin"])] = row
             values = [
                 job.get("isin") or "",

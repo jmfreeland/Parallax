@@ -71,3 +71,10 @@ history becomes a shared multi-user analytical service, QuestDB if live event
 processing is introduced, or ArcticDB if versioned research datasets need
 branching and revision semantics. Confirm FINRA terms for the intended use
 and retention of any downloaded data.
+
+Use `Inspect TRACE history` in the launcher to chart a bond's daily observed
+yield or price, and compare monthly, quarterly, or annual mean, median,
+interquartile range, and min/max. The partition table also reports trailing
+63- and 252-observation volatility and momentum. Zero yields and zero or
+sentinel prices are excluded from derived statistics; the stored source values
+remain unchanged. Rolling measures use observed trade rows, not calendar days.

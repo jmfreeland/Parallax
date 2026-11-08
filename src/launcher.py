@@ -106,6 +106,7 @@ class LauncherWindow(QMainWindow):
             ("Refresh issuer candidates", "src.resolve_lqd_tickers"),
             ("Build bond snapshot", "src.build_lqd_snapshot"),
             ("Download TRACE history", "src.trace_history_app"),
+            ("Inspect TRACE history", "src.trace_history_inspector"),
         )
         self.buttons: list[QPushButton] = []
         for index, (label, module) in enumerate(actions):
