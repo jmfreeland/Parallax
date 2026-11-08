@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -150,25 +152,46 @@ def load_group_data(
     measure: str,
     interval: str,
     run_info: dict[str, Any],
+    minimum_coverage_pct: float = 50.0,
     database_path: Path = DATABASE_PATH,
-) -> list[tuple[Any, ...]]:
+) -> tuple[list[tuple[Any, ...]], int, int]:
     dimension_expression = _dimension_sql(dimension)
     value_sql, _ = _measure_sql(measure)
     interval_unit = {"Daily": "day", "Monthly": "month", "Quarterly": "quarter", "Yearly": "year"}[interval]
     connection = duckdb.connect()
     try:
-        return connection.execute(
+        rows = connection.execute(
             f"""WITH raw AS (
-                    SELECT o.isin, o.trade_date, {dimension_expression} AS group_value,
+                    SELECT o.isin, o.issuer_name, o.trade_date,
+                           {dimension_expression} AS group_value,
                            o.{value_sql} AS value
                     FROM read_parquet(?) o
+                ), first_seen AS (
+                    SELECT group_value, isin, min(trade_date) AS first_date
+                    FROM raw GROUP BY group_value, isin
                 ), per_bond AS (
-                    SELECT group_value, isin,
+                    SELECT group_value, isin, any_value(issuer_name) AS description,
                            date_trunc('{interval_unit}', trade_date)::DATE AS period,
                            avg(value) AS bond_value
                     FROM raw
                     WHERE value IS NOT NULL
                     GROUP BY group_value, isin, period
+                ), ranked_bonds AS (
+                    SELECT *,
+                           row_number() OVER (
+                               PARTITION BY group_value, period ORDER BY bond_value, isin
+                           ) AS min_rank,
+                           row_number() OVER (
+                               PARTITION BY group_value, period ORDER BY bond_value DESC, isin
+                           ) AS max_rank
+                    FROM per_bond
+                ), extrema AS (
+                    SELECT group_value, period,
+                           max(isin) FILTER (WHERE min_rank=1) AS min_isin,
+                           max(description) FILTER (WHERE min_rank=1) AS min_description,
+                           max(isin) FILTER (WHERE max_rank=1) AS max_isin,
+                           max(description) FILTER (WHERE max_rank=1) AS max_description
+                    FROM ranked_bonds GROUP BY group_value, period
                 ), cross_section AS (
                     SELECT group_value, period, count(*) AS bonds,
                         avg(bond_value) AS mean, median(bond_value) AS median,
@@ -176,6 +199,28 @@ def load_group_data(
                         quantile_cont(bond_value, 0.75) AS p75,
                         min(bond_value) AS minimum, max(bond_value) AS maximum
                     FROM per_bond GROUP BY group_value, period
+                ), cross_section_extrema AS (
+                    SELECT c.*, e.min_isin, e.min_description, e.max_isin, e.max_description
+                    FROM cross_section c
+                    JOIN extrema e USING (group_value, period)
+                ), coverage AS (
+                    SELECT c.group_value, c.period, c.bonds,
+                           count(f.isin) AS active_bonds,
+                           c.bonds * 100.0 / nullif(count(f.isin), 0) AS coverage_pct,
+                           c.mean, c.median, c.p25, c.p75, c.minimum, c.maximum,
+                           c.min_isin, c.min_description, c.max_isin, c.max_description
+                    FROM cross_section_extrema c
+                    LEFT JOIN first_seen f ON f.group_value=c.group_value
+                         AND f.first_date < c.period + INTERVAL '1 {interval_unit}'
+                    GROUP BY c.group_value, c.period, c.bonds, c.mean, c.median,
+                             c.p25, c.p75, c.minimum, c.maximum, c.min_isin,
+                             c.min_description, c.max_isin, c.max_description
+                ), coverage_counts AS (
+                    SELECT group_value, count(*) AS total_periods,
+                           count(*) FILTER (WHERE coverage_pct >= ?) AS eligible_periods
+                    FROM coverage GROUP BY group_value
+                ), qualified AS (
+                    SELECT * FROM coverage WHERE coverage_pct >= ?
                 ), rolling AS (
                     SELECT *,
                         stddev_samp(mean) OVER (
@@ -192,13 +237,28 @@ def load_group_data(
                         mean - lag(mean, 252) OVER (
                             PARTITION BY group_value ORDER BY period
                         ) AS mom_252
-                    FROM cross_section
+                    FROM qualified
                 )
-                SELECT period, bonds, mean, median, p25, p75, minimum, maximum,
-                       vol_63, vol_252, mom_63, mom_252
-                FROM rolling WHERE group_value=? ORDER BY period""",
-            [run_info["preprocessing"]["clean_parquet"], group_value],
+                SELECT r.period, r.bonds, r.mean, r.median, r.p25, r.p75, r.minimum, r.maximum,
+                       r.vol_63, r.vol_252, r.mom_63, r.mom_252, r.coverage_pct, r.active_bonds,
+                       cc.total_periods, cc.eligible_periods,
+                       r.min_isin, r.min_description, r.max_isin, r.max_description
+                FROM coverage_counts cc
+                LEFT JOIN rolling r ON r.group_value=cc.group_value
+                WHERE cc.group_value=? ORDER BY r.period""",
+            [
+                run_info["preprocessing"]["clean_parquet"],
+                minimum_coverage_pct,
+                minimum_coverage_pct,
+                group_value,
+            ],
         ).fetchall()
+        if not rows:
+            return [], 0, 0
+        total_periods = int(rows[0][14] or 0)
+        eligible_periods = int(rows[0][15] or 0)
+        eligible_rows = [row[:14] + row[16:20] for row in rows if row[0] is not None]
+        return eligible_rows, total_periods - eligible_periods, total_periods
     finally:
         connection.close()
 
@@ -308,25 +368,123 @@ class HistoryChart(QWidget):
         self.value_label = "Yield (%)"
         self.daily: list[tuple[date, float]] = []
         self.partitions: list[tuple[Any, ...]] = []
+        self.zoom_start = 0.0
+        self.zoom_end = 1.0
+        self._x_positions: list[float] = []
+        self._plot_left = 68
+        self._plot_right = 0
+        self._drag_origin: QPointF | None = None
+        self._drag_zoom: tuple[float, float] | None = None
+        self.setMouseTracking(True)
 
     def set_data(self, data: dict[str, Any], mode: str) -> None:
         self.daily = data["daily"]
         self.partitions = data["partitions"]
         self.value_label = data["value_label"]
         self.mode = mode
+        self.zoom_start = 0.0
+        self.zoom_end = 1.0
+        self._x_positions = []
         self.update()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if not self.daily and not self.partitions:
+            return
+        plot_width = max(1, self._plot_right - self._plot_left)
+        anchor = max(0.0, min(1.0, (event.position().x() - self._plot_left) / plot_width))
+        width = self.zoom_end - self.zoom_start
+        factor = 0.8 if event.angleDelta().y() > 0 else 1.25
+        new_width = max(0.025, min(1.0, width * factor))
+        anchor_date = self.zoom_start + anchor * width
+        start = anchor_date - anchor * new_width
+        self.zoom_start = max(0.0, min(1.0 - new_width, start))
+        self.zoom_end = self.zoom_start + new_width
+        self.update()
+        event.accept()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = event.position()
+            self._drag_zoom = (self.zoom_start, self.zoom_end)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_origin is not None and self._drag_zoom is not None:
+            width = self._drag_zoom[1] - self._drag_zoom[0]
+            plot_width = max(1, self._plot_right - self._plot_left)
+            shift = -(event.position().x() - self._drag_origin.x()) / plot_width * width
+            start = max(0.0, min(1.0 - width, self._drag_zoom[0] + shift))
+            self.zoom_start, self.zoom_end = start, start + width
+            self.update()
+            return
+        if self._x_positions:
+            x = event.position().x()
+            index = min(range(len(self._x_positions)), key=lambda i: abs(self._x_positions[i] - x))
+            if abs(self._x_positions[index] - x) <= 28:
+                self._show_point_tooltip(index, event.globalPosition())
+            else:
+                self.setToolTip("Scroll to zoom · drag to pan · double-click to reset")
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = None
+            self._drag_zoom = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        self.zoom_start, self.zoom_end = 0.0, 1.0
+        self.update()
+        event.accept()
+
+    def _show_point_tooltip(self, index: int, position: QPointF) -> None:
+        if self.mode == "Daily observations":
+            point_date, value = self.daily[index]
+            gap = (point_date - self.daily[index - 1][0]).days if index else None
+            details = [f"{self.value_label}: {value:.3f}"]
+        else:
+            row = self.partitions[index]
+            point_date = row[0]
+            gap = (point_date - self.partitions[index - 1][0]).days if index else None
+            details = [
+                f"Contributing bonds: {int(row[1]):,}",
+                f"Coverage: {float(row[12]):.1f}% of {int(row[13]):,} bonds first seen by interval end",
+                f"Mean: {row[2]:.3f}" if row[2] is not None else "Mean: —",
+                f"Median: {row[3]:.3f}" if row[3] is not None else "Median: —",
+                f"P25–P75: {row[4]:.3f}–{row[5]:.3f}" if row[4] is not None and row[5] is not None else "P25–P75: —",
+                f"Min: {row[6]:.3f} | {row[15]} | ISIN {row[14]}"
+                if row[6] is not None else "Min: —",
+                f"Max: {row[7]:.3f} | {row[17]} | ISIN {row[16]}"
+                if row[7] is not None else "Max: —",
+            ]
+        details.insert(0, str(point_date))
+        if gap is not None:
+            details.append(f"Gap from prior point: {gap} days")
+        self.setToolTip("\n".join(details))
+        QToolTip.showText(position.toPoint(), "\n".join(details), self)
 
     def paintEvent(self, _event: Any) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor("#151a23"))
-        left, right, top, bottom = 68, self.width() - 24, 20, self.height() - 48
+        left, right, top, bottom = 68, self.width() - 24, 20, self.height() - 56
+        self._plot_left, self._plot_right = left, right
         plot_width, plot_height = max(1, right - left), max(1, bottom - top)
         if self.mode == "Daily observations":
             values = [point[1] for point in self.daily]
         else:
-            values = [float(row[7]) for row in self.partitions if row[7] is not None]
-            values += [float(row[6]) for row in self.partitions if row[6] is not None]
+            values = [
+                float(row[index])
+                for row in self.partitions
+                for index in (4, 5, 6, 7)
+                if row[index] is not None
+            ]
         if not values:
             painter.setPen(QColor("#aab6c6"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No valid observations for this measure.")
@@ -357,63 +515,119 @@ class HistoryChart(QWidget):
         painter.drawText(int(-plot_height / 2), 0, self.value_label)
         painter.restore()
 
+        series_dates = (
+            [point[0] for point in self.daily]
+            if self.mode == "Daily observations"
+            else [row[0] for row in self.partitions]
+        )
+        first_ordinal = series_dates[0].toordinal()
+        last_ordinal = series_dates[-1].toordinal()
+        full_span = max(1, last_ordinal - first_ordinal)
+        visible_start = first_ordinal + full_span * self.zoom_start
+        visible_end = first_ordinal + full_span * self.zoom_end
+        visible_span = max(1.0, visible_end - visible_start)
+
+        def x_pos(point_date: date) -> float:
+            return left + (point_date.toordinal() - visible_start) / visible_span * plot_width
+
         if self.mode == "Daily observations":
-            first_day = self.daily[0][0].toordinal()
-            day_span = max(1, self.daily[-1][0].toordinal() - first_day)
-            if len(self.daily) == 1:
-                xs = [left + plot_width / 2]
-            else:
-                xs = [
-                    left + (observed_day.toordinal() - first_day) * plot_width / day_span
-                    for observed_day, _ in self.daily
-                ]
-            path = QPainterPath()
-            for index, ((_, value), x) in enumerate(zip(self.daily, xs)):
-                y = y_pos(value)
-                if index == 0:
-                    path.moveTo(x, y)
-                else:
-                    path.lineTo(x, y)
-            painter.setPen(QPen(QColor("#53b7d8"), 1.9))
-            painter.drawPath(path)
-            first_label = self.daily[0][0].isoformat()
-            last_label = self.daily[-1][0].isoformat()
+            xs = [x_pos(observed_day) for observed_day, _ in self.daily]
+            self._x_positions = xs
+            visible = [
+                (point, x)
+                for point, x in zip(self.daily, xs)
+                if left <= x <= right
+            ]
+            painter.setPen(QPen(QColor("#53b7d8"), 1))
+            painter.setBrush(QColor("#53b7d8"))
+            for (_observed_day, value), x in visible:
+                painter.drawEllipse(QPointF(x, y_pos(value)), 2.5, 2.5)
         else:
-            count = len(self.partitions)
-            first_day = self.partitions[0][0].toordinal()
-            day_span = max(1, self.partitions[-1][0].toordinal() - first_day)
-            if count == 1:
-                xs = [left + plot_width / 2]
-            else:
-                xs = [
-                    left + (row[0].toordinal() - first_day) * plot_width / day_span
-                    for row in self.partitions
+            xs = [x_pos(row[0]) for row in self.partitions]
+            self._x_positions = xs
+            band_points = [
+                (x, row[4], row[5])
+                for x, row in zip(xs, self.partitions)
+                if left <= x <= right and row[4] is not None and row[5] is not None
+            ]
+            if band_points:
+                def smooth_boundary(points: list[tuple[float, float]]) -> QPainterPath:
+                    path = QPainterPath()
+                    path.moveTo(*points[0])
+                    for index in range(len(points) - 1):
+                        x0, y0 = points[index]
+                        x1, y1 = points[index + 1]
+                        xp, yp = points[index - 1] if index else points[index]
+                        xn, yn = points[index + 2] if index + 2 < len(points) else points[index + 1]
+                        path.cubicTo(
+                            x0 + (x1 - xp) / 6,
+                            y0 + (y1 - yp) / 6,
+                            x1 - (xn - x0) / 6,
+                            y1 - (yn - y0) / 6,
+                            x1,
+                            y1,
+                        )
+                    return path
+
+                upper = smooth_boundary(
+                    [(x, y_pos(float(p75))) for x, _p25, p75 in band_points]
+                )
+                lower = smooth_boundary(
+                    [(x, y_pos(float(p25))) for x, p25, _p75 in reversed(band_points)]
+                )
+                band = QPainterPath(upper)
+                band.connectPath(lower)
+                band.closeSubpath()
+                painter.fillPath(band, QColor(36, 91, 117, 105))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor("#53b7d8"), 1.8))
+                painter.drawPath(upper)
+                painter.drawPath(lower)
+
+                mean_points = [
+                    (x, y_pos(float(row[2])))
+                    for x, row in zip(xs, self.partitions)
+                    if left <= x <= right and row[2] is not None
                 ]
-            means = QPainterPath()
-            for x, row in zip(xs, self.partitions):
-                if row[6] is None or row[7] is None:
-                    continue
-                painter.setPen(QPen(QColor("#8d9caf"), 1.1))
-                painter.drawLine(int(x), int(y_pos(float(row[7]))), int(x), int(y_pos(float(row[6]))))
-                box_top, box_bottom = y_pos(float(row[5])), y_pos(float(row[4]))
-                painter.fillRect(int(x - 5), int(box_top), 10, max(2, int(box_bottom - box_top)), QColor("#244359"))
-                painter.setPen(QPen(QColor("#53a9c7"), 1))
-                painter.drawRect(int(x - 5), int(box_top), 10, max(2, int(box_bottom - box_top)))
-                if row[2] is not None:
-                    y = y_pos(float(row[2]))
-                    if means.elementCount() == 0:
-                        means.moveTo(x, y)
-                    else:
-                        means.lineTo(x, y)
-            painter.setPen(QPen(QColor("#f0a35e"), 1.9))
-            painter.drawPath(means)
-            first_label = str(self.partitions[0][0])
-            last_label = str(self.partitions[-1][0])
+                median_points = [
+                    (x, y_pos(float(row[3])))
+                    for x, row in zip(xs, self.partitions)
+                    if left <= x <= right and row[3] is not None
+                ]
+                if mean_points:
+                    painter.setPen(QPen(QColor("#f0a35e"), 2.0))
+                    painter.drawPath(smooth_boundary(mean_points))
+                if median_points:
+                    median_pen = QPen(QColor("#c6a6e8"), 1.4, Qt.PenStyle.DashLine)
+                    painter.setPen(median_pen)
+                    painter.drawPath(smooth_boundary(median_points))
+
+                painter.setBrush(QColor(190, 202, 216, 100))
+                painter.setPen(QPen(QColor(190, 202, 216, 110), 1))
+                for x, row in zip(xs, self.partitions):
+                    if not left <= x <= right:
+                        continue
+                    for value in (row[6], row[7]):
+                        if value is not None:
+                            painter.drawEllipse(QPointF(x, y_pos(float(value))), 2.0, 2.0)
         painter.setPen(QColor("#aab6c6"))
-        painter.drawText(left, self.height() - 12, first_label)
-        painter.drawText(right - 92, self.height() - 12, last_label)
+        tick_count = 5
+        for tick in range(tick_count):
+            fraction = tick / (tick_count - 1)
+            x = left + fraction * plot_width
+            tick_date = date.fromordinal(round(visible_start + fraction * visible_span))
+            painter.setPen(QPen(QColor("#303947"), 1))
+            painter.drawLine(int(x), bottom, int(x), bottom + 4)
+            painter.setPen(QColor("#aab6c6"))
+            text = tick_date.strftime("%Y-%m")
+            painter.drawText(int(x - 30), self.height() - 12, text)
         painter.setPen(QColor("#aab6c6"))
-        legend = "Mean (orange), P25–P75 (blue box), min–max (line)" if self.mode != "Daily observations" else "One point per valid reported trade date; no fill-forward"
+        legend = (
+            "P25–P75 shaded band · mean (orange) · median (dashed) · min/max (faint points) · "
+            "scroll to zoom, drag to pan, double-click to reset"
+            if self.mode != "Daily observations"
+            else "One point per valid reported trade date · scroll to zoom, drag to pan, double-click to reset"
+        )
         painter.drawText(left + 12, top + 15, legend)
 
 
@@ -421,7 +635,7 @@ class TraceHistoryInspector(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("TRACE Bond History Inspector")
-        self.resize(1400, 900)
+        self.resize(1720, 900)
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #10141c; color: #e3e9f1; }
@@ -499,6 +713,20 @@ class TraceHistoryInspector(QMainWindow):
         self.partition.setCurrentText("Monthly")
         self.partition.currentTextChanged.connect(self.refresh)
         controls.addWidget(self.partition)
+        self.minimum_coverage_label = QLabel("Minimum coverage")
+        controls.addWidget(self.minimum_coverage_label)
+        self.minimum_coverage = QDoubleSpinBox()
+        self.minimum_coverage.setRange(0, 100)
+        self.minimum_coverage.setDecimals(0)
+        self.minimum_coverage.setSingleStep(5)
+        self.minimum_coverage.setSuffix("%")
+        self.minimum_coverage.setValue(50)
+        self.minimum_coverage.setToolTip(
+            "An interval is shown only when this share of bonds whose first TRACE observation "
+            "has occurred by interval end has a valid observation in that interval."
+        )
+        self.minimum_coverage.valueChanged.connect(self.refresh)
+        controls.addWidget(self.minimum_coverage)
         layout.addLayout(controls)
 
         self.summary = QLabel("Loading history database…")
@@ -508,10 +736,10 @@ class TraceHistoryInspector(QMainWindow):
         self.tabs = QTabWidget()
         self.chart = HistoryChart()
         self.tabs.addTab(self.chart, "Chart")
-        self.stats = QTableWidget(0, 12)
+        self.stats = QTableWidget(0, 13)
         self.stats.setHorizontalHeaderLabels(
             ["Period", "Observations", "Mean", "Median", "P25", "P75", "Min", "Max",
-             "Vol 63", "Vol 252", "Mom 63", "Mom 252"]
+             "Vol 63", "Vol 252", "Mom 63", "Mom 252", "Coverage %"]
         )
         self.stats.horizontalHeaderItem(8).setToolTip(
             "Trailing sample standard deviation; the selected view and interval define the window."
@@ -570,6 +798,8 @@ class TraceHistoryInspector(QMainWindow):
             widget.setVisible(individual)
         for widget in (self.group_by_label, self.group_by, self.group_value_label, self.group_value):
             widget.setVisible(not individual)
+        self.minimum_coverage_label.setVisible(not individual)
+        self.minimum_coverage.setVisible(not individual)
         self.refresh()
 
     def _group_dimension_changed(self, _dimension: str) -> None:
@@ -601,9 +831,10 @@ class TraceHistoryInspector(QMainWindow):
             if not group_value:
                 return
             try:
-                rows = load_group_data(
+                rows, omitted_periods, total_periods = load_group_data(
                     self.group_by.currentText(), group_value,
                     self.measure.currentText(), self.partition.currentText(), self.run_info,
+                    self.minimum_coverage.value(),
                 )
             except Exception as error:
                 self.statusBar().showMessage(f"Could not load partition history: {error}")
@@ -611,11 +842,14 @@ class TraceHistoryInspector(QMainWindow):
             if not rows:
                 self.chart.daily = []
                 self.chart.partitions = []
+                self.chart._x_positions = []
                 self.chart.mode = "Partition ranges"
                 self.chart.update()
                 self.stats.setRowCount(0)
                 self.summary.setText(
-                    f"{self.group_by.currentText()} = {group_value} | no valid observations in run window"
+                    f"{self.group_by.currentText()} = {group_value} | no intervals meet the "
+                    f"minimum coverage of {self.minimum_coverage.value():.0f}% "
+                    f"({omitted_periods}/{total_periods} intervals omitted)"
                 )
                 return
             self.chart.set_data(
@@ -628,7 +862,9 @@ class TraceHistoryInspector(QMainWindow):
             self.summary.setText(
                 f"{self.group_by.currentText()} = {group_value} | {self.measure.currentText()} | "
                 f"{self.partition.currentText().lower()} cross-section | {first_date} to {last_date} | "
-                f"each bond has equal weight within a time bucket"
+                f"each bond has equal weight within a time bucket | "
+                f"minimum {self.minimum_coverage.value():.0f}% coverage; "
+                f"omitted {omitted_periods}/{total_periods} low-coverage intervals"
             )
             self.statusBar().showMessage(
                 "Range shows cross-sectional bond dispersion; rolling measures use the group mean time series."
@@ -672,10 +908,12 @@ class TraceHistoryInspector(QMainWindow):
     def _fill_stats(self, rows: list[tuple[Any, ...]], group_mode: bool) -> None:
         self.stats.setRowCount(len(rows))
         self.tabs.setTabText(1, "Group statistics" if group_mode else "Bond time-bucket statistics")
-        self.stats.setHorizontalHeaderLabels(
-            ["Period", "Bonds" if group_mode else "Observations", "Mean", "Median", "P25", "P75", "Min", "Max",
-             "Vol 63", "Vol 252", "Mom 63", "Mom 252"]
-        )
+        headers = [
+            "Period", "Bonds" if group_mode else "Observations", "Mean", "Median", "P25", "P75", "Min", "Max",
+            "Vol 63", "Vol 252", "Mom 63", "Mom 252",
+        ]
+        headers.append("Coverage %" if group_mode else "")
+        self.stats.setHorizontalHeaderLabels(headers)
         unit = self.partition.currentText().lower()
         scope = "group mean" if group_mode else "bond series"
         self.stats.horizontalHeaderItem(8).setToolTip(
@@ -691,7 +929,9 @@ class TraceHistoryInspector(QMainWindow):
             f"Current {scope} value minus its value 252 {unit} points earlier."
         )
         for row_index, row in enumerate(rows):
-            display = [row[0], row[1], *row[2:]]
+            display = [row[0], row[1], *row[2:12]]
+            if group_mode:
+                display.append(row[12])
             for column, value in enumerate(display):
                 if value is None:
                     text = ""
@@ -699,6 +939,8 @@ class TraceHistoryInspector(QMainWindow):
                     text = str(value)
                 elif column == 1:
                     text = f"{int(value):,}"
+                elif group_mode and column == 12:
+                    text = f"{float(value):.1f}%"
                 else:
                     text = f"{float(value):.3f}"
                 item = QTableWidgetItem(text)

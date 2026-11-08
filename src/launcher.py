@@ -18,6 +18,7 @@ from PySide6.QtCore import QProcess, QProcessEnvironment, QThread, Qt, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QGridLayout,
     QHeaderView,
     QInputDialog,
@@ -41,6 +42,7 @@ VERSIONS_DIR = DATA_DIR / "mapping_versions"
 MAPPINGS_PATH = DATA_DIR / "issuer_ticker_map.csv"
 DOWNLOAD_STATUS_PATH = DATA_DIR / "reference" / "last_lqd_download.json"
 REQUIREMENTS_PATH = ROOT / "requirements.txt"
+TASK_HISTORY_DIR = DATA_DIR / "task_history"
 
 
 def _requirement_names() -> list[str]:
@@ -94,6 +96,7 @@ class LauncherWindow(QMainWindow):
         self.resize(720, 600)
         self.process: QProcess | None = None
         self.dependency_checker: DependencyChecker | None = None
+        self.current_task_log: Path | None = None
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -156,11 +159,84 @@ class LauncherWindow(QMainWindow):
         self.output.setReadOnly(True)
         self.output.setPlaceholderText("Task output will appear here.")
         self.tabs.addTab(self.output, "Task output")
+
+        history_page = QWidget()
+        history_layout = QVBoxLayout(history_page)
+        self.history_selector = QComboBox()
+        self.history_selector.currentIndexChanged.connect(self._show_selected_task)
+        history_layout.addWidget(self.history_selector)
+        self.history_output = QTextEdit()
+        self.history_output.setReadOnly(True)
+        self.history_output.setPlaceholderText("Completed task outputs will be kept here.")
+        history_layout.addWidget(self.history_output, 1)
+        self.tabs.addTab(history_page, "Task history")
         layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(central)
+        self._load_task_history()
         self._refresh_diagnostics()
         self._populate_dependencies()
+
+    def _load_task_history(self) -> None:
+        TASK_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        paths = sorted(TASK_HISTORY_DIR.glob("*.log"), reverse=True)
+        self.history_selector.blockSignals(True)
+        self.history_selector.clear()
+        for path in paths:
+            self.history_selector.addItem(self._task_history_label(path), str(path))
+        self.history_selector.blockSignals(False)
+        if paths:
+            self.history_selector.setCurrentIndex(0)
+            self._show_selected_task(0)
+
+    @staticmethod
+    def _task_history_label(path: Path) -> str:
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(2048).decode("utf-8", errors="replace").splitlines()[:3]
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 2048))
+                tail = handle.read().decode("utf-8", errors="replace").splitlines()
+        except OSError:
+            header = []
+            tail = []
+        task = next(
+            (line.removeprefix("Task: ") for line in header if line.startswith("Task: ")),
+            path.stem,
+        )
+        started = next(
+            (line.removeprefix("Started: ") for line in header if line.startswith("Started: ")),
+            "",
+        )
+        results = [
+            line.removeprefix("Result: ")
+            for line in (*header, *tail)
+            if line.startswith("Result: ")
+        ]
+        finished = results[-1] if results else "running"
+        return f"{started} | {task} | {finished}"
+
+    def _show_selected_task(self, index: int) -> None:
+        if index < 0:
+            self.history_output.clear()
+            return
+        path = Path(self.history_selector.itemData(index))
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            content = f"Could not read task output: {error}"
+        self.history_output.setPlainText(content)
+
+    def _update_current_history(self) -> None:
+        if self.current_task_log is None:
+            return
+        for index in range(self.history_selector.count()):
+            if Path(self.history_selector.itemData(index)) == self.current_task_log:
+                self.history_selector.setItemText(index, self._task_history_label(self.current_task_log))
+                if self.history_selector.currentIndex() == index:
+                    self._show_selected_task(index)
+                break
 
     def _refresh_diagnostics(self) -> None:
         snapshots = sorted(SNAPSHOTS_DIR.rglob("*.csv")) if SNAPSHOTS_DIR.exists() else []
@@ -272,6 +348,19 @@ class LauncherWindow(QMainWindow):
                 return
             environment.insert("SEC_USER_AGENT", user_agent)
 
+        TASK_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        started = datetime.now().astimezone().isoformat(timespec="seconds")
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+        safe_module = re.sub(r"[^A-Za-z0-9_-]+", "_", module)
+        self.current_task_log = TASK_HISTORY_DIR / f"{stamp}_{safe_module}.log"
+        self.current_task_log.write_text(
+            f"Task: {module}\nStarted: {started}\nResult: running\n\n",
+            encoding="utf-8",
+        )
+        self.history_selector.insertItem(
+            0, self._task_history_label(self.current_task_log), str(self.current_task_log)
+        )
+        self.history_selector.setCurrentIndex(0)
         self.output.clear()
         self.tabs.setCurrentWidget(self.output)
         self.status.setText(f"Running: {module}")
@@ -301,9 +390,18 @@ class LauncherWindow(QMainWindow):
             self.output.setTextCursor(cursor)
             self.output.insertPlainText(text)
             self.output.ensureCursorVisible()
+            if self.current_task_log is not None:
+                with self.current_task_log.open("a", encoding="utf-8") as handle:
+                    handle.write(text)
+                self._update_current_history()
 
     def _finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         self._read_output()
+        if self.current_task_log is not None:
+            result = "success" if exit_code == 0 else f"exit code {exit_code}"
+            with self.current_task_log.open("a", encoding="utf-8") as handle:
+                handle.write(f"\nResult: {result}\n")
+            self._update_current_history()
         self.status.setText("Finished" if exit_code == 0 else f"Finished with errors (exit code {exit_code})")
         for button in self.buttons:
             button.setEnabled(True)
@@ -311,6 +409,10 @@ class LauncherWindow(QMainWindow):
 
     def _process_error(self, _error: QProcess.ProcessError) -> None:
         if self.process and self.process.error() == QProcess.ProcessError.FailedToStart:
+            if self.current_task_log is not None:
+                with self.current_task_log.open("a", encoding="utf-8") as handle:
+                    handle.write("\nResult: failed to start Python\n")
+                self._update_current_history()
             self.status.setText("Could not start Python. Check the active uv environment.")
             for button in self.buttons:
                 button.setEnabled(True)

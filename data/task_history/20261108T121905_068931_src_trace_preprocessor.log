@@ -1,0 +1,22 @@
+Task: src.trace_preprocessor
+Started: 2026-11-08T12:19:05+00:00
+Result: running
+
+TRACE preprocessor finra-trace-v1
+Source run: d4f6fea1-2cf7-4ae3-9ef7-265fa1b8e10c (partial)
+Input window: 2021-11-07 to 2026-11-06 | bonds in run: 3,219
+Policies:
+  price: zero_is_missing=True; sentinels=[999999.99]; minimum_valid_exclusive=0.0; maximum_absolute_exclusive=10000.0
+  last_sale_yield: zero_is_missing=True; sentinels=[999999.99]; minimum_valid_exclusive=None; maximum_absolute_exclusive=10000.0
+Scanning raw field values...
+Rows scanned: 2,397,956
+Rows with one or more field exclusions: 307,683
+Writing normalized clean output to D:\Projects\Parallax\data\trace\preprocessed\run_id=d4f6fea1-2cf7-4ae3-9ef7-265fa1b8e10c\preprocess_id=20261108T121906Z_5b1b5f8c\observations.parquet
+Field results:
+  price: valid=2,314,984, missing=0, zero=82,972, sentinel=0, outside_limit=0, non_numeric=0, non_finite=0
+  last_sale_yield: valid=2,090,273, missing=306,973, zero=0, sentinel=710, outside_limit=0, non_numeric=0, non_finite=0
+Clean Parquet: D:\Projects\Parallax\data\trace\preprocessed\run_id=d4f6fea1-2cf7-4ae3-9ef7-265fa1b8e10c\preprocess_id=20261108T121906Z_5b1b5f8c\observations.parquet
+Diagnostics JSON: D:\Projects\Parallax\data\trace\preprocessed\run_id=d4f6fea1-2cf7-4ae3-9ef7-265fa1b8e10c\preprocess_id=20261108T121906Z_5b1b5f8c\diagnostics.json
+Raw DuckDB observations were not modified.
+
+Result: success

@@ -141,7 +141,7 @@ def run_preprocessor(
                            rb.run_id AS population_run_id
                     FROM observations o
                     JOIN run_bonds rb ON rb.isin=o.isin AND rb.run_id={run_sql}
-                    LEFT JOIN read_csv_auto('{snapshot_sql}', header=true, all_varchar=true) s
+                    LEFT JOIN read_csv_auto({snapshot_sql}, header=true, all_varchar=true) s
                            ON s.isin=o.isin
                     WHERE o.trade_date BETWEEN ? AND ?
                     ORDER BY o.isin, o.trade_date
