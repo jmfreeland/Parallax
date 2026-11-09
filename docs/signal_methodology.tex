@@ -1,0 +1,21 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,hyperref}
+\title{Parallax TRACE Research Signals\\\large Definitions, Construction, and Validation}
+\author{Parallax Observatory}
+\date{9 November 2026}
+\begin{document}\maketitle
+\begin{abstract}
+This note defines a research-safe construction for signals from FINRA TRACE observations. It separates vendor data, cleaned inputs, descriptive statistics, and investable forecasts. Current Parallax inspector outputs are descriptive levels; the methodology below is proposed and not implemented alpha.
+\end{abstract}
+\section{Data and eligibility}
+For bond $i$ at $t$, let $P_{i,t}$ be clean price per 100 par, $y_{i,t}$ clean yield in decimal units, $D_{i,t}$ modified duration, and $C_{i,t}$ convexity. Preserve instrument/source IDs, trade date, retrieval timestamp, and vintage. The universe $\mathcal U_t$ is an as-of-dated membership set. An observation is eligible only if its policy status and identifiers are valid and it belongs to frozen universe and vintage. Report $q_t=\#\{i\in\mathcal U_t:\mathrm{eligible}\}/\#\mathcal U_t$.
+\section{Return primitives}
+For successive valid observations, $r^P_{i,t_0,t_1}=\log(P_{i,t_1}/P_{i,t_0})$. Compare elapsed time rather than row count. A yield-space approximation is $\widehat r^Y_{i,t}\approx-D_{i,t^-}\Delta y_{i,t}+\frac12C_{i,t^-}(\Delta y_{i,t})^2$. Yield increases have negative price-return sign. Without duration/convexity, describe yield movement as a rate change, not return.
+\section{Cross-sectional residual}
+Estimate $\Delta y_{i,t}=\alpha_t+\beta_t^\top x_{i,t^-}+u_{i,t}$ using only contemporaneously available sector, rating, maturity/duration, and liquidity inputs. A candidate dislocation is $z_{i,t}=u_{i,t}/(1.4826\,\mathrm{MAD}(u_{\cdot,t}))$. It becomes a forecast only after out-of-sample estimation of sign and horizon.
+\section{Aggregation and validation}
+Group levels may equal-weight eligible bonds. Portfolio signals require explicit weights, turnover, concentration, liquidity, and issuer constraints. Calculate daily return primitives before reporting-period aggregation. Use walk-forward, revision-isolated vintages; report cost-adjusted performance, IC, turnover, capacity, exposures, and regime stability.
+\section{Current status}
+Parallax currently stores TRACE price/yield observations, applies an auditable policy, and displays group levels plus rolling level statistics. It does not calculate returns, residuals, forecasts, costs, or validated performance.
+\end{document}
