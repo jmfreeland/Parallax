@@ -2,6 +2,13 @@
 
 Parallax is an internal Python platform for systematic research, risk, alpha, and portfolio analysis in US investment-grade credit. The Observatory is intended to make the evidence behind a view inspectable: source data, transformations, assumptions, model outputs, and portfolio implications should be traceable.
 
+## Documentation
+
+- [Usage guide](docs/usage.md) — setup, TRACE workflows, cleaning, and reproducibility.
+- [Architecture](docs/architecture.md) — current data flow and target structure.
+- [Signal methodology](docs/signal_methodology.tex) — LaTeX research note.
+- [Development review](docs/development_review.md) — prioritized findings.
+
 ## Research frame
 
 Keep four concepts distinct:
