@@ -508,10 +508,16 @@ def evaluate_nelson_siegel_signal(
         selected_count = len(long_leg) + len(short_leg)
         total_return_coverage = 100.0 * len(total_return_by_isin) / selected_count if selected_count else None
         total_return_pct = None
-        if selected_count and len(total_return_by_isin) == selected_count:
-            long_mean = float(np.mean([total_return_by_isin[row["isin"]] for row in long_leg]))
-            short_mean = float(np.mean([total_return_by_isin[row["isin"]] for row in short_leg]))
-            total_return_pct = 100.0 * (long_mean - short_mean)
+        if long_leg and short_leg and total_return_by_isin:
+            # Preserve the target equal weights: unpriced bonds contribute zero
+            # and coverage makes the resulting partial observation explicit.
+            long_contribution = sum(
+                total_return_by_isin.get(row["isin"], 0.0) / len(long_leg) for row in long_leg
+            )
+            short_contribution = sum(
+                total_return_by_isin.get(row["isin"], 0.0) / len(short_leg) for row in short_leg
+            )
+            total_return_pct = 100.0 * (long_contribution - short_contribution)
 
         # Record every fitted signal at the maximum horizon, including missing
         # outcomes, so coverage remains inspectable in the export.
@@ -710,7 +716,7 @@ def evaluate_nelson_siegel_signal(
         "percentile_definition": "mid-rank percentile of the partition median latest TRACE yield versus strictly prior partition medians in trailing history; partition signals apply to all constituent bonds and portfolio legs are bond equal-weighted"
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
         "strategy_return_definition": "equal-weighted bonds in the top signal quantile long and bottom quantile short; percentile signals select whole partition tails; fixed modified-duration yield-only return proxy uses raw observed yield changes without cross-sectional demeaning; missing changes contribute zero and coverage is reported",
-        "total_return_definition": "at maximum horizon, equal-weighted long minus short fixed-rate bond total return; reported only with full price coverage",
+        "total_return_definition": "at maximum horizon, equal-weighted long minus short fixed-rate bond total return; unpriced positions contribute zero at their target weight and coverage is reported",
         "rebalanced_series_definition": "daily signal selection held to next TRACE signal date; show covered total-return contribution and duration-adjusted yield-change proxy using raw observed yield changes without cross-sectional demeaning; missing position contributions are zero and coverage is reported",
     }
     summary = {

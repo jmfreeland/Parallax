@@ -795,7 +795,7 @@ class SignalEvaluationWindow(QMainWindow):
             f"Mean daily side-adjusted long-short performance: "
             f"{display(summary['mean_daily_long_short_yield_return_proxy_bps'], ' bps')}. "
             f"Mean actual total-return long-short: {display(summary['mean_daily_long_short_total_return_pct'], '%')} "
-            f"on {summary['dates_with_total_return']} fully priced dates (mean leg coverage "
+            f"on {summary['dates_with_total_return']} dates with priced positions (unpriced bonds contribute zero; mean leg coverage "
             f"{display(summary['mean_long_short_total_return_coverage_pct'], '%')}; positive on "
             f"{display(summary['total_return_positive_date_fraction'] * 100 if summary['total_return_positive_date_fraction'] is not None else None, '%')}). "
             f"Rebalanced indices from 100: covered total-return contribution "
@@ -803,7 +803,7 @@ class SignalEvaluationWindow(QMainWindow):
             f"{display(summary['rebalanced_yield_only_nav_index'])}, across {summary['rebalanced_periods']} periods. "
             f"{predictor_description}{outcome_description}{data_source_note}"
             "positive side-adjusted IC/performance is favorable. "
-            "The horizon total return uses a synthetic coupon schedule and excludes costs/defaults; horizon windows overlap. "
+            "The horizon total return uses a synthetic coupon schedule, treats unpriced positions as zero contribution, and excludes costs/defaults; horizon windows overlap. "
             "The rebalanced index is a duration-adjusted yield-only proxy. Past TRACE revisions and the current bond-list snapshot may affect results."
         )
         self.status.setText(
