@@ -49,8 +49,9 @@ class NelsonSiegelExplorer(QWidget):
         fitted = [float(row["fitted_yield_pct"]) for row in rows]
         residuals = [float(row["yield_residual_pct"]) for row in rows]
         maturities = [float(row["maturity_years"]) for row in rows]
-        x_min, x_max = min(0.0, min(xs)), max(xs)
-        x_max = max(x_max, x_min + 1.0)
+        x_min, x_max = min(xs), max(xs)
+        if x_max <= x_min:
+            x_max = x_min + 1.0
         y_min, y_max = min(observed + fitted), max(observed + fitted)
         y_pad = max(0.12, (y_max - y_min) * 0.18)
         y_min, y_max = y_min - y_pad, y_max + y_pad
@@ -65,10 +66,14 @@ class NelsonSiegelExplorer(QWidget):
 
         painter.setPen(QColor("#e2e8f0"))
         rmse = float(rows[0]["curve_rmse_pct"])
+        loo_rmse = float(rows[0]["tau_selection_loo_rmse_pct"])
+        zero_maturity_yield = float(rows[0]["implied_zero_maturity_yield_pct"])
         painter.drawText(
             QRectF(left, 12, right - left, 24),
             Qt.AlignmentFlag.AlignLeft,
-            f"{rows[0]['ticker']} | Observed yields and fitted Nelson-Siegel curve | RMSE {rmse:.3f} pp",
+            f"{rows[0]['ticker']} | NS curve | RMSE {rmse:.3f} pp | "
+            f"0Y extrapolation {zero_maturity_yield:.2f}% | "
+            f"LOO tau-selection RMSE {loo_rmse:.3f} pp",
         )
         painter.setPen(QColor("#94a3b8"))
         painter.drawText(QRectF(4, top_top, 70, 18), Qt.AlignmentFlag.AlignRight, "Yield (%)")
@@ -102,7 +107,7 @@ class NelsonSiegelExplorer(QWidget):
         tau = float(rows[0]["tau_years"])
         path = QPainterPath()
         for index in range(101):
-            maturity = max(0.001, x_max * index / 100)
+            maturity = x_min + (x_max - x_min) * index / 100
             scaled = maturity / tau
             level = -math.expm1(-scaled) / scaled
             curvature = level - math.exp(-scaled)
@@ -132,7 +137,7 @@ class NelsonSiegelExplorer(QWidget):
 
         painter.setPen(QColor("#94a3b8"))
         painter.drawText(QRectF(left, top_bottom + 5, right - left, 20), Qt.AlignmentFlag.AlignCenter, "Remaining maturity (years)")
-        for maturity in (0.0, x_max / 2, x_max):
+        for maturity in (x_min, (x_min + x_max) / 2, x_max):
             x = x_map(maturity)
             painter.drawText(QRectF(x - 35, bot_bottom + 4, 70, 18), Qt.AlignmentFlag.AlignHCenter, f"{maturity:.1f}")
 
@@ -145,8 +150,11 @@ class NelsonSiegelExplorer(QWidget):
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left + 150, self.height() - 26, 130, 20), Qt.AlignmentFlag.AlignLeft, f"Fitted (tau={tau:.2f}y)")
         painter.setPen(QColor("#94a3b8"))
-        painter.drawText(QRectF(left + 290, self.height() - 26, right - left - 290, 20), Qt.AlignmentFlag.AlignLeft,
-                         "Residual = observed yield minus fitted yield; positive means cheap vs curve")
+        painter.drawText(
+            QRectF(left + 290, self.height() - 26, right - left - 290, 20),
+            Qt.AlignmentFlag.AlignLeft,
+            "Curve limited to observed maturities; positive residual means cheap vs curve",
+        )
         painter.end()
 
 
@@ -196,10 +204,11 @@ class NelsonSiegelWindow(QMainWindow):
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.summary)
 
-        self.table = QTableWidget(0, 12)
+        self.table = QTableWidget(0, 14)
         self.table.setHorizontalHeaderLabels([
             "Ticker", "Status", "ISIN", "Maturity (years)", "Yield date", "Observed yield (%)",
-            "Fitted yield (%)", "Residual (pp)", "Signal", "Tau (years)", "Curve RMSE (pp)", "Reason",
+            "Fitted yield (%)", "Residual (pp)", "Signal", "Tau (years)", "Curve RMSE (pp)",
+            "Tau selection LOO RMSE (pp)", "0Y extrapolation (%)", "Reason",
         ])
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -282,7 +291,8 @@ class NelsonSiegelWindow(QMainWindow):
     def _populate(self) -> None:
         fields = (
             "ticker", "status", "isin", "maturity_years", "yield_date", "observed_yield_pct",
-            "fitted_yield_pct", "yield_residual_pct", "relative_value_signal", "tau_years", "curve_rmse_pct", "reason",
+            "fitted_yield_pct", "yield_residual_pct", "relative_value_signal", "tau_years", "curve_rmse_pct",
+            "tau_selection_loo_rmse_pct", "implied_zero_maturity_yield_pct", "reason",
         )
         self.table.setRowCount(len(self.results))
         for row_index, row in enumerate(self.results):

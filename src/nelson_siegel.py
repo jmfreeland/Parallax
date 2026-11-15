@@ -14,7 +14,9 @@ from .trace_cleaning import TRACE_POLICY_VERSION, clean_trace_value
 
 
 METHODOLOGY = "Nelson-Siegel cross-sectional yield curve"
-TAU_GRID_YEARS = tuple(float(value) for value in np.geomspace(0.25, 15.0, 100))
+TAU_GRID_POINTS = 100
+TAU_MIN_FLOOR_YEARS = 0.5
+TAU_MAX_CAP_YEARS = 15.0
 
 
 def _basis(maturity_years: np.ndarray, tau: float) -> np.ndarray:
@@ -25,19 +27,37 @@ def _basis(maturity_years: np.ndarray, tau: float) -> np.ndarray:
     return np.column_stack((np.ones_like(scaled), level, curvature))
 
 
-def _fit_curve(maturities: np.ndarray, yields_pct: np.ndarray) -> tuple[float, np.ndarray, float]:
-    best: tuple[float, float, np.ndarray, float] | None = None
-    for tau in TAU_GRID_YEARS:
+def _fit_curve(
+    maturities: np.ndarray, yields_pct: np.ndarray
+) -> tuple[float, np.ndarray, float, float, float, float]:
+    tau_min = max(TAU_MIN_FLOOR_YEARS, float(np.min(maturities)))
+    tau_max = max(tau_min, min(TAU_MAX_CAP_YEARS, float(np.max(maturities))))
+    tau_grid = np.geomspace(tau_min, tau_max, TAU_GRID_POINTS)
+    best: tuple[float, float] | None = None
+    for tau in tau_grid:
         design = _basis(maturities, tau)
-        beta, *_ = np.linalg.lstsq(design, yields_pct, rcond=None)
-        residual = yields_pct - design @ beta
-        sse = float(residual @ residual)
-        candidate = (sse, tau, beta, float(np.sqrt(np.mean(residual**2))))
-        if best is None or candidate[0] < best[0]:
-            best = candidate
-    assert best is not None
-    _, tau, beta, rmse = best
-    return tau, beta, rmse
+        loo_errors = []
+        for held_out in range(len(maturities)):
+            keep = np.arange(len(maturities)) != held_out
+            training_design = design[keep]
+            if np.linalg.matrix_rank(training_design) < 3:
+                loo_errors = []
+                break
+            beta_loo, *_ = np.linalg.lstsq(training_design, yields_pct[keep], rcond=None)
+            loo_errors.append(float(yields_pct[held_out] - design[held_out] @ beta_loo))
+        if not loo_errors:
+            continue
+        loo_rmse = float(np.sqrt(np.mean(np.square(loo_errors))))
+        if best is None or loo_rmse < best[0]:
+            best = (loo_rmse, float(tau))
+    if best is None:
+        raise ValueError("Nelson-Siegel curve is underdetermined for leave-one-bond-out tau selection")
+    loo_rmse, tau = best
+    design = _basis(maturities, tau)
+    beta, *_ = np.linalg.lstsq(design, yields_pct, rcond=None)
+    residual = yields_pct - design @ beta
+    rmse = float(np.sqrt(np.mean(residual**2)))
+    return tau, beta, rmse, loo_rmse, tau_min, tau_max
 
 
 def fit_ticker_curves(
@@ -82,7 +102,7 @@ def fit_ticker_curves(
     if not bonds:
         raise ValueError("No unmatured bonds with a mapped equity_ticker and maturity date")
     provenance = {
-        "model_version": "nelson_siegel_grid_v1",
+        "model_version": "nelson_siegel_loo_tau_v2",
         "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bond_list_path": str(bond_list_path.resolve()),
         "trace_database_path": str(database_path.resolve()),
@@ -90,9 +110,10 @@ def fit_ticker_curves(
         "minimum_distinct_maturities": 4,
         "yield_unit": "percent",
         "trace_cleaning_policy_version": TRACE_POLICY_VERSION,
-        "tau_grid_min_years": min(TAU_GRID_YEARS),
-        "tau_grid_max_years": max(TAU_GRID_YEARS),
-        "tau_grid_points": len(TAU_GRID_YEARS),
+        "tau_selection": "leave_one_bond_out_rmse",
+        "tau_grid_points": TAU_GRID_POINTS,
+        "tau_minimum_floor_years": TAU_MIN_FLOOR_YEARS,
+        "tau_maximum_cap_years": TAU_MAX_CAP_YEARS,
     }
 
     connection = duckdb.connect(str(database_path), read_only=True)
@@ -134,7 +155,7 @@ def fit_ticker_curves(
 
         maturities = np.array([float(row["maturity_years"]) for row in rows], dtype=float)
         yields_pct = np.array([float(row["observed_yield_pct"]) for row in rows], dtype=float)
-        tau, beta, rmse = _fit_curve(maturities, yields_pct)
+        tau, beta, rmse, loo_rmse, tau_min, tau_max = _fit_curve(maturities, yields_pct)
         fitted = _basis(maturities, tau) @ beta
         for row, fitted_yield in zip(rows, fitted):
             residual = float(row["observed_yield_pct"] - fitted_yield)
@@ -147,10 +168,14 @@ def fit_ticker_curves(
                 "as_of_date": as_of_date.isoformat(),
                 "methodology": METHODOLOGY,
                 "tau_years": float(tau),
+                "tau_search_min_years": tau_min,
+                "tau_search_max_years": tau_max,
                 "beta_level": float(beta[0]),
                 "beta_slope": float(beta[1]),
                 "beta_curvature": float(beta[2]),
+                "implied_zero_maturity_yield_pct": float(beta[0] + beta[1]),
                 "curve_rmse_pct": rmse,
+                "tau_selection_loo_rmse_pct": loo_rmse,
                 "fitted_yield_pct": float(fitted_yield),
                 "yield_residual_pct": residual,
                 "relative_value_signal": "cheap vs curve" if residual > 0 else "rich vs curve" if residual < 0 else "on curve",

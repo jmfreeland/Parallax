@@ -191,9 +191,10 @@ class PortfolioTimeSeriesChart(QWidget):
         painter.setPen(QPen(QColor("#38bdf8"), 2))
         for previous, current in zip(path_points, path_points[1:]):
             painter.drawLine(previous, current)
-        painter.setBrush(QColor("#38bdf8"))
-        for point in path_points:
-            painter.drawEllipse(point, 3.0, 3.0)
+        if len(path_points) <= 250:
+            painter.setBrush(QColor("#38bdf8"))
+            for point in path_points:
+                painter.drawEllipse(point, 2.0, 2.0)
         painter.setPen(QColor("#94a3b8"))
         painter.drawText(QRectF(left, bottom + 8, 120, 20), Qt.AlignmentFlag.AlignLeft,
                          self.rows[0]["date"].isoformat())
@@ -292,6 +293,10 @@ class PortfolioAnalyticsWindow(QMainWindow):
 
         time_series_page = QWidget()
         time_series_layout = QVBoxLayout(time_series_page)
+        self.performance_summary = QLabel("Calculate a portfolio horizon to view performance statistics.")
+        self.performance_summary.setWordWrap(True)
+        self.performance_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        time_series_layout.addWidget(self.performance_summary)
         self.time_series_note = QLabel(
             "Weekday marks use the latest valid TRACE clean price, carried forward across missing observations. "
             "Accrued interest and cash flows update by valuation date; stale marked weight is flagged."
@@ -486,6 +491,7 @@ class PortfolioAnalyticsWindow(QMainWindow):
         self._populate_position_table()
         self._refresh_contributor_views()
         self.time_series_chart.set_data(analysis.time_series)
+        self.performance_summary.setText(self._format_performance_summary(summary))
         self._populate_exposure_table(
             self.sector_exposure_table,
             analysis.sector_attribution,
@@ -502,6 +508,37 @@ class PortfolioAnalyticsWindow(QMainWindow):
             "Issuer",
         )
         self._update_chart()
+
+    @staticmethod
+    def _format_performance_summary(summary: dict[str, Any]) -> str:
+        def fmt(key: str, digits: int = 2, suffix: str = "") -> str:
+            value = summary.get(key)
+            return f"{value:.{digits}f}{suffix}" if value is not None else "n/a"
+
+        peak_date = summary.get("max_drawdown_peak_date")
+        trough_date = summary.get("max_drawdown_trough_date")
+        drawdown_dates = (
+            f"{peak_date} to {trough_date}"
+            if peak_date is not None and trough_date is not None
+            else "n/a"
+        )
+        return (
+            f"Cumulative return {fmt('cumulative_return_pct', suffix='%')} | "
+            f"Annualized return {fmt('annualized_return_pct', suffix='%')} | "
+            f"Annualized volatility {fmt('annualized_volatility_pct', suffix='%')} | "
+            f"Sharpe (0% risk-free) {fmt('sharpe_ratio')} | Sortino (0% target) {fmt('sortino_ratio')} | "
+            f"Calmar {fmt('calmar_ratio')}\n"
+            f"Max drawdown {fmt('max_drawdown_pct', suffix='%')} ({drawdown_dates}; "
+            f"{summary.get('max_drawdown_duration_days', 'n/a')} calendar days) | "
+            f"Positive marks {fmt('positive_day_pct', suffix='%')} | "
+            f"Best/worst day {fmt('best_day_return_pct', suffix='%')} / "
+            f"{fmt('worst_day_return_pct', suffix='%')} | "
+            f"Historical 95% VaR / CVaR {fmt('historical_var_95_pct', suffix='%')} / "
+            f"{fmt('historical_cvar_95_pct', suffix='%')}\n"
+            f"Sample: {summary.get('performance_observation_count', 0):,} daily intervals. "
+            "Annualization assumes 252 weekday marks. Unpriced weights contribute zero P&L; "
+            "the daily series carries forward the last available price mark."
+        )
 
     def _populate_position_table(self) -> None:
         if self.analysis is None:

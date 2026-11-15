@@ -15,6 +15,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .portfolio_archive import ARCHIVE_DIR, load_archive
+from .signal_registry import SIGNALS
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QThread, Qt, Signal
 from PySide6.QtGui import QTextCursor
@@ -160,6 +161,32 @@ class LauncherWindow(QMainWindow):
         self.portfolio_archive_details.setPlaceholderText("Select an archived portfolio to inspect its methodology and positions.")
         portfolio_layout.addWidget(self.portfolio_archive_details, 3)
         self.tabs.addTab(portfolio_page, "Portfolio tooling")
+
+        signal_page = QWidget()
+        signal_layout = QVBoxLayout(signal_page)
+        signal_layout.addWidget(QLabel(
+            "Signal inventory and research status. Prototype signals require walk-forward validation before interpretation as investment alpha."
+        ))
+        self.signal_table = QTableWidget(0, 6)
+        self.signal_table.setHorizontalHeaderLabels(
+            ["Signal", "Family", "Construction", "Inputs", "Status", "Validation"]
+        )
+        self.signal_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.signal_table.setWordWrap(True)
+        self.signal_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.signal_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.signal_table.horizontalHeader().setStretchLastSection(True)
+        self.signal_table.setRowCount(len(SIGNALS))
+        for row, signal in enumerate(SIGNALS):
+            for column, value in enumerate((signal.name, signal.family, signal.construction, signal.inputs, signal.status, signal.validation)):
+                self.signal_table.setItem(row, column, QTableWidgetItem(value))
+            self.signal_table.setRowHeight(row, 105)
+        signal_layout.addWidget(self.signal_table, 1)
+        evaluate_signal = QPushButton("Evaluate Nelson-Siegel residual signal")
+        evaluate_signal.clicked.connect(lambda: self._launch("src.signal_evaluation_app"))
+        self.buttons.append(evaluate_signal)
+        signal_layout.addWidget(evaluate_signal, 0, Qt.AlignmentFlag.AlignLeft)
+        self.tabs.addTab(signal_page, "Signal inventory")
 
         self.diagnostics = QTextEdit()
         self.diagnostics.setReadOnly(True)

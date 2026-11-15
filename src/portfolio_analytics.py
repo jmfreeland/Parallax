@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+import math
 from pathlib import Path
+import statistics
 from typing import Any, Callable
 
 import duckdb
@@ -58,6 +60,99 @@ def _maturity_bucket(maturity_date: date | None, as_of_date: date) -> tuple[str,
     if years < 7.0:
         return "3-7 years", years
     return "7+ years", years
+
+
+def _performance_statistics(
+    time_series: list[dict[str, Any]], starting_nav: float
+) -> dict[str, Any]:
+    """Summarize daily NAV returns; annualization assumes 252 weekdays/year."""
+    nav_points = [
+        (row["date"], starting_nav + float(row["cumulative_pnl"]))
+        for row in time_series
+    ]
+    daily_returns: list[tuple[date, float]] = []
+    for (previous_date, previous_nav), (current_date, current_nav) in zip(
+        nav_points, nav_points[1:]
+    ):
+        if previous_nav > 0:
+            daily_returns.append((current_date, current_nav / previous_nav - 1.0))
+
+    result: dict[str, Any] = {
+        "performance_observation_count": len(daily_returns),
+        "cumulative_return_pct": None,
+        "annualized_return_pct": None,
+        "annualized_volatility_pct": None,
+        "sharpe_ratio": None,
+        "sortino_ratio": None,
+        "max_drawdown_pct": None,
+        "max_drawdown_peak_date": None,
+        "max_drawdown_trough_date": None,
+        "max_drawdown_duration_days": None,
+        "calmar_ratio": None,
+        "positive_day_pct": None,
+        "best_day_return_pct": None,
+        "worst_day_return_pct": None,
+        "historical_var_95_pct": None,
+        "historical_cvar_95_pct": None,
+    }
+    if not nav_points or starting_nav <= 0:
+        return result
+
+    final_nav = nav_points[-1][1]
+    cumulative_return = final_nav / starting_nav - 1.0
+    result["cumulative_return_pct"] = 100.0 * cumulative_return
+    if daily_returns:
+        returns = [value for _, value in daily_returns]
+        mean_daily = statistics.fmean(returns)
+        annualized_arithmetic_return = mean_daily * 252.0
+        if final_nav > 0:
+            result["annualized_return_pct"] = (
+                100.0 * ((final_nav / starting_nav) ** (252.0 / len(returns)) - 1.0)
+            )
+        if len(returns) > 1:
+            annualized_volatility = statistics.stdev(returns) * math.sqrt(252.0)
+            result["annualized_volatility_pct"] = 100.0 * annualized_volatility
+            if annualized_volatility > 0:
+                # No historical risk-free series is wired into the tool yet.
+                result["sharpe_ratio"] = annualized_arithmetic_return / annualized_volatility
+        downside_deviation = math.sqrt(
+            sum(min(value, 0.0) ** 2 for value in returns) / len(returns)
+        ) * math.sqrt(252.0)
+        if downside_deviation > 0:
+            result["sortino_ratio"] = annualized_arithmetic_return / downside_deviation
+        result["positive_day_pct"] = 100.0 * sum(value > 0 for value in returns) / len(returns)
+        result["best_day_return_pct"] = 100.0 * max(returns)
+        result["worst_day_return_pct"] = 100.0 * min(returns)
+        sorted_returns = sorted(returns)
+        tail_count = max(1, math.ceil(0.05 * len(sorted_returns)))
+        var_index = min(len(sorted_returns) - 1, math.floor(0.05 * (len(sorted_returns) - 1)))
+        result["historical_var_95_pct"] = -100.0 * sorted_returns[var_index]
+        result["historical_cvar_95_pct"] = -100.0 * statistics.fmean(sorted_returns[:tail_count])
+
+    peak_nav = nav_points[0][1]
+    peak_date = nav_points[0][0]
+    worst_drawdown = 0.0
+    worst_peak_date = peak_date
+    worst_trough_date = peak_date
+    worst_duration = 0
+    for mark_date, nav in nav_points:
+        if nav > peak_nav:
+            peak_nav, peak_date = nav, mark_date
+        drawdown = nav / peak_nav - 1.0 if peak_nav > 0 else 0.0
+        if drawdown < worst_drawdown:
+            worst_drawdown = drawdown
+            worst_peak_date = peak_date
+            worst_trough_date = mark_date
+            worst_duration = (mark_date - peak_date).days
+    result["max_drawdown_pct"] = 100.0 * worst_drawdown
+    result["max_drawdown_peak_date"] = worst_peak_date
+    result["max_drawdown_trough_date"] = worst_trough_date
+    result["max_drawdown_duration_days"] = worst_duration
+    if worst_drawdown < 0:
+        annualized_return_pct = result["annualized_return_pct"]
+        if annualized_return_pct is not None:
+            result["calmar_ratio"] = (annualized_return_pct / 100.0) / abs(worst_drawdown)
+    return result
 
 
 def _aggregate_groups(
@@ -267,13 +362,25 @@ def analyze_portfolio_horizon(
         point_date += timedelta(days=1)
     if not time_series_dates or time_series_dates[-1] != horizon_end_date:
         time_series_dates.append(horizon_end_date)
+    initial_covered_weight = sum(
+        float(position["weight"]) for position in positions if position["status"] == "priced"
+    )
+    initial_stale_weight = sum(
+        float(position["weight"])
+        for position in positions
+        if position["status"] == "priced"
+        and max_price_age_days is not None
+        and position.get("start_price_age_days") is not None
+        and position["start_price_age_days"] > max_price_age_days
+    )
     time_series: list[dict[str, Any]] = [
         {
             "date": as_of_date,
             "cumulative_pnl": 0.0,
             "return_contribution_pct_nav": 0.0,
-            "covered_weight": 0.0,
-            "coverage_pct": 0.0,
+            "covered_weight": initial_covered_weight,
+            "coverage_pct": 100.0 * initial_covered_weight / total_weight,
+            "stale_weight_pct": 100.0 * initial_stale_weight / total_weight,
         }
     ]
     for point_index, point_date in enumerate(time_series_dates, start=1):
@@ -400,6 +507,7 @@ def analyze_portfolio_horizon(
         "largest_issuer": max(issuer_exposure.items(), key=lambda item: item[1])[0],
         "largest_issuer_weight_pct": 100.0 * max(issuer_exposure.values()) / total_weight,
     }
+    summary.update(_performance_statistics(time_series, starting_nav))
     return PortfolioHorizonAnalysis(
         archive_id=str(archive.get("archive_id") or ""),
         portfolio_as_of_date=as_of_date,

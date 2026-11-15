@@ -92,9 +92,10 @@ price history but no valid yield observation available by the selected date.
 In **Portfolio tooling**, choose **Explore Nelson-Siegel curves**. For each
 mapped equity issuer ticker, the tool takes each unmatured bond's latest valid
 TRACE yield on or before the selected date and fits a four-parameter
-Nelson-Siegel curve to yield versus remaining maturity. The decay parameter is
-selected from a fixed 100-point log-spaced grid from 0.25 to 15 years; the three
-loadings are least-squares estimates. A ticker needs at least five bonds by
+Nelson-Siegel curve to yield versus remaining maturity. The three loadings are
+least-squares estimates. The decay parameter is selected by leave-one-bond-out
+fit error from 100 log-spaced candidates, bounded by the cross-section's
+maturity range (with a 0.5-year floor and a 15-year cap). A ticker needs at least five bonds by
 default and four distinct maturities. Tickers with insufficient observations
 are listed with the reason.
 
@@ -111,8 +112,41 @@ After fitting, use the **Curve explorer** tab to choose a fitted ticker. The
 upper chart overlays observed bond yields with the fitted curve; the lower chart
 shows each bond's observed-minus-fitted residual by remaining maturity. The
 table beneath it gives the exact ISIN, yield date, fitted yield, and residual.
-The **All results** tab includes tickers that could not be fitted and their
-minimum-data reason.
+The curve is drawn only across maturities represented by the ticker's bonds, so
+the plot does not imply a fitted value at zero maturity when there is no short
+bond observation. The displayed leave-one-out error is the tau selection score,
+not an independent out-of-sample forecast evaluation. The **All results** tab
+includes tickers that could not be fitted and their minimum-data reason.
+
+## Signal inventory and evaluation
+
+The launcher **Signal inventory** tab lists implemented signals and their
+validation status. Choose **Evaluate Nelson-Siegel residual signal** to run the
+first point-in-time test over a selected start/end range. On every TRACE yield
+date in that range, the evaluator fits the ticker curves using observations
+available by that date and records each bond's yield residual. It correlates
+that residual with the bond's yield change from its first valid TRACE
+observation on or after T+1 through its last valid observation by T+end. The
+start observation delay, horizon-end staleness, price staleness, signal
+staleness, minimum curve size, and horizon are configurable. Results include
+pooled and average daily Pearson/Spearman correlations.
+
+The evaluator also ranks eligible bonds across the cross-section by residual,
+goes long the top quantile (cheap versus the issuer curve), and shorts the
+bottom quantile (rich). It reports the equal-weighted long-short result using
+historical fixed-rate bond total returns when every selected position has valid
+boundary prices; partial leg coverage is reported without silently reweighting
+the strategy. It also reports a modified-duration-adjusted yield-only return
+proxy. The total-return calculation uses the current synthetic coupon schedule
+and excludes costs, taxes, defaults, and coupon reinvestment. TRACE history does
+not currently include a Treasury benchmark, so the tested forward yield change
+is only a spread-change proxy, not a benchmark-relative option-adjusted spread.
+Signal dates are drawn from the supplied bond list and are not historical index
+membership. The TRACE store does not retain immutable observation vintages, so
+later corrections to historical observations can affect this retrospective
+test. Forward windows overlap; the date-level summary is descriptive and is not
+an independent or annualized performance estimate. Export the date report JSON
+and bond-date observation CSV for further analysis.
 
 ## Portfolio horizon P&L
 
@@ -133,7 +167,11 @@ the selected horizon. It carries the latest valid clean price forward across
 missing observations while accruing interest and coupon cash flows by mark
 date; the stale marked weight is reported. Partition attribution tables and
 P&L charts show the configurable largest contributors by absolute P&L, so both
-gains and losses can appear in the ranking.
+gains and losses can appear in the ranking. The performance summary includes
+cumulative and annualized return, annualized volatility, Sharpe and Sortino
+ratios, maximum drawdown, Calmar ratio, positive-day share, and historical
+95% VaR/CVaR. Annualization assumes 252 weekday marks; Sharpe uses a zero
+risk-free rate and Sortino uses a zero return target.
 
 ## Bond total return
 
