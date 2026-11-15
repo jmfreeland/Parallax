@@ -167,6 +167,13 @@ class SignalReturnScatterChart(QWidget):
         y_min, y_max = y_min - y_pad, y_max + y_pad
         x_map = lambda value: left + (value - x_min) / (x_max - x_min) * (right - left)
         y_map = lambda value: bottom - (value - y_min) / (y_max - y_min) * (bottom - top)
+        x_mean = sum(xs) / len(xs)
+        y_mean = sum(ys) / len(ys)
+        x_variance_sum = sum((value - x_mean) ** 2 for value in xs)
+        fit_line: tuple[float, float] | None = None
+        if len(xs) >= 2 and x_variance_sum > 0:
+            slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / x_variance_sum
+            fit_line = (slope, y_mean - slope * x_mean)
 
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 22), Qt.AlignmentFlag.AlignLeft,
@@ -187,10 +194,22 @@ class SignalReturnScatterChart(QWidget):
         if y_min <= 0 <= y_max:
             painter.setPen(QPen(QColor("#64748b"), 1, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(left, y_map(0.0)), QPointF(right, y_map(0.0)))
+        if fit_line is not None:
+            slope, intercept = fit_line
+            painter.setPen(QPen(QColor("#fbbf24"), 2, Qt.PenStyle.DashLine))
+            painter.drawLine(
+                QPointF(x_map(min(xs)), y_map(slope * min(xs) + intercept)),
+                QPointF(x_map(max(xs)), y_map(slope * max(xs) + intercept)),
+            )
         painter.setPen(QPen(QColor("#38bdf8"), 1))
         painter.setBrush(QColor(56, 189, 248, 170))
         for x_value, y_value in zip(xs, ys):
             painter.drawEllipse(QPointF(x_map(x_value), y_map(y_value)), 4.0, 4.0)
+        if fit_line is not None:
+            painter.setPen(QPen(QColor("#fbbf24"), 2, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(left + 18, self.height() - 13), QPointF(left + 44, self.height() - 13))
+            painter.setPen(QColor("#e2e8f0"))
+            painter.drawText(QRectF(left + 50, self.height() - 22, 125, 18), Qt.AlignmentFlag.AlignLeft, "OLS best-fit line")
         painter.end()
 
 
@@ -518,7 +537,7 @@ class SignalEvaluationWindow(QMainWindow):
             if path.parent.name.startswith(parent_prefix)
             and (
                 parent_prefix != "clean_id="
-                or self._has_current_cleaning_version(path)
+                or SignalEvaluationWindow._has_current_cleaning_version(path)
             )
         ]
         if not candidates:

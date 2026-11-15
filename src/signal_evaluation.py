@@ -411,6 +411,7 @@ def evaluate_nelson_siegel_signal(
             row["bond_total_return_error"] = ""
         cumulative_demeaned: dict[str, float] = defaultdict(float)
         cumulative_raw: dict[str, float] = defaultdict(float)
+        cumulative_portfolio_raw: dict[str, float] = defaultdict(float)
         active_isins: set[str] = set()
         scatter_outcomes: dict[str, list[float | None]] = {
             row["isin"]: [None] * horizon_days for row in signals
@@ -422,10 +423,11 @@ def evaluate_nelson_siegel_signal(
                 if isin in signal_ids:
                     cumulative_demeaned[isin] += change
                     active_isins.add(isin)
-            if change_date in demeaned_changes_after_signal:
+            if change_date in raw_changes_after_signal:
                 for isin, change in raw_changes_after_signal.get(change_date, {}).items():
                     if isin in signal_ids:
                         cumulative_raw[isin] += change
+                        cumulative_portfolio_raw[isin] += change
 
             for isin in active_isins:
                 scatter_outcomes[isin][horizon - 1] = -cumulative_demeaned[isin]
@@ -440,12 +442,12 @@ def evaluate_nelson_siegel_signal(
             pooled_targets.extend(side_adjusted_targets)
 
             long_leg_proxy = [
-                -float(row["modified_duration_years"]) * cumulative_demeaned[row["isin"]]
+                -float(row["modified_duration_years"]) * cumulative_portfolio_raw[row["isin"]]
                 if row["modified_duration_years"] is not None else 0.0
                 for row in long_leg
             ]
             short_leg_proxy = [
-                -float(row["modified_duration_years"]) * cumulative_demeaned[row["isin"]]
+                -float(row["modified_duration_years"]) * cumulative_portfolio_raw[row["isin"]]
                 if row["modified_duration_years"] is not None else 0.0
                 for row in short_leg
             ]
@@ -562,10 +564,10 @@ def evaluate_nelson_siegel_signal(
         date_position = date_index - 1
         if date_position + 1 < len(ordered_signal_dates) and long_leg and short_leg:
             next_signal_date = ordered_signal_dates[date_position + 1]
-            # Accumulate each intervening de-meaned daily move for the holding
-            # period; the next signal date itself is only the rebalance mark.
+            # Accumulate raw observed daily moves for portfolio P&L. De-meaning
+            # is reserved for signal correlation and horizon analysis.
             next_changes: dict[str, float] = defaultdict(float)
-            for change_date, changes in demeaned_changes_after_signal.items():
+            for change_date, changes in raw_changes_after_signal.items():
                 if as_of < change_date <= next_signal_date:
                     for isin, change in changes.items():
                         next_changes[isin] += change
@@ -707,9 +709,9 @@ def evaluate_nelson_siegel_signal(
         "spread_measurement": "TRACE yield-level/change proxy; no Treasury benchmark-relative spread available",
         "percentile_definition": "mid-rank percentile of the partition median latest TRACE yield versus strictly prior partition medians in trailing history; partition signals apply to all constituent bonds and portfolio legs are bond equal-weighted"
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
-        "strategy_return_definition": "equal-weighted bonds in the top signal quantile long and bottom quantile short; percentile signals select whole partition tails; fixed modified-duration yield-only return proxy; missing changes contribute zero and coverage is reported",
+        "strategy_return_definition": "equal-weighted bonds in the top signal quantile long and bottom quantile short; percentile signals select whole partition tails; fixed modified-duration yield-only return proxy uses raw observed yield changes without cross-sectional demeaning; missing changes contribute zero and coverage is reported",
         "total_return_definition": "at maximum horizon, equal-weighted long minus short fixed-rate bond total return; reported only with full price coverage",
-        "rebalanced_series_definition": "daily signal selection held to next TRACE signal date; show covered total-return contribution and duration-adjusted yield-change proxy, missing position contributions are zero and coverage is reported; yield changes are de-meaned for Nelson-Siegel residual and raw for historical partition percentile",
+        "rebalanced_series_definition": "daily signal selection held to next TRACE signal date; show covered total-return contribution and duration-adjusted yield-change proxy using raw observed yield changes without cross-sectional demeaning; missing position contributions are zero and coverage is reported",
     }
     summary = {
         **metadata,

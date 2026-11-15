@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from .portfolio_analytics import PortfolioHorizonAnalysis, analyze_portfolio_horizon
 from .portfolio_archive import load_archive
+from .portfolio_covariance import calculate_portfolio_covariance
 from .trace_history import DATABASE_PATH
 
 
@@ -62,6 +63,43 @@ class AnalysisWorker(QThread):
                 self.archive,
                 horizon_end_date=self.end_date,
                 starting_nav=self.starting_nav,
+                max_price_age_days=self.max_price_age_days,
+                database_path=DATABASE_PATH,
+                on_progress=self.progress.emit,
+            )
+            self.succeeded.emit(result)
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
+class CovarianceWorker(QThread):
+    progress = Signal(int, int)
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        archive: dict[str, Any],
+        as_of_date: date,
+        lookback_days: int,
+        minimum_pair_observations: int,
+        max_price_age_days: int,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.archive = archive
+        self.as_of_date = as_of_date
+        self.lookback_days = lookback_days
+        self.minimum_pair_observations = minimum_pair_observations
+        self.max_price_age_days = max_price_age_days
+
+    def run(self) -> None:
+        try:
+            result = calculate_portfolio_covariance(
+                self.archive,
+                as_of_date=self.as_of_date,
+                lookback_days=self.lookback_days,
+                minimum_pair_observations=self.minimum_pair_observations,
                 max_price_age_days=self.max_price_age_days,
                 database_path=DATABASE_PATH,
                 on_progress=self.progress.emit,
@@ -215,6 +253,8 @@ class PortfolioAnalyticsWindow(QMainWindow):
         self.archives: list[dict[str, Any]] = []
         self.analysis: PortfolioHorizonAnalysis | None = None
         self.worker: AnalysisWorker | None = None
+        self.covariance_result: dict[str, Any] | None = None
+        self.covariance_worker: CovarianceWorker | None = None
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -354,6 +394,84 @@ class PortfolioAnalyticsWindow(QMainWindow):
         characteristics_layout.addWidget(self.maturity_exposure_table)
         characteristics_layout.addWidget(self.issuer_exposure_table)
         self.tabs.addTab(characteristics, "Characteristics")
+
+        covariance_page = QWidget()
+        covariance_layout = QVBoxLayout(covariance_page)
+        covariance_controls = QHBoxLayout()
+        covariance_controls.addWidget(QLabel("As of"))
+        self.covariance_as_of = QDateEdit(calendarPopup=True)
+        self.covariance_as_of.setDisplayFormat("yyyy-MM-dd")
+        covariance_controls.addWidget(self.covariance_as_of)
+        covariance_controls.addWidget(QLabel("Lookback (calendar days)"))
+        self.covariance_lookback = QSpinBox()
+        self.covariance_lookback.setRange(30, 3650)
+        self.covariance_lookback.setValue(365)
+        covariance_controls.addWidget(self.covariance_lookback)
+        covariance_controls.addWidget(QLabel("Minimum pair observations"))
+        self.covariance_min_observations = QSpinBox()
+        self.covariance_min_observations.setRange(2, 1000)
+        self.covariance_min_observations.setValue(20)
+        covariance_controls.addWidget(self.covariance_min_observations)
+        covariance_controls.addWidget(QLabel("Max price age (days)"))
+        self.covariance_price_age = QSpinBox()
+        self.covariance_price_age.setRange(0, 90)
+        self.covariance_price_age.setValue(7)
+        covariance_controls.addWidget(self.covariance_price_age)
+        self.covariance_run_button = QPushButton("Calculate covariance")
+        self.covariance_run_button.clicked.connect(self._calculate_covariance)
+        covariance_controls.addWidget(self.covariance_run_button)
+        covariance_layout.addLayout(covariance_controls)
+
+        covariance_view_controls = QHBoxLayout()
+        covariance_view_controls.addWidget(QLabel("Display"))
+        self.covariance_metric = QComboBox()
+        self.covariance_metric.addItem("Covariance (bps²)", "covariance_bps_squared")
+        self.covariance_metric.addItem("Correlation", "correlation")
+        self.covariance_metric.currentIndexChanged.connect(self._covariance_metric_changed)
+        covariance_view_controls.addWidget(self.covariance_metric)
+        covariance_view_controls.addWidget(QLabel("Partition view"))
+        self.covariance_partition = QComboBox()
+        self.covariance_partition.addItem("Individual bonds", "bond")
+        self.covariance_partition.addItem("Sector", "sector")
+        self.covariance_partition.addItem("Issuer", "issuer_name")
+        self.covariance_partition.addItem("Maturity bucket", "maturity_bucket")
+        self.covariance_partition.currentIndexChanged.connect(self._render_covariance)
+        covariance_view_controls.addWidget(self.covariance_partition)
+        covariance_view_controls.addWidget(QLabel("Color lower"))
+        self.covariance_color_min = QDoubleSpinBox()
+        self.covariance_color_min.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.covariance_color_min.setDecimals(4)
+        self.covariance_color_min.setValue(-1.0)
+        self.covariance_color_min.valueChanged.connect(self._render_covariance)
+        covariance_view_controls.addWidget(self.covariance_color_min)
+        covariance_view_controls.addWidget(QLabel("Color upper"))
+        self.covariance_color_max = QDoubleSpinBox()
+        self.covariance_color_max.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.covariance_color_max.setDecimals(4)
+        self.covariance_color_max.setValue(1.0)
+        self.covariance_color_max.valueChanged.connect(self._render_covariance)
+        covariance_view_controls.addWidget(self.covariance_color_max)
+        self.covariance_auto_scale = QPushButton("Auto scale")
+        self.covariance_auto_scale.clicked.connect(self._auto_scale_covariance)
+        covariance_view_controls.addWidget(self.covariance_auto_scale)
+        covariance_layout.addLayout(covariance_view_controls)
+
+        self.covariance_status = QLabel("Calculate a covariance matrix for the selected archived portfolio.")
+        self.covariance_status.setWordWrap(True)
+        covariance_layout.addWidget(self.covariance_status)
+        covariance_layout.addWidget(QLabel(
+            "Daily clean-price returns use weekday marks carried forward for at most the selected price age; "
+            "coupon and carry are excluded. Estimates use pairwise overlapping dates and can be noisy or non-PSD. "
+            "Partition cells average the bond-pair estimates; diagonal cells include bond variances or self-correlations. "
+            "Colors run from blue (low/negative) through white near zero to red (high/positive)."
+        ))
+        self.covariance_table = QTableWidget(0, 0)
+        self.covariance_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.covariance_table.setAlternatingRowColors(False)
+        self.covariance_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.covariance_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        covariance_layout.addWidget(self.covariance_table, 1)
+        self.tabs.addTab(covariance_page, "Covariance explorer")
         layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(central)
@@ -406,8 +524,195 @@ class PortfolioAnalyticsWindow(QMainWindow):
         as_of_date = date.fromisoformat(self.archives[index]["as_of_date"])
         initial_end = max(date.today(), as_of_date + timedelta(days=90))
         self.end_date.setDate(QDate(initial_end.year, initial_end.month, initial_end.day))
+        self.covariance_as_of.setDate(QDate(as_of_date.year, as_of_date.month, as_of_date.day))
         self.analysis = None
+        self.covariance_result = None
+        self.covariance_table.clear()
+        self.covariance_table.setRowCount(0)
+        self.covariance_table.setColumnCount(0)
+        self.covariance_status.setText("Calculate a covariance matrix for the selected archived portfolio.")
         self.export_button.setEnabled(False)
+
+    def _calculate_covariance(self) -> None:
+        if self.covariance_worker is not None and self.covariance_worker.isRunning():
+            return
+        archive_index = self.archive_selector.currentIndex()
+        if archive_index < 0:
+            QMessageBox.information(self, "No archived portfolio", "Save or select a portfolio first.")
+            return
+        as_of_date = date.fromisoformat(self.covariance_as_of.date().toString("yyyy-MM-dd"))
+        self.covariance_run_button.setEnabled(False)
+        self.covariance_status.setText("Loading TRACE clean prices and estimating pairwise covariance...")
+        self.progress.setRange(0, len(self.archives[archive_index].get("positions", [])))
+        self.progress.setValue(0)
+        self.covariance_worker = CovarianceWorker(
+            self.archives[archive_index],
+            as_of_date,
+            self.covariance_lookback.value(),
+            self.covariance_min_observations.value(),
+            self.covariance_price_age.value(),
+            self,
+        )
+        self.covariance_worker.progress.connect(self._covariance_progress)
+        self.covariance_worker.succeeded.connect(self._covariance_succeeded)
+        self.covariance_worker.failed.connect(self._covariance_failed)
+        self.covariance_worker.start()
+
+    def _covariance_progress(self, completed: int, total: int) -> None:
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(completed)
+        self.covariance_status.setText(f"Building marked daily return series: {completed:,}/{total:,} bonds")
+
+    def _covariance_succeeded(self, result: dict[str, Any]) -> None:
+        self.covariance_worker = None
+        self.covariance_run_button.setEnabled(True)
+        archive_index = self.archive_selector.currentIndex()
+        if archive_index < 0 or self.archives[archive_index].get("archive_id") != result.get("archive_id"):
+            return
+        self.covariance_result = result
+        self.covariance_status.setText(
+            f"{result['series_count']:,} bonds | {result['window_start_date']} to {result['window_end_date']} | "
+            f"{result['eligible_pair_count']:,}/{result['total_pair_count']:,} bond pairs meet the "
+            f"{result['minimum_pair_observations']}-observation minimum | "
+            f"median shared observations: {result['median_eligible_pair_observations'] or 0:.0f}. "
+            "Change metric, partition, or color bounds without recalculating."
+        )
+        self._auto_scale_covariance()
+        self._render_covariance()
+
+    def _covariance_failed(self, message: str) -> None:
+        self.covariance_worker = None
+        self.covariance_run_button.setEnabled(True)
+        self.covariance_status.setText("Covariance calculation failed.")
+        QMessageBox.warning(self, "Could not calculate covariance", message)
+
+    def _covariance_metric_changed(self, *_args: Any) -> None:
+        if self.covariance_result is not None:
+            self._auto_scale_covariance()
+        self._render_covariance()
+
+    def _auto_scale_covariance(self) -> None:
+        if self.covariance_result is None:
+            return
+        matrix_key = self.covariance_metric.currentData()
+        matrix = self.covariance_result[matrix_key]
+        values = [abs(value) for row in matrix for value in row if value is not None]
+        maximum = max(values, default=1.0)
+        if matrix_key == "correlation":
+            lower, upper = -1.0, 1.0
+        else:
+            maximum = maximum or 1.0
+            lower, upper = -maximum, maximum
+        self.covariance_color_min.blockSignals(True)
+        self.covariance_color_max.blockSignals(True)
+        self.covariance_color_min.setValue(lower)
+        self.covariance_color_max.setValue(upper)
+        self.covariance_color_min.blockSignals(False)
+        self.covariance_color_max.blockSignals(False)
+
+    @staticmethod
+    def _blend_color(start: QColor, end: QColor, fraction: float) -> QColor:
+        fraction = min(1.0, max(0.0, fraction))
+        return QColor(
+            round(start.red() + (end.red() - start.red()) * fraction),
+            round(start.green() + (end.green() - start.green()) * fraction),
+            round(start.blue() + (end.blue() - start.blue()) * fraction),
+        )
+
+    def _covariance_color(self, value: float) -> QColor:
+        lower = self.covariance_color_min.value()
+        upper = self.covariance_color_max.value()
+        blue = QColor("#2563eb")
+        neutral = QColor("#f8fafc")
+        red = QColor("#dc2626")
+        if lower < 0 < upper:
+            if value <= 0:
+                return self._blend_color(blue, neutral, (value - lower) / -lower)
+            return self._blend_color(neutral, red, value / upper)
+        if lower >= 0:
+            return self._blend_color(neutral, red, (value - lower) / (upper - lower))
+        return self._blend_color(blue, neutral, (value - lower) / (upper - lower))
+
+    def _render_covariance(self, *_args: Any) -> None:
+        if self.covariance_result is None:
+            return
+        lower, upper = self.covariance_color_min.value(), self.covariance_color_max.value()
+        if upper <= lower:
+            self.covariance_status.setText("Color upper bound must be greater than the lower bound.")
+            return
+        metric_key = self.covariance_metric.currentData()
+        source_matrix = self.covariance_result[metric_key]
+        observation_counts = self.covariance_result["observation_counts"]
+        positions = self.covariance_result["positions"]
+        partition = self.covariance_partition.currentData()
+        if partition == "bond":
+            labels = [position["label"] for position in positions]
+            matrix = source_matrix
+            tooltips = [
+                [
+                    f"{positions[row]['label']} × {positions[column]['label']}\n"
+                    f"{self.covariance_result['minimum_pair_observations']} observations required; "
+                    f"{observation_counts[row][column]:,} shared daily observations"
+                    for column in range(len(positions))
+                ]
+                for row in range(len(positions))
+            ]
+        else:
+            grouped: dict[str, list[int]] = {}
+            for index, position in enumerate(positions):
+                group = str(position.get(partition) or "Unclassified")
+                grouped.setdefault(group, []).append(index)
+            labels = sorted(grouped)
+            matrix = []
+            tooltips = []
+            for row_label in labels:
+                matrix_row = []
+                tooltip_row = []
+                for column_label in labels:
+                    values: list[float] = []
+                    counts: list[int] = []
+                    for row_index in grouped[row_label]:
+                        for column_index in grouped[column_label]:
+                            value = source_matrix[row_index][column_index]
+                            if value is not None:
+                                values.append(float(value))
+                                counts.append(int(observation_counts[row_index][column_index]))
+                    matrix_row.append(sum(values) / len(values) if values else None)
+                    mean_count = sum(counts) / len(counts) if counts else 0.0
+                    tooltip_row.append(
+                        f"Mean of {len(values):,} available bond-pair estimates\n"
+                        f"Mean shared daily observations per estimate: {mean_count:.1f}"
+                    )
+                matrix.append(matrix_row)
+                tooltips.append(tooltip_row)
+
+        self.covariance_table.clear()
+        self.covariance_table.setRowCount(len(labels))
+        self.covariance_table.setColumnCount(len(labels))
+        self.covariance_table.setHorizontalHeaderLabels(labels)
+        self.covariance_table.setVerticalHeaderLabels(labels)
+        is_correlation = metric_key == "correlation"
+        for row_index, row_values in enumerate(matrix):
+            for column_index, value in enumerate(row_values):
+                item = QTableWidgetItem("—" if value is None else (f"{float(value):.3f}" if is_correlation else f"{float(value):,.2f}"))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setToolTip(tooltips[row_index][column_index])
+                if value is None:
+                    item.setBackground(QColor("#334155"))
+                    item.setForeground(QColor("#cbd5e1"))
+                else:
+                    color = self._covariance_color(float(value))
+                    item.setBackground(color)
+                    luminance = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+                    item.setForeground(QColor("#0b1220" if luminance > 145 else "#ffffff"))
+                self.covariance_table.setItem(row_index, column_index, item)
+        unit = "correlation" if is_correlation else "bps²"
+        self.covariance_status.setText(
+            f"{self.covariance_result['series_count']:,} bonds | {self.covariance_result['window_start_date']} to "
+            f"{self.covariance_result['window_end_date']} | showing {len(labels):,} "
+            f"{('bonds' if partition == 'bond' else self.covariance_partition.currentText().lower() + ' groups')} | "
+            f"{unit}; blanks have fewer than {self.covariance_result['minimum_pair_observations']} shared observations."
+        )
 
     def _analyze(self) -> None:
         index = self.archive_selector.currentIndex()

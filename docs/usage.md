@@ -231,6 +231,22 @@ ratios, maximum drawdown, Calmar ratio, positive-day share, and historical
 95% VaR/CVaR. Annualization assumes 252 weekday marks; Sharpe uses a zero
 risk-free rate and Sortino uses a zero return target.
 
+## Portfolio covariance explorer
+
+In **Analyze archived portfolio**, open **Covariance explorer** and calculate
+the matrix for the selected archived holdings. The initial view shows
+bond-to-bond sample covariance of daily clean-price returns in bps². Values
+are based on shared weekday marks that carry the latest TRACE price forward
+for up to the selected age; coupon and carry are excluded. Each bond pair uses
+its own overlapping dates and must meet the selected minimum observation
+count, so the pairwise matrix can be noisy and need not be positive
+semidefinite. Switch to correlation or aggregate the bond-pair estimates by
+sector, issuer, or maturity bucket without recalculating. Partition cells show
+the mean available bond-pair estimate; diagonal blocks include each bond's
+variance or self-correlation.
+Set color lower and upper bounds manually or use **Auto scale**. Hover a cell
+for its available pair count or mean shared-observation coverage.
+
 ## Bond total return
 
 `src.bond_returns.calculate_historical_bond_total_return` calculates an
