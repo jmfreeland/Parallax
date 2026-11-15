@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Sequence
 
 import QuantLib as ql
 import duckdb
@@ -30,6 +31,8 @@ class BondTotalReturn:
     start_dirty_price_per_100: float
     end_dirty_value_per_100: float
     cashflows_received_per_100: float
+    coupon_cashflows_received_per_100: float
+    principal_repayment_per_100: float
     total_return: float
     total_return_pct: float
     start_price_age_days: int
@@ -92,6 +95,7 @@ def calculate_historical_bond_total_return(
     database_path: Path = DATABASE_PATH,
     coupon_frequency: int = 2,
     max_price_age_days: int | None = 5,
+    price_observations: Sequence[tuple[date, float | None]] | None = None,
 ) -> BondTotalReturn:
     """Calculate a bond's total return over a requested historical window.
 
@@ -127,16 +131,23 @@ def calculate_historical_bond_total_return(
         else date.min
     )
     query_end = min(end_date, maturity_date)
-    connection = duckdb.connect(str(database_path), read_only=True)
-    try:
-        rows = connection.execute(
-            """SELECT trade_date, price FROM observations
-               WHERE isin = ? AND trade_date BETWEEN ? AND ?
-               ORDER BY trade_date""",
-            [isin.strip().upper(), query_start, query_end],
-        ).fetchall()
-    finally:
-        connection.close()
+    if price_observations is None:
+        connection = duckdb.connect(str(database_path), read_only=True)
+        try:
+            rows = connection.execute(
+                """SELECT trade_date, price FROM observations
+                   WHERE isin = ? AND trade_date BETWEEN ? AND ?
+                   ORDER BY trade_date""",
+                [isin.strip().upper(), query_start, query_end],
+            ).fetchall()
+        finally:
+            connection.close()
+    else:
+        rows = [
+            (trade_date, raw_price)
+            for trade_date, raw_price in price_observations
+            if query_start <= trade_date <= query_end
+        ]
 
     prices = [
         (trade_date, clean_price)
@@ -204,6 +215,8 @@ def calculate_historical_bond_total_return(
             for cashflow in bond.cashflows()
             if start_price_date < _python_date(cashflow.date()) <= effective_end_date
         )
+        principal_repayment = 100.0 if matures_in_window else 0.0
+        coupon_cashflows = cashflows - principal_repayment
         total_return = (end_dirty + cashflows - start_dirty) / start_dirty
     finally:
         settings.evaluationDate = previous_evaluation_date
@@ -222,6 +235,8 @@ def calculate_historical_bond_total_return(
         start_dirty_price_per_100=start_dirty,
         end_dirty_value_per_100=end_dirty,
         cashflows_received_per_100=cashflows,
+        coupon_cashflows_received_per_100=coupon_cashflows,
+        principal_repayment_per_100=principal_repayment,
         total_return=total_return,
         total_return_pct=total_return * 100.0,
         start_price_age_days=start_age,

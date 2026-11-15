@@ -87,7 +87,53 @@ liquidity-adjusted risk estimate.
 The optional **Require valid yield by date** filter excludes bonds with valid
 price history but no valid yield observation available by the selected date.
 
-## Reproducibility
+### Nelson-Siegel ticker curves
+
+In **Portfolio tooling**, choose **Explore Nelson-Siegel curves**. For each
+mapped equity issuer ticker, the tool takes each unmatured bond's latest valid
+TRACE yield on or before the selected date and fits a four-parameter
+Nelson-Siegel curve to yield versus remaining maturity. The decay parameter is
+selected from a fixed 100-point log-spaced grid from 0.25 to 15 years; the three
+loadings are least-squares estimates. A ticker needs at least five bonds by
+default and four distinct maturities. Tickers with insufficient observations
+are listed with the reason.
+
+The output reports fitted yield and observed-minus-fitted yield residual in
+percentage points. A positive residual is labelled cheap versus that ticker's
+curve; a negative residual is labelled rich. This is a cross-sectional
+relative-value signal candidate, not a validated future-return forecast. The
+fit uses equity issuer ticker because rating data are not yet available; it
+does not control for rating, seniority, coupon, optionality, liquidity, or
+TRACE observation age. Export results to CSV to preserve the date-specific
+fits and diagnostics.
+
+After fitting, use the **Curve explorer** tab to choose a fitted ticker. The
+upper chart overlays observed bond yields with the fitted curve; the lower chart
+shows each bond's observed-minus-fitted residual by remaining maturity. The
+table beneath it gives the exact ISIN, yield date, fitted yield, and residual.
+The **All results** tab includes tickers that could not be fitted and their
+minimum-data reason.
+
+## Portfolio horizon P&L
+
+In the launcher's **Portfolio tooling** tab, choose **Analyze archived portfolio**
+to calculate a saved portfolio's horizon P&L through a selected end date. The
+view includes bond, sector, and maturity-bucket attribution for clean-price
+movement, coupon cash plus accrued-interest change, and principal repayment;
+it also summarizes sector and maturity exposure, coupon/yield coverage,
+remaining maturity, issuer concentration, and priced-weight coverage. Use the
+price-age control to set the maximum age of boundary prices. Unpriced positions
+remain uncovered rather than being reweighted; both covered P&L contribution
+and the return normalized to priced positions are shown. The summary includes
+weighted modified duration on positions with reported yields. Bond attribution
+can be exported as CSV. The calculation holds the archived weights constant
+without rebalancing, and coupon or redemption proceeds earn zero after receipt.
+The **Time series** tab plots cumulative P&L at monthly month-end marks and at
+the selected horizon. Partition attribution tables and P&L charts show the
+configurable largest contributors by absolute P&L, so both gains and losses can
+appear in the ranking.
+
+## Bond total return
 
 `src.bond_returns.calculate_historical_bond_total_return` calculates an
 individual fixed-rate bond's holding-period return from TRACE clean prices,
@@ -113,5 +159,7 @@ print(result.total_return_pct)
 Coupon dates are estimated by rolling a semiannual schedule back from maturity
 because actual issue/coupon dates are not in the snapshot. Coupon cash is not
 reinvested; fees, taxes, defaults, and settlement lag are not included.
+
+## Reproducibility
 
 Record the Git commit, run ID, population snapshot hash/date, requested date range, source and retrieval timestamps, cleaning-policy version, and diagnostics path with every analysis. Do not refresh a dataset in place without retaining the prior vintage.
