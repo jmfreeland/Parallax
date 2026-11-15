@@ -38,6 +38,14 @@ Create or resume a run in **Download TRACE history**. The downloader derives a C
 
 Before treating a run as research-ready, check feed lag, zero/sentinel values, the review status, LQD population date versus TRACE retrieval date, and FINRA/OpenBB usage rights.
 
+In **Download TRACE history**, use **Refetch + fill price/yield gaps** to
+re-request bonds with missing or invalid observations in the selected run's
+date window. Existing valid raw values are preserved. A fetched value replaces
+an existing invalid/missing value only when it passes the TRACE cleaning
+policy; each replacement is recorded in `observation_augmentation_fields`,
+with run-level counts in `observation_augmentation_runs`. The run's Parquet
+export is refreshed when values or rows are added.
+
 ## Cleaning and inspection
 
 ```bash
@@ -47,6 +55,63 @@ uv run python -m src.trace_history_inspector
 
 The preprocessor writes clean Parquet and diagnostics beneath `data/trace/preprocessed/`; it never modifies raw observations. The inspector displays individual bonds or equal-bond-weighted group levels. Its volatility and momentum columns are changes in a plotted level, not an investable return signal. See [signal methodology](signal_methodology.tex).
 
+## Exploratory portfolios
+
+Open the **Portfolio tooling** tab in the launcher and choose **Build exploratory portfolio**. Choose a bond-list CSV
+with an `isin` column, an as-of date, and a weighting method. A bond enters the
+date-specific universe only if at least one valid TRACE price or yield exists
+on or before that date. The table shows when each bond's valid history began
+and its latest price and yield observations with their separate dates; bonds
+already matured by the portfolio date are excluded. Select a table row to see
+separate clean-price and yield scatter plots from 90 days before through 90 days
+after the portfolio date. The post-date chart points are visual context only;
+portfolio membership and weights use no observations after the selected date.
+Export the selected portfolio and its weights as CSV for further analysis. The
+supplied bond list controls the candidate universe, so the tool does not
+recreate historical index membership.
+
+Use **Save to archive** in the builder to save a self-contained JSON record under
+`data/portfolio_archive/`. The record retains its creation timestamp, as-of date,
+bond-list path, weighting methodology and parameters, universe/exclusion counts,
+and every portfolio position and weight. Review saved records and methodology
+details in the launcher's **Portfolio tooling** tab. CSV export remains available
+for analysis outside Parallax.
+
+Equal weight assigns the same weight to every eligible bond. Inverse
+price-return variance uses consecutive observed log clean-price changes over
+the trailing calendar window and excludes bonds without the requested minimum
+number of observations. These are exploratory price-only weights; TRACE
+observations are irregular and this method is not a total-return or
+liquidity-adjusted risk estimate.
+
+The optional **Require valid yield by date** filter excludes bonds with valid
+price history but no valid yield observation available by the selected date.
+
 ## Reproducibility
+
+`src.bond_returns.calculate_historical_bond_total_return` calculates an
+individual fixed-rate bond's holding-period return from TRACE clean prices,
+accrued interest, and coupon/redemption cash flows. Pass the bond's ISIN,
+coupon, maturity, and requested dates. It returns the actual selected price
+dates and the return as both a decimal and a percentage. By default, each
+boundary price must be no more than five calendar days old.
+
+```python
+from datetime import date
+from src.bond_returns import calculate_historical_bond_total_return
+
+result = calculate_historical_bond_total_return(
+    isin="US001055BJ00",
+    start_date=date(2025, 1, 2),
+    end_date=date(2025, 12, 31),
+    coupon_pct=3.6,
+    maturity_date=date(2030, 4, 1),
+)
+print(result.total_return_pct)
+```
+
+Coupon dates are estimated by rolling a semiannual schedule back from maturity
+because actual issue/coupon dates are not in the snapshot. Coupon cash is not
+reinvested; fees, taxes, defaults, and settlement lag are not included.
 
 Record the Git commit, run ID, population snapshot hash/date, requested date range, source and retrieval timestamps, cleaning-policy version, and diagnostics path with every analysis. Do not refresh a dataset in place without retaining the prior vintage.

@@ -4,3 +4,5 @@ PySide6-Essentials>=6.8
 openbb-finra>=2.0,<3
 duckdb>=1.4,<3
 polars>=1.0
+QuantLib>=1.35
+numpy>=1.26

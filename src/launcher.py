@@ -14,6 +14,8 @@ from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from .portfolio_archive import ARCHIVE_DIR, load_archive
+
 from PySide6.QtCore import QProcess, QProcessEnvironment, QThread, Qt, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
@@ -125,6 +127,32 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self.status)
 
         self.tabs = QTabWidget()
+        portfolio_page = QWidget()
+        portfolio_layout = QVBoxLayout(portfolio_page)
+        portfolio_actions = QGridLayout()
+        build_portfolio = QPushButton("Build exploratory portfolio")
+        build_portfolio.clicked.connect(lambda: self._launch("src.portfolio_builder_app"))
+        self.buttons.append(build_portfolio)
+        portfolio_actions.addWidget(build_portfolio, 0, 0)
+        refresh_archive = QPushButton("Refresh archive")
+        refresh_archive.clicked.connect(self._refresh_portfolio_archive)
+        portfolio_actions.addWidget(refresh_archive, 0, 1)
+        portfolio_layout.addLayout(portfolio_actions)
+        self.portfolio_archive_table = QTableWidget(0, 5)
+        self.portfolio_archive_table.setHorizontalHeaderLabels(
+            ["Created", "As of", "Weighting", "Positions", "Archive file"]
+        )
+        self.portfolio_archive_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.portfolio_archive_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.portfolio_archive_table.horizontalHeader().setStretchLastSection(True)
+        self.portfolio_archive_table.currentCellChanged.connect(self._show_portfolio_archive)
+        portfolio_layout.addWidget(self.portfolio_archive_table, 2)
+        self.portfolio_archive_details = QTextEdit()
+        self.portfolio_archive_details.setReadOnly(True)
+        self.portfolio_archive_details.setPlaceholderText("Select an archived portfolio to inspect its methodology and positions.")
+        portfolio_layout.addWidget(self.portfolio_archive_details, 3)
+        self.tabs.addTab(portfolio_page, "Portfolio tooling")
+
         self.diagnostics = QTextEdit()
         self.diagnostics.setReadOnly(True)
         diagnostics_page = QWidget()
@@ -176,6 +204,44 @@ class LauncherWindow(QMainWindow):
         self._load_task_history()
         self._refresh_diagnostics()
         self._populate_dependencies()
+        self._refresh_portfolio_archive()
+
+    def _refresh_portfolio_archive(self) -> None:
+        records = load_archive()
+        table = self.portfolio_archive_table
+        table.setRowCount(len(records))
+        for row, record in enumerate(records):
+            methodology = record.get("methodology", {})
+            values = (
+                record.get("created_at", ""),
+                record.get("as_of_date", ""),
+                methodology.get("weighting_method", ""),
+                str(methodology.get("position_count", len(record.get("positions", [])))),
+                Path(record.get("_path", "")).name,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, record)
+                table.setItem(row, column, item)
+        table.resizeColumnsToContents()
+        if records:
+            table.setCurrentCell(0, 0)
+        else:
+            self.portfolio_archive_details.setPlainText(f"No archived portfolios yet.\nArchive folder: {ARCHIVE_DIR}")
+
+    def _show_portfolio_archive(
+        self, row: int, _column: int, _previous_row: int, _previous_column: int
+    ) -> None:
+        if row < 0:
+            return
+        item = self.portfolio_archive_table.item(row, 0)
+        if item is None:
+            return
+        record = item.data(Qt.ItemDataRole.UserRole)
+        self.portfolio_archive_details.setPlainText(
+            json.dumps({key: value for key, value in record.items() if key != "_path"}, indent=2, ensure_ascii=False)
+            + f"\n\nArchive file: {record.get('_path', '')}"
+        )
 
     def _load_task_history(self) -> None:
         TASK_HISTORY_DIR.mkdir(parents=True, exist_ok=True)

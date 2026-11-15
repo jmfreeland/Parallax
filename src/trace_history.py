@@ -142,6 +142,41 @@ def _initialize_database(connection: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS observation_augmentation_runs (
+            augmentation_id VARCHAR PRIMARY KEY,
+            source_run_id VARCHAR NOT NULL,
+            started_at_utc VARCHAR NOT NULL,
+            completed_at_utc VARCHAR,
+            status VARCHAR NOT NULL,
+            requested_bonds INTEGER NOT NULL,
+            processed_bonds INTEGER NOT NULL DEFAULT 0,
+            response_rows INTEGER NOT NULL DEFAULT 0,
+            inserted_rows INTEGER NOT NULL DEFAULT 0,
+            fields_filled INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            last_error VARCHAR
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS observation_augmentation_fields (
+            augmentation_id VARCHAR NOT NULL,
+            source_run_id VARCHAR NOT NULL,
+            isin VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            field_name VARCHAR NOT NULL,
+            previous_value DOUBLE,
+            previous_reason VARCHAR NOT NULL,
+            augmented_value DOUBLE NOT NULL,
+            retrieved_at_utc VARCHAR NOT NULL,
+            provider_cusip VARCHAR NOT NULL,
+            PRIMARY KEY (augmentation_id, isin, trade_date, field_name)
+        )
+        """
+    )
 
 
 def _now() -> str:
@@ -372,6 +407,309 @@ def _fetch_history(identifiers: list[str], start_date: date, end_date: date) -> 
         provider="finra",
     )
     return [record.model_dump() for record in response.results]
+
+
+def augment_missing_fields(
+    run_id: str,
+    database_path: Path = DATABASE_PATH,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    on_progress: ProgressCallback = lambda _done, _total: None,
+    on_batch: BatchCallback = lambda _size: None,
+) -> dict[str, Any]:
+    """Refetch incomplete bond histories and audit valid price/yield backfills.
+
+    Only bonds with at least one invalid/missing price or yield field (or no
+    observations) in the source run window are requested. Existing valid raw
+    values are never replaced. An invalid prior value can be replaced only by a
+    newly fetched value that passes the registered TRACE cleaning policy; its
+    prior value and disposition are retained in the augmentation audit table.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if not database_path.exists():
+        raise FileNotFoundError(f"TRACE history database not found: {database_path}")
+
+    augmentation_id = uuid.uuid4().hex
+    connection = connect_database(database_path, initialize=True)
+    try:
+        run = connection.execute(
+            "SELECT start_date, end_date FROM history_runs WHERE run_id = ?", [run_id]
+        ).fetchone()
+        if not run:
+            raise ValueError(f"Unknown download run: {run_id}")
+        start_date, end_date = run
+        price_reason = reason_sql("price", TRACE_FIELD_POLICIES["price"])
+        yield_reason = reason_sql("last_sale_yield", TRACE_FIELD_POLICIES["last_sale_yield"])
+        jobs = connection.execute(
+            f"""SELECT rb.isin, rb.issuer_name, rb.cusip, rb.symbol,
+                       rb.finra_security_id
+                FROM run_bonds rb
+                WHERE rb.run_id = ? AND trim(rb.cusip) <> ''
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM observations ox
+                        WHERE ox.isin = rb.isin
+                          AND ox.trade_date BETWEEN ? AND ?
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM observations o
+                        WHERE o.isin = rb.isin
+                          AND o.trade_date BETWEEN ? AND ?
+                          AND (({price_reason}) <> 'valid' OR ({yield_reason}) <> 'valid')
+                    )
+                  )
+                ORDER BY rb.issuer_name, rb.isin""",
+            [run_id, start_date, end_date, start_date, end_date],
+        ).fetchall()
+        job_names = [column[0] for column in connection.description]
+        jobs = [dict(zip(job_names, row)) for row in jobs]
+        started = _now()
+        connection.execute(
+            """INSERT INTO observation_augmentation_runs
+               (augmentation_id, source_run_id, started_at_utc, status, requested_bonds)
+               VALUES (?, ?, ?, 'running', ?)""",
+            [augmentation_id, run_id, started, len(jobs)],
+        )
+        connection.commit()
+
+        processed = response_rows = inserted_rows = fields_filled = error_count = 0
+        last_error: str | None = None
+        status = "complete"
+        for batch_start in range(0, len(jobs), batch_size):
+            batch = jobs[batch_start : batch_start + batch_size]
+            on_batch(len(batch))
+            try:
+                response = _fetch_history(
+                    [str(job["cusip"]).strip().upper() for job in batch],
+                    start_date,
+                    end_date,
+                )
+            except Exception as error:
+                logger.exception(
+                    "Augmentation %s provider request failed for batch starting at %d",
+                    augmentation_id,
+                    batch_start,
+                )
+                error_count += len(batch)
+                last_error = str(error)
+                status = "partial"
+                break
+            response_rows += len(response)
+            by_cusip: dict[str, list[dict[str, Any]]] = {}
+            for record in response:
+                cusip = str(record.get("cusip") or "").strip().upper()
+                if cusip:
+                    by_cusip.setdefault(cusip, []).append(record)
+
+            for job in batch:
+                cusip = str(job["cusip"]).strip().upper()
+                records = by_cusip.get(cusip, [])
+                unique_records = _deduplicate_records(records)
+                now = _now()
+                bond_inserted = 0
+                bond_fields_filled = 0
+                try:
+                    connection.execute("BEGIN TRANSACTION")
+                    for record in unique_records:
+                        trade_date = _as_date(record.get("date"))
+                        if trade_date is None or not start_date <= trade_date <= end_date:
+                            continue
+                        incoming_price, _ = classify_value(
+                            record.get("price"), TRACE_FIELD_POLICIES["price"]
+                        )
+                        incoming_yield, _ = classify_value(
+                            record.get("last_sale_yield"),
+                            TRACE_FIELD_POLICIES["last_sale_yield"],
+                        )
+                        prior = connection.execute(
+                            """SELECT price, last_sale_yield FROM observations
+                               WHERE isin = ? AND trade_date = ?""",
+                            [job["isin"], trade_date],
+                        ).fetchone()
+                        provider_cusip = str(record.get("cusip") or cusip).strip().upper()
+                        values_to_audit = []
+                        if prior is None:
+                            raw_price = _optional_float(record.get("price"))
+                            raw_yield = _optional_float(record.get("last_sale_yield"))
+                            connection.execute(
+                                """INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                [
+                                    job["isin"],
+                                    trade_date,
+                                    provider_cusip,
+                                    record.get("symbol") or job.get("symbol"),
+                                    str(record.get("finra_security_id") or job.get("finra_security_id") or ""),
+                                    str(record.get("product_type") or ""),
+                                    raw_price,
+                                    raw_yield,
+                                    now,
+                                    run_id,
+                                ],
+                            )
+                            bond_inserted += 1
+                            for field_name, value in (
+                                ("price", incoming_price),
+                                ("last_sale_yield", incoming_yield),
+                            ):
+                                if value is not None:
+                                    values_to_audit.append(
+                                        (field_name, None, "no_row", value)
+                                    )
+                        else:
+                            updates: dict[str, float] = {}
+                            for field_name, old_value, new_value, policy in (
+                                ("price", prior[0], incoming_price, TRACE_FIELD_POLICIES["price"]),
+                                (
+                                    "last_sale_yield",
+                                    prior[1],
+                                    incoming_yield,
+                                    TRACE_FIELD_POLICIES["last_sale_yield"],
+                                ),
+                            ):
+                                old_clean, old_reason = classify_value(old_value, policy)
+                                if old_clean is None and new_value is not None:
+                                    updates[field_name] = new_value
+                                    values_to_audit.append(
+                                        (field_name, old_value, old_reason, new_value)
+                                    )
+                            if updates:
+                                connection.execute(
+                                    """UPDATE observations SET
+                                       price = coalesce(?, price),
+                                       last_sale_yield = coalesce(?, last_sale_yield)
+                                       WHERE isin = ? AND trade_date = ?""",
+                                    [
+                                        updates.get("price"),
+                                        updates.get("last_sale_yield"),
+                                        job["isin"],
+                                        trade_date,
+                                    ],
+                                )
+                        for field_name, old_value, old_reason, new_value in values_to_audit:
+                            connection.execute(
+                                """INSERT INTO observation_augmentation_fields VALUES
+                                   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                [
+                                    augmentation_id,
+                                    run_id,
+                                    job["isin"],
+                                    trade_date,
+                                    field_name,
+                                    old_value,
+                                    old_reason,
+                                    new_value,
+                                    now,
+                                    provider_cusip,
+                                ],
+                            )
+                        bond_fields_filled += len(values_to_audit)
+                    coverage = connection.execute(
+                        """SELECT count(*), min(trade_date), max(trade_date)
+                           FROM observations WHERE isin = ? AND trade_date BETWEEN ? AND ?""",
+                        [job["isin"], start_date, end_date],
+                    ).fetchone()
+                    connection.execute(
+                        """UPDATE run_bonds SET observation_count = ?, first_date = ?,
+                           last_date = ?, updated_at_utc = ?
+                           WHERE run_id = ? AND isin = ?""",
+                        [
+                            int(coverage[0]),
+                            coverage[1],
+                            coverage[2],
+                            now,
+                            run_id,
+                            job["isin"],
+                        ],
+                    )
+                    connection.execute(
+                        """UPDATE observation_augmentation_runs SET
+                           processed_bonds = ?, response_rows = ?, inserted_rows = ?,
+                           fields_filled = ?, error_count = ?
+                           WHERE augmentation_id = ?""",
+                        [
+                            processed + 1,
+                            response_rows,
+                            inserted_rows + bond_inserted,
+                            fields_filled + bond_fields_filled,
+                            error_count,
+                            augmentation_id,
+                        ],
+                    )
+                    connection.commit()
+                except Exception as error:
+                    connection.rollback()
+                    logger.exception(
+                        "Augmentation %s failed while merging bond %s",
+                        augmentation_id,
+                        job["isin"],
+                    )
+                    error_count += 1
+                    last_error = str(error)
+                    bond_inserted = 0
+                    bond_fields_filled = 0
+                processed += 1
+                inserted_rows += bond_inserted
+                fields_filled += bond_fields_filled
+                on_progress(processed, len(jobs))
+
+        if error_count:
+            status = "partial"
+        completed = _now()
+        connection.execute(
+            """UPDATE observation_augmentation_runs SET completed_at_utc = ?,
+               status = ?, processed_bonds = ?, response_rows = ?, inserted_rows = ?,
+               fields_filled = ?, error_count = ?, last_error = ?
+               WHERE augmentation_id = ?""",
+            [
+                completed,
+                status,
+                processed,
+                response_rows,
+                inserted_rows,
+                fields_filled,
+                error_count,
+                last_error,
+                augmentation_id,
+            ],
+        )
+        connection.commit()
+        if inserted_rows or fields_filled:
+            try:
+                _export_parquet(connection, run_id, database_path)
+            except Exception as error:
+                logger.exception("Augmentation %s could not refresh the Parquet export", augmentation_id)
+                status = "complete_export_failed"
+                last_error = str(error)
+                error_count += 1
+                connection.execute(
+                    """UPDATE observation_augmentation_runs SET status = ?, error_count = ?,
+                       last_error = ? WHERE augmentation_id = ?""",
+                    [status, error_count, last_error, augmentation_id],
+                )
+                connection.commit()
+        logger.info(
+            "Augmentation %s finished: status=%s bonds=%d/%d rows=%d fields=%d errors=%d",
+            augmentation_id,
+            status,
+            processed,
+            len(jobs),
+            inserted_rows,
+            fields_filled,
+            error_count,
+        )
+        return {
+            "augmentation_id": augmentation_id,
+            "status": status,
+            "requested_bonds": len(jobs),
+            "processed_bonds": processed,
+            "response_rows": response_rows,
+            "inserted_rows": inserted_rows,
+            "fields_filled": fields_filled,
+            "error_count": error_count,
+            "last_error": last_error,
+        }
+    finally:
+        connection.close()
 
 
 def _quality_flags(records: list[dict[str, Any]], start_date: date, end_date: date) -> list[str]:

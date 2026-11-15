@@ -65,12 +65,20 @@ class DownloadWorker(QThread):
         self.mode = mode
         self.isin = isin
         self.batch_size = batch_size
+        self.result: dict[str, Any] | None = None
 
     def run(self) -> None:
         try:
             if self.mode == "fix":
                 trace_history.fix_bond(
                     self.run_id, self.isin, on_job=self.job_changed.emit
+                )
+            elif self.mode == "augment":
+                self.result = trace_history.augment_missing_fields(
+                    self.run_id,
+                    batch_size=self.batch_size,
+                    on_progress=self.progress_changed.emit,
+                    on_batch=self.batch_started.emit,
                 )
             else:
                 trace_history.download_run(
@@ -126,6 +134,12 @@ class TraceHistoryWindow(QMainWindow):
         self.retry_button = QPushButton("Attempt fix for selected bond")
         self.retry_button.clicked.connect(self._retry_selected)
         self.retry_button.setEnabled(False)
+        self.augment_button = QPushButton("Refetch + fill price/yield gaps")
+        self.augment_button.setToolTip(
+            "Redownload bonds with missing/invalid price or yield data; preserve valid values and audit every backfill."
+        )
+        self.augment_button.clicked.connect(self._augment_missing)
+        self.augment_button.setEnabled(False)
         self.export_button = QPushButton("Export CSV")
         self.export_button.clicked.connect(self._export_csv)
         self.export_button.setEnabled(False)
@@ -135,6 +149,7 @@ class TraceHistoryWindow(QMainWindow):
         self.refresh_button = QPushButton("Refresh list")
         self.refresh_button.clicked.connect(self._refresh_jobs)
         action_row.addWidget(self.retry_button)
+        action_row.addWidget(self.augment_button)
         action_row.addWidget(self.export_button)
         action_row.addWidget(self.filter)
         action_row.addStretch(1)
@@ -241,12 +256,29 @@ class TraceHistoryWindow(QMainWindow):
         isin = self.table.item(selected[0].row(), COL_ISIN).text()
         self._start_worker("fix", isin)
 
+    def _augment_missing(self) -> None:
+        if not self.run_id or self._worker_running():
+            return
+        try:
+            # OpenBB installs process signal handlers at import; initialize it
+            # on the GUI thread before the worker starts, like regular downloads.
+            trace_history.initialize_provider()
+        except Exception as error:
+            logger.exception("Could not initialize TRACE provider for augmentation")
+            QMessageBox.warning(self, "Could not start augmentation", str(error))
+            return
+        self.statusBar().showMessage("Starting audited refetch of bonds with missing fields...")
+        self._start_worker("augment")
+
     def _start_worker(self, mode: str, isin: str = "") -> None:
         if not self.run_id:
             return
         if mode == "download":
             self.progress.setValue(0)
             self.progress.setMaximum(max(1, self._snapshot_population_size()))
+        elif mode == "augment":
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
         self._set_controls_enabled(False)
         self.worker = DownloadWorker(self.run_id, mode, isin, parent=self)
         self.worker.job_changed.connect(self._update_job)
@@ -264,6 +296,7 @@ class TraceHistoryWindow(QMainWindow):
         self.resume_button.setEnabled(enabled)
         self.refresh_button.setEnabled(enabled)
         self.retry_button.setEnabled(enabled and bool(self.run_id))
+        self.augment_button.setEnabled(enabled and bool(self.run_id))
         self.export_button.setEnabled(enabled and bool(self.run_id))
 
     def _update_job(self, job: dict[str, Any]) -> None:
@@ -326,6 +359,17 @@ class TraceHistoryWindow(QMainWindow):
             self.close()
             return
         self._refresh_jobs()
+        if self.worker and self.worker.mode == "augment":
+            result = self.worker.result or {}
+            self.statusBar().showMessage(
+                f"Augmentation {result.get('status', 'finished')}: "
+                f"{result.get('processed_bonds', 0):,}/{result.get('requested_bonds', 0):,} bonds, "
+                f"{result.get('fields_filled', 0):,} fields filled, "
+                f"{result.get('inserted_rows', 0):,} rows inserted, "
+                f"{result.get('error_count', 0):,} errors. "
+                f"Audit ID {result.get('augmentation_id', 'unknown')}"
+            )
+            return
         summary = trace_history.run_summary(self.run_id) if self.run_id else {}
         self.statusBar().showMessage(
             f"Run {summary.get('status', 'finished')}: "
@@ -340,7 +384,7 @@ class TraceHistoryWindow(QMainWindow):
             self.close()
             return
         self._refresh_jobs()
-        self.statusBar().showMessage("Download action failed; the run remains resumable.")
+        self.statusBar().showMessage("TRACE action failed; review the error and retry if appropriate.")
         QMessageBox.warning(self, "TRACE download error", message)
 
     def _refresh_jobs(self) -> None:
@@ -396,6 +440,7 @@ class TraceHistoryWindow(QMainWindow):
         )
         self.export_button.setEnabled(bool(jobs))
         self.retry_button.setEnabled(bool(jobs))
+        self.augment_button.setEnabled(bool(jobs))
 
     def _snapshot_date(self) -> str:
         latest = trace_history.latest_run()
