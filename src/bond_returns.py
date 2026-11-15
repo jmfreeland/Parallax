@@ -96,16 +96,22 @@ def calculate_historical_bond_total_return(
     coupon_frequency: int = 2,
     max_price_age_days: int | None = 5,
     price_observations: Sequence[tuple[date, float | None]] | None = None,
+    value_on_requested_dates: bool = False,
+    carry_forward_stale_prices: bool = False,
 ) -> BondTotalReturn:
     """Calculate a bond's total return over a requested historical window.
 
     The function selects the latest valid TRACE clean price on or before each
     requested boundary. Prices must be no older than ``max_price_age_days``
     unless that argument is ``None``. The reported effective dates are the
-    actual selected observation dates. Accrued interest and coupon/redemption
+    actual selected observation dates. By default accrued interest and coupon/redemption
     cash flows are calculated with a synthetic schedule rolled back from
     maturity because the current security snapshot lacks actual coupon dates.
     Valuation uses each observation date with zero settlement-day lag.
+
+    When ``value_on_requested_dates`` is true, the selected clean prices are
+    marked on the requested dates, accrued interest is measured on those dates,
+    and cash flows are accumulated through the requested end (or maturity).
 
     If the bond matures during the requested window, its coupon and redemption
     cash flows are treated as the terminal proceeds and held as cash at zero
@@ -178,15 +184,25 @@ def calculate_historical_bond_total_return(
             raise ValueError(f"No valid TRACE price on or before {end_date} for {isin}")
         end_price_date, end_clean_price = end_points[-1]
         end_price_age = (end_date - end_price_date).days
-        if max_price_age_days is not None and end_price_age > max_price_age_days:
+        if (
+            max_price_age_days is not None
+            and end_price_age > max_price_age_days
+            and not carry_forward_stale_prices
+        ):
             raise ValueError(
                 f"End price for {isin} is {end_price_age} days old; limit is {max_price_age_days}"
             )
-        if end_price_date <= start_price_date:
+        if not value_on_requested_dates and end_price_date <= start_price_date:
             raise ValueError("start and end boundaries resolve to the same price observation")
         effective_end_date = end_price_date
 
-    if effective_end_date <= start_price_date:
+    valuation_start_date = start_date if value_on_requested_dates else start_price_date
+    valuation_end_date = (
+        min(end_date, maturity_date) if value_on_requested_dates else effective_end_date
+    )
+    if value_on_requested_dates:
+        effective_end_date = valuation_end_date
+    if valuation_end_date <= valuation_start_date:
         raise ValueError("effective return window is empty")
 
     settings = ql.Settings.instance()
@@ -198,7 +214,7 @@ def calculate_historical_bond_total_return(
             coupon_pct=coupon_pct,
             coupon_frequency=coupon_frequency,
         )
-        settings.evaluationDate = _ql_date(start_price_date)
+        settings.evaluationDate = _ql_date(valuation_start_date)
         start_accrued = float(bond.accruedAmount())
         start_dirty = start_clean_price + start_accrued
 
@@ -206,14 +222,14 @@ def calculate_historical_bond_total_return(
             end_accrued = 0.0
             end_dirty = 0.0
         else:
-            settings.evaluationDate = _ql_date(end_price_date)
+            settings.evaluationDate = _ql_date(valuation_end_date)
             end_accrued = float(bond.accruedAmount())
             end_dirty = float(end_clean_price) + end_accrued
 
         cashflows = sum(
             float(cashflow.amount())
             for cashflow in bond.cashflows()
-            if start_price_date < _python_date(cashflow.date()) <= effective_end_date
+            if valuation_start_date < _python_date(cashflow.date()) <= valuation_end_date
         )
         principal_repayment = 100.0 if matures_in_window else 0.0
         coupon_cashflows = cashflows - principal_repayment

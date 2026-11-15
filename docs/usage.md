@@ -128,10 +128,12 @@ and the return normalized to priced positions are shown. The summary includes
 weighted modified duration on positions with reported yields. Bond attribution
 can be exported as CSV. The calculation holds the archived weights constant
 without rebalancing, and coupon or redemption proceeds earn zero after receipt.
-The **Time series** tab plots cumulative P&L at monthly month-end marks and at
-the selected horizon. Partition attribution tables and P&L charts show the
-configurable largest contributors by absolute P&L, so both gains and losses can
-appear in the ranking.
+The **Time series** tab plots cumulative P&L at daily weekday marks through
+the selected horizon. It carries the latest valid clean price forward across
+missing observations while accruing interest and coupon cash flows by mark
+date; the stale marked weight is reported. Partition attribution tables and
+P&L charts show the configurable largest contributors by absolute P&L, so both
+gains and losses can appear in the ranking.
 
 ## Bond total return
 

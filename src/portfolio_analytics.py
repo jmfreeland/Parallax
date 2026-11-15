@@ -207,6 +207,8 @@ def analyze_portfolio_horizon(
                 database_path=database_path,
                 max_price_age_days=max_price_age_days,
                 price_observations=prices_by_isin.get(isin, []),
+                value_on_requested_dates=True,
+                carry_forward_stale_prices=True,
             )
         except Exception as error:
             position["error"] = str(error)
@@ -255,22 +257,16 @@ def analyze_portfolio_horizon(
     if total_weight <= 0:
         raise ValueError("archived position weights sum to zero")
 
-    # Monthly month-end marks, plus the exact requested horizon. Each point
-    # uses the latest valid TRACE observation within the configured age limit.
+    # Mark every weekday using the latest eligible TRACE price and accrued
+    # interest/cash flows through that date.
     time_series_dates: list[date] = []
-    year, month = as_of_date.year, as_of_date.month
-    while True:
-        month += 1
-        if month == 13:
-            year += 1
-            month = 1
-        month_start = date(year, month, 1)
-        month_end = month_start + timedelta(days=31)
-        month_end = month_end.replace(day=1) - timedelta(days=1)
-        if month_end >= horizon_end_date:
-            break
-        time_series_dates.append(month_end)
-    time_series_dates.append(horizon_end_date)
+    point_date = as_of_date + timedelta(days=1)
+    while point_date <= horizon_end_date:
+        if point_date.weekday() < 5:
+            time_series_dates.append(point_date)
+        point_date += timedelta(days=1)
+    if not time_series_dates or time_series_dates[-1] != horizon_end_date:
+        time_series_dates.append(horizon_end_date)
     time_series: list[dict[str, Any]] = [
         {
             "date": as_of_date,
@@ -280,9 +276,10 @@ def analyze_portfolio_horizon(
             "coverage_pct": 0.0,
         }
     ]
-    for point_date in time_series_dates:
+    for point_index, point_date in enumerate(time_series_dates, start=1):
         point_pnl = 0.0
         point_covered_weight = 0.0
+        point_stale_weight = 0.0
         for position in positions:
             if position["coupon_pct"] is None or position["maturity_date"] is None:
                 continue
@@ -296,12 +293,20 @@ def analyze_portfolio_horizon(
                     database_path=database_path,
                     max_price_age_days=max_price_age_days,
                     price_observations=prices_by_isin.get(position["isin"], []),
+                    value_on_requested_dates=True,
+                    carry_forward_stale_prices=True,
                 )
             except Exception:
                 continue
             weight = float(position["weight"])
             point_pnl += starting_nav * weight * point_return.total_return
             point_covered_weight += weight
+            if (
+                max_price_age_days is not None
+                and point_return.end_price_age_days is not None
+                and point_return.end_price_age_days > max_price_age_days
+            ):
+                point_stale_weight += weight
         time_series.append(
             {
                 "date": point_date,
@@ -309,10 +314,23 @@ def analyze_portfolio_horizon(
                 "return_contribution_pct_nav": 100.0 * point_pnl / starting_nav,
                 "covered_weight": point_covered_weight,
                 "coverage_pct": 100.0 * point_covered_weight / total_weight,
+                "stale_weight_pct": 100.0 * point_stale_weight / total_weight,
             }
         )
+        if on_progress is not None:
+            on_progress(
+                len(archived_positions) + point_index,
+                len(archived_positions) + len(time_series_dates),
+            )
     covered = [position for position in positions if position["status"] == "priced"]
     covered_weight = sum(float(position["weight"]) for position in covered)
+    stale_mark_weight = sum(
+        float(position["weight"])
+        for position in covered
+        if max_price_age_days is not None
+        and position.get("end_price_age_days") is not None
+        and position["end_price_age_days"] > max_price_age_days
+    )
     pnl = sum(float(position.get("pnl", 0.0)) for position in covered)
     covered_return_pct_nav = 100.0 * pnl / starting_nav
     covered_subset_return_pct = (
@@ -360,6 +378,8 @@ def analyze_portfolio_horizon(
         "unpriced_position_count": len(positions) - len(covered),
         "total_weight": total_weight,
         "covered_weight": covered_weight,
+        "stale_mark_weight": stale_mark_weight,
+        "stale_mark_weight_pct": 100.0 * stale_mark_weight / total_weight,
         "uncovered_weight": max(0.0, total_weight - covered_weight),
         "coverage_pct": 100.0 * covered_weight / total_weight,
         "starting_nav": starting_nav,

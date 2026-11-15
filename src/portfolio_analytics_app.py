@@ -142,7 +142,7 @@ class PortfolioBarChart(QWidget):
 
 
 class PortfolioTimeSeriesChart(QWidget):
-    """Cumulative horizon P&L plotted at monthly marks."""
+    """Cumulative horizon P&L plotted at daily weekday marks."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -200,8 +200,9 @@ class PortfolioTimeSeriesChart(QWidget):
         painter.drawText(QRectF(right - 120, bottom + 8, 120, 20), Qt.AlignmentFlag.AlignRight,
                          self.rows[-1]["date"].isoformat())
         coverage = self.rows[-1]["coverage_pct"]
+        stale = self.rows[-1]["stale_weight_pct"]
         painter.drawText(QRectF(right - 240, 8, 220, 24), Qt.AlignmentFlag.AlignRight,
-                         f"Horizon price coverage: {coverage:.1f}%")
+                         f"Marked {coverage:.1f}% | stale {stale:.1f}%")
         painter.end()
 
 
@@ -292,7 +293,8 @@ class PortfolioAnalyticsWindow(QMainWindow):
         time_series_page = QWidget()
         time_series_layout = QVBoxLayout(time_series_page)
         self.time_series_note = QLabel(
-            "Monthly marks use the latest valid TRACE price on or before each month-end, subject to the max price age."
+            "Weekday marks use the latest valid TRACE clean price, carried forward across missing observations. "
+            "Accrued interest and cash flows update by valuation date; stale marked weight is flagged."
         )
         self.time_series_note.setWordWrap(True)
         time_series_layout.addWidget(self.time_series_note)
@@ -428,7 +430,7 @@ class PortfolioAnalyticsWindow(QMainWindow):
     def _progress_changed(self, completed: int, total: int) -> None:
         self.progress.setMaximum(max(1, total))
         self.progress.setValue(completed)
-        self.status.setText(f"Calculating position returns: {completed:,} of {total:,}")
+        self.status.setText(f"Calculating position returns and daily marks: {completed:,} of {total:,}")
 
     def _analysis_succeeded(self, result: PortfolioHorizonAnalysis) -> None:
         self.worker = None
@@ -456,13 +458,14 @@ class PortfolioAnalyticsWindow(QMainWindow):
         summary_lines = [
             f"Portfolio {analysis.archive_id[:8]} | formed {analysis.portfolio_as_of_date} | horizon {analysis.horizon_end_date}",
             f"Positions: {summary['position_count']:,} | priced: {summary['priced_position_count']:,} | "
-            f"unpriced: {summary['unpriced_position_count']:,} | price coverage: {summary['coverage_pct']:.1f}% "
-            f"({summary['covered_weight']:.1%} of original weights)",
+            f"unpriced: {summary['unpriced_position_count']:,} | marked coverage: {summary['coverage_pct']:.1f}% "
+            f"({summary['covered_weight']:.1%} of original weights) | stale end marks: "
+            f"{summary['stale_mark_weight_pct']:.1f}% weight",
             f"Covered-position P&L: {summary['covered_pnl']:,.2f} NAV units | "
             f"contribution to starting NAV: {summary['covered_return_contribution_pct_nav']:.3f}% | "
             f"return on priced subset: {covered_return:.3f}%" if covered_return is not None else
             f"Covered-position P&L: {summary['covered_pnl']:,.2f} NAV units | no priced return coverage",
-            f"Starting NAV: {analysis.starting_nav:,.2f} | max boundary price age: "
+            f"Starting NAV: {analysis.starting_nav:,.2f} | max start price age: "
             f"{analysis.max_price_age_days if analysis.max_price_age_days is not None else 'unlimited'} days",
             f"Weighted coupon: {average_coupon:.2f}% ({summary['coupon_weight_coverage_pct']:.1f}% weight covered)"
             if average_coupon is not None else "Weighted coupon: unavailable",
