@@ -113,6 +113,7 @@ class LauncherWindow(QMainWindow):
             ("Build bond snapshot", "src.build_lqd_snapshot"),
             ("Download TRACE history", "src.trace_history_app"),
             ("Preprocess TRACE history", "src.trace_preprocessor"),
+            ("Clean preprocessed TRACE data", "src.trace_cleaner_app"),
             ("Inspect TRACE history", "src.trace_history_inspector"),
         )
         self.buttons: list[QPushButton] = []
@@ -182,7 +183,7 @@ class LauncherWindow(QMainWindow):
                 self.signal_table.setItem(row, column, QTableWidgetItem(value))
             self.signal_table.setRowHeight(row, 105)
         signal_layout.addWidget(self.signal_table, 1)
-        evaluate_signal = QPushButton("Evaluate Nelson-Siegel residual signal")
+        evaluate_signal = QPushButton("Evaluate credit predictors")
         evaluate_signal.clicked.connect(lambda: self._launch("src.signal_evaluation_app"))
         self.buttons.append(evaluate_signal)
         signal_layout.addWidget(evaluate_signal, 0, Qt.AlignmentFlag.AlignLeft)

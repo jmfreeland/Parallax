@@ -26,4 +26,16 @@ SIGNALS = (
         status="Implemented",
         validation="Prototype; no out-of-sample validation yet",
     ),
+    SignalDefinition(
+        signal_id="historical_partition_percentile",
+        name="Historical partition yield percentile",
+        family="Credit regime",
+        construction=(
+            "Partition median latest TRACE yield ranked against strictly prior values in a trailing window; "
+            "higher percentile indicates a high-yield regime."
+        ),
+        inputs="TRACE yields and a selected bond-list partition field",
+        status="Implemented",
+        validation="Exploratory yield proxy; not benchmark-relative spread; no out-of-sample validation yet",
+    ),
 )

@@ -1,4 +1,4 @@
-"""Desktop point-in-time evaluation for the Nelson-Siegel residual signal."""
+"""Desktop point-in-time evaluation for exploratory credit predictors."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QDate, Qt, QThread, Signal
+from PySide6.QtCore import QDate, QPointF, QRectF, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDateEdit,
     QDoubleSpinBox,
     QFileDialog,
@@ -23,7 +25,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -31,8 +32,232 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .signal_evaluation import evaluate_nelson_siegel_signal
+from .signal_evaluation import (
+    PREDICTOR_NELSON_SIEGEL,
+    PREDICTOR_PARTITION_PERCENTILE,
+    evaluate_nelson_siegel_signal,
+)
 from .trace_history import DATABASE_PATH, DEFAULT_SNAPSHOT
+
+
+class HorizonCurvesChart(QWidget):
+    """Show event-time side-adjusted performance and cross-sectional IC."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, Any]] = []
+        self.setMinimumHeight(300)
+
+    def set_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.update()
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0b1220"))
+        rows = self.rows
+        if not rows:
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Run an evaluation to plot horizon curves.")
+            painter.end()
+            return
+
+        perf = [row["mean_daily_side_adjusted_performance_bps"] for row in rows]
+        corr = [row["mean_daily_side_adjusted_spearman"] for row in rows]
+        left, right = 76.0, float(self.width() - 72)
+        top, bottom = 42.0, float(self.height() - 52)
+        x_min, x_max = float(rows[0]["horizon_days"]), float(rows[-1]["horizon_days"])
+        if x_max <= x_min:
+            x_max = x_min + 1.0
+        valid_perf = [float(value) for value in perf if value is not None]
+        perf_min = min(0.0, min(valid_perf, default=0.0))
+        perf_max = max(0.0, max(valid_perf, default=0.0))
+        pad = max(1.0, (perf_max - perf_min) * 0.12)
+        perf_min, perf_max = perf_min - pad, perf_max + pad
+        x_map = lambda day: left + (day - x_min) / (x_max - x_min) * (right - left)
+        y_perf = lambda value: bottom - (value - perf_min) / (perf_max - perf_min) * (bottom - top)
+        y_corr = lambda value: bottom - (value + 1.0) / 2.0 * (bottom - top)
+
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left, 8, right - left, 24), Qt.AlignmentFlag.AlignLeft,
+                         "Average side-adjusted long-short performance and signal IC by horizon")
+        for step in range(5):
+            fraction = step / 4
+            y_value = perf_min + fraction * (perf_max - perf_min)
+            y = y_perf(y_value)
+            painter.setPen(QPen(QColor("#263449"), 1))
+            painter.drawLine(QPointF(left, y), QPointF(right, y))
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(QRectF(4, y - 9, 66, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{y_value:.1f}")
+            corr_value = -1.0 + fraction * 2.0
+            painter.drawText(QRectF(right + 5, y - 9, 62, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"{corr_value:.2f}")
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(QRectF(4, top - 24, 70, 18), Qt.AlignmentFlag.AlignRight, "Return (bps)")
+        painter.drawText(QRectF(right + 2, top - 24, 65, 18), Qt.AlignmentFlag.AlignLeft, "Spearman IC")
+        painter.drawText(QRectF(left, bottom + 6, right - left, 20), Qt.AlignmentFlag.AlignCenter, "Calendar days after signal (T+1 to T+horizon)")
+
+        def draw_series(values: list[Any], mapper: Any, color: str) -> None:
+            path = QPainterPath()
+            drawing = False
+            for row, value in zip(rows, values):
+                if value is None:
+                    drawing = False
+                    continue
+                point = QPointF(x_map(float(row["horizon_days"])), mapper(float(value)))
+                if drawing:
+                    path.lineTo(point)
+                else:
+                    path.moveTo(point)
+                drawing = True
+            painter.setPen(QPen(QColor(color), 2.4))
+            painter.drawPath(path)
+            for row, value in zip(rows, values):
+                if value is not None:
+                    painter.setBrush(QColor(color))
+                    painter.setPen(QPen(QColor(color), 1))
+                    painter.drawEllipse(QPointF(x_map(float(row["horizon_days"])), mapper(float(value))), 2.4, 2.4)
+
+        draw_series(perf, y_perf, "#38bdf8")
+        draw_series(corr, y_corr, "#fbbf24")
+        painter.setPen(QPen(QColor("#38bdf8"), 2.4))
+        painter.drawLine(QPointF(left + 8, self.height() - 16), QPointF(left + 30, self.height() - 16))
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left + 36, self.height() - 25, 230, 18), Qt.AlignmentFlag.AlignLeft, "Long-short side-adjusted performance")
+        painter.setPen(QPen(QColor("#fbbf24"), 2.4))
+        painter.drawLine(QPointF(left + 285, self.height() - 16), QPointF(left + 307, self.height() - 16))
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left + 313, self.height() - 25, 230, 18), Qt.AlignmentFlag.AlignLeft, "Side-adjusted Spearman correlation")
+        painter.end()
+
+
+class SignalReturnScatterChart(QWidget):
+    """Plot one signal-date cross-section against its forward yield outcome."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, Any]] = []
+        self.setMinimumHeight(360)
+
+    def set_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.update()
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0b1220"))
+        if not self.rows:
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "Select a signal date with available forward observations.")
+            painter.end()
+            return
+
+        xs = [float(row["signal_value_pct"]) for row in self.rows]
+        ys = [float(row["side_adjusted_forward_yield_change_bps"]) for row in self.rows]
+        left, right = 82.0, float(self.width() - 28)
+        top, bottom = 38.0, float(self.height() - 64)
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        x_pad = max((x_max - x_min) * 0.08, 0.05)
+        y_pad = max((y_max - y_min) * 0.08, 1.0)
+        x_min, x_max = x_min - x_pad, x_max + x_pad
+        y_min, y_max = y_min - y_pad, y_max + y_pad
+        x_map = lambda value: left + (value - x_min) / (x_max - x_min) * (right - left)
+        y_map = lambda value: bottom - (value - y_min) / (y_max - y_min) * (bottom - top)
+
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left, 8, right - left, 22), Qt.AlignmentFlag.AlignLeft,
+                         f"{len(self.rows):,} bonds | side-adjusted cumulative yield change")
+        for fraction in range(5):
+            ratio = fraction / 4
+            y_value = y_min + ratio * (y_max - y_min)
+            y = y_map(y_value)
+            painter.setPen(QPen(QColor("#263449"), 1))
+            painter.drawLine(QPointF(left, y), QPointF(right, y))
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(QRectF(4, y - 9, 72, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"{y_value:.1f}")
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(QRectF(4, top - 23, 72, 18), Qt.AlignmentFlag.AlignRight, "Outcome (bps)")
+        painter.drawText(QRectF(left, bottom + 22, right - left, 20), Qt.AlignmentFlag.AlignCenter,
+                         "Signal value (percentile 0–100 or yield residual, pp)")
+        if y_min <= 0 <= y_max:
+            painter.setPen(QPen(QColor("#64748b"), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(left, y_map(0.0)), QPointF(right, y_map(0.0)))
+        painter.setPen(QPen(QColor("#38bdf8"), 1))
+        painter.setBrush(QColor(56, 189, 248, 170))
+        for x_value, y_value in zip(xs, ys):
+            painter.drawEllipse(QPointF(x_map(x_value), y_map(y_value)), 4.0, 4.0)
+        painter.end()
+
+
+class RebalancedPortfolioChart(QWidget):
+    """Plot the compounded daily-rebalanced yield-only return proxy."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, Any]] = []
+        self.setMinimumHeight(300)
+
+    def set_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.update()
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0b1220"))
+        rows = self.rows
+        if not rows:
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No adjacent signal dates had eligible long and short holdings.")
+            painter.end()
+            return
+        proxy_values = [float(row["yield_only_nav_index"]) for row in rows]
+        total_return_values = [float(row["covered_total_return_nav_index"]) for row in rows]
+        values = proxy_values + total_return_values
+        minimum, maximum = min(values), max(values)
+        pad = max(0.1, (maximum - minimum) * 0.12)
+        minimum, maximum = minimum - pad, maximum + pad
+        left, right = 76.0, float(self.width() - 24)
+        top, bottom = 42.0, float(self.height() - 52)
+        x_map = lambda index: left + index / max(len(rows) - 1, 1) * (right - left)
+        y_map = lambda value: bottom - (value - minimum) / (maximum - minimum) * (bottom - top)
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left, 8, right - left, 24), Qt.AlignmentFlag.AlignLeft,
+                         "Rebalanced portfolio indices; missing bond returns contribute zero and coverage is reported")
+        for step in range(5):
+            fraction = step / 4
+            value = minimum + fraction * (maximum - minimum)
+            y = y_map(value)
+            painter.setPen(QPen(QColor("#263449"), 1))
+            painter.drawLine(QPointF(left, y), QPointF(right, y))
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(QRectF(4, y - 9, 66, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{value:.2f}")
+        for series, color in ((total_return_values, "#38bdf8"), (proxy_values, "#34d399")):
+            path = QPainterPath()
+            for index, value in enumerate(series):
+                point = QPointF(x_map(index), y_map(value))
+                if index == 0:
+                    path.moveTo(point)
+                else:
+                    path.lineTo(point)
+            painter.setPen(QPen(QColor(color), 2.5))
+            painter.drawPath(path)
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(QRectF(left, bottom + 7, right - left, 20), Qt.AlignmentFlag.AlignCenter,
+                         f"{rows[0]['holding_date']}  to  {rows[-1]['holding_date']}  |  Initial index 100")
+        painter.setPen(QPen(QColor("#38bdf8"), 2.5))
+        painter.drawLine(QPointF(left + 8, self.height() - 13), QPointF(left + 30, self.height() - 13))
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left + 36, self.height() - 22, 210, 18), Qt.AlignmentFlag.AlignLeft, "Covered total-return contribution")
+        painter.setPen(QPen(QColor("#34d399"), 2.5))
+        painter.drawLine(QPointF(left + 270, self.height() - 13), QPointF(left + 292, self.height() - 13))
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left + 298, self.height() - 22, 190, 18), Qt.AlignmentFlag.AlignLeft, "Yield-only proxy")
+        painter.end()
 
 
 class EvaluationWorker(QThread):
@@ -58,21 +283,45 @@ class EvaluationWorker(QThread):
 class SignalEvaluationWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Signal Evaluation - Nelson-Siegel Residual")
+        self.setWindowTitle("Signal Evaluation - Credit Predictors")
         self.resize(1500, 900)
         self.worker: EvaluationWorker | None = None
         self.result: dict[str, Any] | None = None
+        self.scatter_rows_by_date: dict[str, list[dict[str, Any]]] = {}
 
         central = QWidget()
         layout = QVBoxLayout(central)
         source = QHBoxLayout()
         source.addWidget(QLabel("Bond list"))
         self.bond_list = QLineEdit(str(DEFAULT_SNAPSHOT))
+        self.bond_list.textChanged.connect(self._refresh_partition_fields)
         source.addWidget(self.bond_list, 1)
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse)
         source.addWidget(browse)
         layout.addLayout(source)
+
+        predictor_row = QHBoxLayout()
+        predictor_row.addWidget(QLabel("Predictor"))
+        self.predictor = QComboBox()
+        self.predictor.addItem("Nelson-Siegel ticker residual", PREDICTOR_NELSON_SIEGEL)
+        self.predictor.addItem("Historical partition percentile", PREDICTOR_PARTITION_PERCENTILE)
+        self.predictor.currentIndexChanged.connect(self._predictor_changed)
+        predictor_row.addWidget(self.predictor)
+        predictor_row.addWidget(QLabel("Partition field"))
+        self.partition_field = QComboBox()
+        predictor_row.addWidget(self.partition_field)
+        predictor_row.addWidget(QLabel("Percentile lookback (days)"))
+        self.percentile_lookback = QSpinBox()
+        self.percentile_lookback.setRange(30, 3650)
+        self.percentile_lookback.setValue(1095)
+        predictor_row.addWidget(self.percentile_lookback)
+        predictor_row.addWidget(QLabel("Minimum history points"))
+        self.minimum_history = QSpinBox()
+        self.minimum_history.setRange(5, 500)
+        self.minimum_history.setValue(20)
+        predictor_row.addWidget(self.minimum_history)
+        layout.addLayout(predictor_row)
 
         row_one = QHBoxLayout()
         row_one.addWidget(QLabel("Test start"))
@@ -90,9 +339,9 @@ class SignalEvaluationWindow(QMainWindow):
         self.horizon_days.setRange(2, 365)
         self.horizon_days.setValue(21)
         row_one.addWidget(self.horizon_days)
-        row_one.addWidget(QLabel("Minimum bonds per ticker"))
+        row_one.addWidget(QLabel("Minimum bonds per group"))
         self.minimum_bonds = QSpinBox()
-        self.minimum_bonds.setRange(5, 100)
+        self.minimum_bonds.setRange(1, 100)
         self.minimum_bonds.setValue(5)
         row_one.addWidget(self.minimum_bonds)
         layout.addLayout(row_one)
@@ -103,16 +352,11 @@ class SignalEvaluationWindow(QMainWindow):
         self.signal_age.setRange(0, 365)
         self.signal_age.setValue(30)
         row_two.addWidget(self.signal_age)
-        row_two.addWidget(QLabel("Max T+1 observation delay (days)"))
-        self.forward_start_delay = QSpinBox()
-        self.forward_start_delay.setRange(0, 90)
-        self.forward_start_delay.setValue(7)
-        row_two.addWidget(self.forward_start_delay)
-        row_two.addWidget(QLabel("Max horizon-end observation age (days)"))
-        self.end_age = QSpinBox()
-        self.end_age.setRange(0, 90)
-        self.end_age.setValue(14)
-        row_two.addWidget(self.end_age)
+        row_two.addWidget(QLabel("Max gap between yield changes (days)"))
+        self.change_gap = QSpinBox()
+        self.change_gap.setRange(1, 90)
+        self.change_gap.setValue(7)
+        row_two.addWidget(self.change_gap)
         row_two.addWidget(QLabel("Max TRACE price age (days)"))
         self.price_age = QSpinBox()
         self.price_age.setRange(0, 90)
@@ -139,7 +383,7 @@ class SignalEvaluationWindow(QMainWindow):
         row_two.addStretch(1)
         layout.addLayout(row_two)
 
-        self.status = QLabel(f"Signal: Nelson-Siegel ticker residual | TRACE database: {DATABASE_PATH}")
+        self.status = QLabel(f"Credit signal evaluation | TRACE database: {DATABASE_PATH}")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.progress = QProgressBar()
@@ -151,9 +395,10 @@ class SignalEvaluationWindow(QMainWindow):
         dates_page = QWidget()
         dates_layout = QVBoxLayout(dates_page)
         self.summary = QLabel(
-            "Select a test range and run. Positive residual means high yield versus the issuer's fitted curve. "
-            "Forward yield change is a spread proxy (no Treasury benchmark); long-short return is a duration-adjusted, "
-            "yield-only price proxy that excludes carry and costs. TRACE observations are not stored in immutable vintages, "
+            "Select a predictor, partition, and test range. Positive scores mean high yield versus the selected reference. "
+            "Forward yield changes use the predictor's matching outcome convention and are side-adjusted so positive is favorable. "
+            "TRACE yield changes are a spread proxy (no Treasury benchmark). Historical returns "
+            "and the rebalanced NAV proxy are shown separately. TRACE observations are not stored in immutable vintages, "
             "so later revisions to past observations may affect historical results."
         )
         self.summary.setWordWrap(True)
@@ -161,9 +406,9 @@ class SignalEvaluationWindow(QMainWindow):
         dates_layout.addWidget(self.summary)
         self.date_table = QTableWidget(0, 11)
         self.date_table.setHorizontalHeaderLabels([
-            "Signal date", "Horizon end", "Bond pairs", "Ticker curves", "Pearson IC",
-            "Spearman IC", "Long positions", "Short positions", "L/S total return (%)",
-            "Return coverage (%)", "Yield-only proxy (bps)",
+            "Signal date", "Horizon end", "Signals with forward changes", "Groups/signals",
+            "Side-adjust Pearson IC", "Side-adjust Spearman IC", "Long positions", "Short positions",
+            "L/S total return (%)", "Price coverage (%)", "Yield-only proxy (bps)",
         ])
         self.date_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.date_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -172,16 +417,65 @@ class SignalEvaluationWindow(QMainWindow):
         dates_layout.addWidget(self.date_table, 1)
         self.tabs.addTab(dates_page, "Date performance")
 
+        horizon_page = QWidget()
+        horizon_layout = QVBoxLayout(horizon_page)
+        self.horizon_chart = HorizonCurvesChart()
+        horizon_layout.addWidget(self.horizon_chart, 3)
+        self.horizon_table = QTableWidget(0, 10)
+        self.horizon_table.setHorizontalHeaderLabels([
+            "Horizon (days)", "Dates with IC", "Bond-date pairs", "Mean daily Pearson IC",
+            "Mean daily Spearman IC", "Pooled Pearson IC", "Pooled Spearman IC", "Mean side-adjusted performance (bps)",
+            "Median side-adjusted performance (bps)", "Yield-change coverage (%)",
+        ])
+        self.horizon_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.horizon_table.horizontalHeader().setStretchLastSection(True)
+        horizon_layout.addWidget(self.horizon_table, 2)
+        self.tabs.addTab(horizon_page, "Horizon performance")
+
+        scatter_page = QWidget()
+        scatter_layout = QVBoxLayout(scatter_page)
+        scatter_controls = QHBoxLayout()
+        scatter_controls.addWidget(QLabel("Signal date"))
+        self.scatter_date = QComboBox()
+        self.scatter_date.currentIndexChanged.connect(self._update_scatter_plot)
+        scatter_controls.addWidget(self.scatter_date, 1)
+        scatter_controls.addWidget(QLabel("Forward horizon T+ (calendar days)"))
+        self.scatter_horizon = QSpinBox()
+        self.scatter_horizon.setRange(1, 365)
+        self.scatter_horizon.setValue(5)
+        self.scatter_horizon.valueChanged.connect(self._update_scatter_plot)
+        scatter_controls.addWidget(self.scatter_horizon)
+        scatter_layout.addLayout(scatter_controls)
+        self.scatter_status = QLabel("Select a signal date to inspect its cross-section.")
+        scatter_layout.addWidget(self.scatter_status)
+        self.scatter_chart = SignalReturnScatterChart()
+        scatter_layout.addWidget(self.scatter_chart, 1)
+        self.tabs.addTab(scatter_page, "Signal vs. return")
+
+        portfolio_page = QWidget()
+        portfolio_layout = QVBoxLayout(portfolio_page)
+        self.portfolio_chart = RebalancedPortfolioChart()
+        portfolio_layout.addWidget(self.portfolio_chart, 2)
+        self.rebalance_table = QTableWidget(0, 9)
+        self.rebalance_table.setHorizontalHeaderLabels([
+            "Signal date", "Holding date", "Period days", "Long positions", "Short positions",
+            "Yield-only return proxy (bps)", "Yield-change coverage (%)",
+            "Covered total-return contribution (%)", "Total-return coverage (%)",
+        ])
+        self.rebalance_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.rebalance_table.horizontalHeader().setStretchLastSection(True)
+        portfolio_layout.addWidget(self.rebalance_table, 3)
+        self.tabs.addTab(portfolio_page, "Rebalanced portfolio")
+
         details_page = QWidget()
         details_layout = QVBoxLayout(details_page)
         self.detail_status = QLabel("Select a signal date to inspect the included bond observations and strategy legs.")
         details_layout.addWidget(self.detail_status)
-        self.detail_table = QTableWidget(0, 16)
+        self.detail_table = QTableWidget(0, 13)
         self.detail_table.setHorizontalHeaderLabels([
-            "Signal date", "Ticker", "ISIN", "Signal residual (pp)", "Signal yield date",
-            "T+1 yield date", "T+end yield date", "Yield change (bps)",
-            "Duration (years)", "Yield-only proxy (bps)", "Strategy leg", "Bond total return (%)",
-            "Return status", "Forward days", "Sector", "Issuer",
+            "Signal date", "Partition", "ISIN", "Signal value", "Signal yield date",
+            "Raw cumulative change (bps)", "De-meaned cumulative change (bps)", "Side-adjusted change (bps)",
+            "Strategy leg", "Bond total return (%)", "Return status", "Duration (years)", "Issuer",
         ])
         self.detail_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.detail_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -190,6 +484,7 @@ class SignalEvaluationWindow(QMainWindow):
         self.tabs.addTab(details_page, "Bond observations")
         layout.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
+        self._refresh_partition_fields()
 
     def _browse(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
@@ -197,6 +492,34 @@ class SignalEvaluationWindow(QMainWindow):
         )
         if selected:
             self.bond_list.setText(selected)
+
+    def _refresh_partition_fields(self, *_args: Any) -> None:
+        selected = self.partition_field.currentText()
+        fields: list[str] = []
+        try:
+            with Path(self.bond_list.text()).expanduser().open("r", encoding="utf-8-sig", newline="") as handle:
+                fields = list(csv.DictReader(handle).fieldnames or [])
+        except OSError:
+            fields = []
+        self.partition_field.blockSignals(True)
+        self.partition_field.clear()
+        self.partition_field.addItems(fields)
+        if selected in fields:
+            self.partition_field.setCurrentText(selected)
+        elif "sector" in fields:
+            self.partition_field.setCurrentText("sector")
+        self.partition_field.blockSignals(False)
+        self._predictor_changed()
+
+    def _predictor_changed(self, *_args: Any) -> None:
+        percentile_mode = self.predictor.currentData() == PREDICTOR_PARTITION_PERCENTILE
+        self.partition_field.setEnabled(percentile_mode)
+        self.percentile_lookback.setEnabled(percentile_mode)
+        self.minimum_history.setEnabled(percentile_mode)
+        minimum_bonds = 1 if percentile_mode else 5
+        self.minimum_bonds.setMinimum(minimum_bonds)
+        if self.minimum_bonds.value() < minimum_bonds:
+            self.minimum_bonds.setValue(minimum_bonds)
 
     def _run_evaluation(self) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -214,10 +537,13 @@ class SignalEvaluationWindow(QMainWindow):
             "database_path": DATABASE_PATH,
             "minimum_bonds": self.minimum_bonds.value(),
             "maximum_signal_age_days": self.signal_age.value(),
-            "maximum_forward_start_delay_days": self.forward_start_delay.value(),
-            "maximum_horizon_end_age_days": self.end_age.value(),
+            "maximum_yield_change_gap_days": self.change_gap.value(),
             "maximum_price_age_days": self.price_age.value(),
             "long_short_quantile": self.quantile.value(),
+            "predictor_id": self.predictor.currentData(),
+            "partition_field": self.partition_field.currentText() or "sector",
+            "percentile_lookback_days": self.percentile_lookback.value(),
+            "minimum_history_observations": self.minimum_history.value(),
         }
         self.run_button.setEnabled(False)
         self.export_button.setEnabled(False)
@@ -225,7 +551,7 @@ class SignalEvaluationWindow(QMainWindow):
         self.result = None
         self.date_table.setRowCount(0)
         self.detail_table.setRowCount(0)
-        self.status.setText("Building point-in-time curves and evaluating forward observations...")
+        self.status.setText("Building point-in-time predictor values and evaluating forward observations...")
         self.progress.setRange(0, 0)
         self.worker = EvaluationWorker(parameters, self)
         self.worker.progress.connect(self._progress)
@@ -239,18 +565,79 @@ class SignalEvaluationWindow(QMainWindow):
         self.progress.setValue(completed)
         self.status.setText(f"Evaluating signal dates: {completed:,}/{total:,}")
 
+    def _update_scatter_plot(self, *_args: Any) -> None:
+        if self.result is None:
+            return
+        as_of = self.scatter_date.currentText()
+        horizon = self.scatter_horizon.value()
+        scatter_details = []
+        if as_of:
+            for item in self.scatter_rows_by_date.get(as_of, []):
+                outcomes = item["side_adjusted_outcomes_by_horizon_bps"]
+                if horizon > len(outcomes) or outcomes[horizon - 1] is None:
+                    continue
+                scatter_details.append({
+                    **item,
+                    "horizon_days": horizon,
+                    "side_adjusted_forward_yield_change_bps": outcomes[horizon - 1],
+                })
+        self.scatter_chart.set_rows(scatter_details)
+        self.scatter_status.setText(
+            f"{as_of or 'Select a signal date'} | T+{horizon} calendar days | "
+            f"{len(scatter_details):,} bonds with a forward TRACE yield observation"
+        )
+
     def _show_results(self, result: dict[str, Any]) -> None:
         self.result = result
         date_rows = result["date_results"]
         detail_rows = result["bond_results"]
+        self.scatter_rows_by_date = {}
+        for item in result["scatter_results"]:
+            self.scatter_rows_by_date.setdefault(item["as_of_date"], []).append(item)
+        self.scatter_horizon.setMaximum(max(1, result["summary"]["horizon_days"]))
+        self.scatter_date.blockSignals(True)
+        self.scatter_date.clear()
+        self.scatter_date.addItems([row["as_of_date"] for row in date_rows])
+        self.scatter_date.blockSignals(False)
         self._fill_table(
             self.date_table,
             date_rows,
             (
-                "as_of_date", "horizon_end_date", "signal_bonds_with_forward_data", "ticker_curves_fitted",
-                "pearson_signal_forward_yield_change", "spearman_signal_forward_yield_change",
+                "as_of_date", "horizon_end_date", "signal_bonds_with_forward_change", "ticker_curves_fitted",
+                "pearson_side_adjusted_outcome", "spearman_side_adjusted_outcome",
                 "long_positions", "short_positions", "long_short_total_return_pct",
-                "long_short_total_return_coverage_pct", "long_short_duration_adjusted_return_proxy_bps",
+                "long_short_total_return_coverage_pct", "side_adjusted_long_short_yield_return_proxy_bps",
+            ),
+        )
+        self.date_table.setHorizontalHeaderItem(
+            3,
+            QTableWidgetItem(
+                "Ticker curves" if result["summary"]["signal_id"] == PREDICTOR_NELSON_SIEGEL
+                else "Eligible partitions"
+            ),
+        )
+        event_rows = result["event_curve_results"]
+        self.horizon_chart.set_rows(event_rows)
+        self._fill_table(
+            self.horizon_table,
+            event_rows,
+            (
+                "horizon_days", "dates_with_correlation", "bond_date_pairs",
+                "mean_daily_side_adjusted_pearson", "mean_daily_side_adjusted_spearman",
+                "pooled_side_adjusted_pearson", "pooled_side_adjusted_spearman",
+                "mean_daily_side_adjusted_performance_bps", "median_daily_side_adjusted_performance_bps",
+                "mean_long_short_change_coverage_pct",
+            ),
+        )
+        rebalance_rows = result["rebalance_results"]
+        self.portfolio_chart.set_rows(rebalance_rows)
+        self._fill_table(
+            self.rebalance_table,
+            rebalance_rows,
+            (
+                "signal_date", "holding_date", "holding_period_days", "long_positions", "short_positions",
+                "side_adjusted_yield_return_proxy_bps", "yield_change_coverage_pct",
+                "covered_total_return_contribution_pct", "total_return_coverage_pct",
             ),
         )
         if date_rows:
@@ -259,29 +646,51 @@ class SignalEvaluationWindow(QMainWindow):
         else:
             self.detail_table.setRowCount(0)
         summary = result["summary"]
+        percentile_mode = summary["signal_id"] == PREDICTOR_PARTITION_PERCENTILE
 
         def display(value: Any, suffix: str = "") -> str:
             return "n/a" if value is None else f"{float(value):.3f}{suffix}"
 
+        predictor_description = (
+            f"{summary['partition_field']} group median TRACE yield ranked against strictly prior "
+            f"{summary['percentile_lookback_days']}-day history; higher percentile means higher-yield regime. "
+            f"Requires {summary['minimum_history_observations']} prior group observations. "
+            "This is a yield-based spread proxy until government-relative spreads are available. "
+            if percentile_mode else
+            "Positive Nelson-Siegel residual means high yield versus the fitted issuer curve. "
+        )
+        outcome_description = (
+            "Forward outcomes use raw, non-demeaned yield changes. "
+            if percentile_mode else "Forward outcomes use cross-sectionally de-meaned yield changes. "
+        )
+        outcome_description += (
+            "For stale signal yields, the first later print is excluded because it spans pre-signal time; "
+            "forward changes resume after two post-signal prints. "
+        )
         self.summary.setText(
             f"{summary['signal_name']} | {summary['test_start_date']} to {summary['test_end_date']} | "
-            f"T+1 to T+{summary['horizon_days']} calendar days. "
-            f"Mean daily Pearson/Spearman correlation with forward yield-change proxy: "
-            f"{display(summary['mean_daily_pearson_correlation'])} / "
-            f"{display(summary['mean_daily_spearman_correlation'])}. "
-            f"Mean daily gross long-short duration-adjusted return proxy: "
-            f"{display(summary['mean_daily_long_short_return_proxy_bps'], ' bps')}; "
-            f"mean actual total-return long-short: {display(summary['mean_daily_long_short_total_return_pct'], '%')} "
+            f"At T+{summary['horizon_days']}, mean daily side-adjusted Pearson/Spearman IC: "
+            f"{display(summary['mean_daily_pearson_correlation_side_adjusted'])} / "
+            f"{display(summary['mean_daily_spearman_correlation_side_adjusted'])}; pooled Spearman IC: "
+            f"{display(summary['pooled_spearman_correlation_side_adjusted'])}. "
+            f"Mean daily side-adjusted long-short performance: "
+            f"{display(summary['mean_daily_long_short_yield_return_proxy_bps'], ' bps')}. "
+            f"Mean actual total-return long-short: {display(summary['mean_daily_long_short_total_return_pct'], '%')} "
             f"on {summary['dates_with_total_return']} fully priced dates (mean leg coverage "
             f"{display(summary['mean_long_short_total_return_coverage_pct'], '%')}; positive on "
             f"{display(summary['total_return_positive_date_fraction'] * 100 if summary['total_return_positive_date_fraction'] is not None else None, '%')}). "
-            "Yield changes are only a spread proxy because no Treasury benchmark is available. "
-            "The yield-only proxy excludes carry, convexity, and costs; total returns use the current synthetic coupon schedule and exclude costs and defaults. "
-            "Forward windows overlap. Past TRACE revisions and the current bond-list snapshot may affect this retrospective test."
+            f"Rebalanced indices from 100: covered total-return contribution "
+            f"{display(summary['rebalanced_covered_total_return_nav_index'])}, yield-only proxy "
+            f"{display(summary['rebalanced_yield_only_nav_index'])}, across {summary['rebalanced_periods']} periods. "
+            f"{predictor_description}{outcome_description}"
+            "positive side-adjusted IC/performance is favorable. "
+            "The horizon total return uses a synthetic coupon schedule and excludes costs/defaults; horizon windows overlap. "
+            "The rebalanced index is a duration-adjusted yield-only proxy. Past TRACE revisions and the current bond-list snapshot may affect results."
         )
         self.status.setText(
             f"Completed {summary['signal_dates']:,} signal dates; "
-            f"{summary['dates_with_correlation']:,} dates had enough pairs for correlation."
+            f"{summary['dates_with_correlation']:,} dates had enough pairs for correlation. "
+            f"Excluded {summary['stale_first_prints_excluded']:,} first post-signal prints from stale yield baselines."
         )
         self.export_button.setEnabled(bool(detail_rows))
         self.export_report_button.setEnabled(bool(date_rows))
@@ -289,18 +698,38 @@ class SignalEvaluationWindow(QMainWindow):
     def _show_date_details(self, row: int, _column: int, _previous_row: int, _previous_column: int) -> None:
         if self.result is None or row < 0 or row >= len(self.result["date_results"]):
             self.detail_table.setRowCount(0)
+            self.scatter_chart.set_rows([])
             return
         as_of = self.result["date_results"][row]["as_of_date"]
         details = [item for item in self.result["bond_results"] if item["as_of_date"] == as_of]
+        self.scatter_date.blockSignals(True)
+        self.scatter_date.setCurrentText(as_of)
+        self.scatter_date.blockSignals(False)
+        self._update_scatter_plot()
+        percentile_mode = self.result["summary"]["signal_id"] == PREDICTOR_PARTITION_PERCENTILE
+        self.detail_table.setHorizontalHeaderItem(
+            1, QTableWidgetItem("Partition" if percentile_mode else "Ticker")
+        )
+        self.detail_table.setHorizontalHeaderItem(
+            6,
+            QTableWidgetItem(
+                "Cumulative yield change (bps)" if percentile_mode
+                else "De-meaned cumulative change (bps)"
+            ),
+        )
+        self.detail_table.setHorizontalHeaderItem(
+            3,
+            QTableWidgetItem("Percentile (0-100)" if percentile_mode else "Yield residual (pp)"),
+        )
         self.detail_status.setText(f"{as_of}: {len(details):,} bond-date observations; selected strategy legs are labelled Long/Short.")
         self._fill_table(
             self.detail_table,
             details,
             (
-                "as_of_date", "ticker", "isin", "signal_value_pct", "yield_date",
-                "forward_start_yield_date", "horizon_end_yield_date", "forward_yield_change_bps",
-                "modified_duration_years", "yield_duration_return_proxy_bps", "strategy_leg",
-                "bond_total_return_pct", "bond_total_return_status", "forward_window_days", "sector", "issuer_name",
+                "as_of_date", "partition_value" if percentile_mode else "ticker", "isin", "signal_value_pct", "yield_date",
+                "raw_cumulative_yield_change_bps", "cumulative_demeaned_yield_change_bps",
+                "side_adjusted_yield_change_bps", "strategy_leg", "bond_total_return_pct",
+                "bond_total_return_status", "modified_duration_years", "issuer_name",
             ),
         )
 
@@ -331,7 +760,7 @@ class SignalEvaluationWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export signal evaluation observations",
-            "nelson_siegel_signal_observations.csv",
+            f"{self.result['summary']['signal_id']}_observations.csv",
             "CSV files (*.csv)",
         )
         if not path:
@@ -354,12 +783,17 @@ class SignalEvaluationWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export signal evaluation date report",
-            "nelson_siegel_signal_report.json",
+            f"{self.result['summary']['signal_id']}_report.json",
             "JSON files (*.json)",
         )
         if not path:
             return
-        report = {"summary": self.result["summary"], "date_results": self.result["date_results"]}
+        report = {
+            "summary": self.result["summary"],
+            "date_results": self.result["date_results"],
+            "event_curve_results": self.result["event_curve_results"],
+            "rebalance_results": self.result["rebalance_results"],
+        }
         try:
             Path(path).write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         except OSError as error:
