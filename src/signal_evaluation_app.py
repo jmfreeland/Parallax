@@ -64,71 +64,144 @@ class HorizonCurvesChart(QWidget):
             painter.end()
             return
 
-        perf = [row["mean_daily_side_adjusted_performance_bps"] for row in rows]
-        corr = [row["mean_daily_side_adjusted_spearman"] for row in rows]
-        left, right = 76.0, float(self.width() - 72)
-        top, bottom = 42.0, float(self.height() - 52)
+        deciles = [row["decile_average_outperformance_bps"] for row in rows]
+        left, right = 76.0, float(self.width() - 24)
+        top, bottom = 38.0, float(self.height() - 76)
         x_min, x_max = float(rows[0]["horizon_days"]), float(rows[-1]["horizon_days"])
         if x_max <= x_min:
             x_max = x_min + 1.0
-        valid_perf = [float(value) for value in perf if value is not None]
-        perf_min = min(0.0, min(valid_perf, default=0.0))
-        perf_max = max(0.0, max(valid_perf, default=0.0))
-        pad = max(1.0, (perf_max - perf_min) * 0.12)
-        perf_min, perf_max = perf_min - pad, perf_max + pad
+        valid_values = [float(value) for series in deciles for value in series if value is not None]
+        y_min = min(0.0, min(valid_values, default=0.0))
+        y_max = max(0.0, max(valid_values, default=0.0))
+        pad = max(1.0, (y_max - y_min) * 0.12)
+        y_min, y_max = y_min - pad, y_max + pad
         x_map = lambda day: left + (day - x_min) / (x_max - x_min) * (right - left)
-        y_perf = lambda value: bottom - (value - perf_min) / (perf_max - perf_min) * (bottom - top)
-        y_corr = lambda value: bottom - (value + 1.0) / 2.0 * (bottom - top)
+        y_map = lambda value: bottom - (value - y_min) / (y_max - y_min) * (bottom - top)
 
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 24), Qt.AlignmentFlag.AlignLeft,
-                         "Average side-adjusted long-short performance and signal IC by horizon")
+                         "D1 = lowest signal, D10 = highest; return proxy vs. population")
         for step in range(5):
             fraction = step / 4
-            y_value = perf_min + fraction * (perf_max - perf_min)
-            y = y_perf(y_value)
+            y_value = y_min + fraction * (y_max - y_min)
+            y = y_map(y_value)
             painter.setPen(QPen(QColor("#263449"), 1))
             painter.drawLine(QPointF(left, y), QPointF(right, y))
             painter.setPen(QColor("#94a3b8"))
             painter.drawText(QRectF(4, y - 9, 66, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{y_value:.1f}")
-            corr_value = -1.0 + fraction * 2.0
-            painter.drawText(QRectF(right + 5, y - 9, 62, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"{corr_value:.2f}")
         painter.setPen(QColor("#94a3b8"))
-        painter.drawText(QRectF(4, top - 24, 70, 18), Qt.AlignmentFlag.AlignRight, "Return (bps)")
-        painter.drawText(QRectF(right + 2, top - 24, 65, 18), Qt.AlignmentFlag.AlignLeft, "Spearman IC")
+        painter.drawText(QRectF(4, top - 24, 70, 18), Qt.AlignmentFlag.AlignRight, "Outperf. (bps)")
         painter.drawText(QRectF(left, bottom + 6, right - left, 20), Qt.AlignmentFlag.AlignCenter, "Calendar days after signal (T+1 to T+horizon)")
+        painter.setPen(QPen(QColor("#64748b"), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(left, y_map(0.0)), QPointF(right, y_map(0.0)))
 
-        def draw_series(values: list[Any], mapper: Any, color: str) -> None:
+        colors = ("#64748b", "#38bdf8", "#22c55e", "#a3e635", "#facc15",
+                  "#fb923c", "#f97316", "#f43f5e", "#e879f9", "#c084fc")
+        def draw_series(values: list[Any], color: str) -> None:
             path = QPainterPath()
             drawing = False
             for row, value in zip(rows, values):
                 if value is None:
                     drawing = False
                     continue
-                point = QPointF(x_map(float(row["horizon_days"])), mapper(float(value)))
+                point = QPointF(x_map(float(row["horizon_days"])), y_map(float(value)))
                 if drawing:
                     path.lineTo(point)
                 else:
                     path.moveTo(point)
                 drawing = True
-            painter.setPen(QPen(QColor(color), 2.4))
+            painter.setPen(QPen(QColor(color), 2.0))
             painter.drawPath(path)
             for row, value in zip(rows, values):
                 if value is not None:
                     painter.setBrush(QColor(color))
                     painter.setPen(QPen(QColor(color), 1))
-                    painter.drawEllipse(QPointF(x_map(float(row["horizon_days"])), mapper(float(value))), 2.4, 2.4)
+                    painter.drawEllipse(QPointF(x_map(float(row["horizon_days"])), y_map(float(value))), 2.4, 2.4)
 
-        draw_series(perf, y_perf, "#38bdf8")
-        draw_series(corr, y_corr, "#fbbf24")
-        painter.setPen(QPen(QColor("#38bdf8"), 2.4))
-        painter.drawLine(QPointF(left + 8, self.height() - 16), QPointF(left + 30, self.height() - 16))
+        legend_y = self.height() - 16
+        column_width = max(60, (right - left) / 5)
+        for decile, color in enumerate(colors):
+            draw_series([series[decile] for series in deciles], color)
+            legend_row, legend_col = divmod(decile, 5)
+            legend_x = left + legend_col * column_width
+            y = legend_y - legend_row * 16
+            painter.setPen(QPen(QColor(color), 2.0))
+            painter.drawLine(QPointF(legend_x, y), QPointF(legend_x + 16, y))
+            painter.setPen(QColor("#e2e8f0"))
+            painter.drawText(QRectF(legend_x + 20, y - 8, column_width - 22, 16),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             f"D{decile + 1}")
+        painter.end()
+
+
+class CorrelationHorizonChart(QWidget):
+    """Show predictive correlations separately from decile returns."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, Any]] = []
+        self.setMinimumHeight(260)
+
+    def set_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.update()
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0b1220"))
+        if not self.rows:
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Run an evaluation to plot correlations.")
+            painter.end()
+            return
+        left, right = 76.0, float(self.width() - 24)
+        top, bottom = 38.0, float(self.height() - 44)
+        x_min, x_max = float(self.rows[0]["horizon_days"]), float(self.rows[-1]["horizon_days"])
+        if x_max <= x_min:
+            x_max = x_min + 1.0
+        x_map = lambda day: left + (day - x_min) / (x_max - x_min) * (right - left)
+        y_map = lambda value: bottom - (value + 1.0) / 2.0 * (bottom - top)
         painter.setPen(QColor("#e2e8f0"))
-        painter.drawText(QRectF(left + 36, self.height() - 25, 230, 18), Qt.AlignmentFlag.AlignLeft, "Long-short side-adjusted performance")
-        painter.setPen(QPen(QColor("#fbbf24"), 2.4))
-        painter.drawLine(QPointF(left + 285, self.height() - 16), QPointF(left + 307, self.height() - 16))
+        painter.drawText(QRectF(left, 8, right - left, 22), Qt.AlignmentFlag.AlignLeft,
+                         "Mean daily Pearson and Spearman IC")
+        for step in range(5):
+            value = -1.0 + step * 0.5
+            y = y_map(value)
+            painter.setPen(QPen(QColor("#263449"), 1))
+            painter.drawLine(QPointF(left, y), QPointF(right, y))
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(QRectF(8, y - 9, 60, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"{value:.1f}")
+        colors = (("mean_daily_side_adjusted_pearson", "#38bdf8"),
+                  ("mean_daily_side_adjusted_spearman", "#fbbf24"))
+        for field, color in colors:
+            path = QPainterPath()
+            drawing = False
+            for row in self.rows:
+                value = row[field]
+                if value is None:
+                    drawing = False
+                    continue
+                point = QPointF(x_map(float(row["horizon_days"])), y_map(float(value)))
+                if drawing:
+                    path.lineTo(point)
+                else:
+                    path.moveTo(point)
+                drawing = True
+            painter.setPen(QPen(QColor(color), 2.2))
+            painter.drawPath(path)
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(QRectF(left, bottom + 6, right - left, 18), Qt.AlignmentFlag.AlignCenter,
+                         "Calendar days after signal")
+        painter.setPen(QPen(QColor("#38bdf8"), 2.2))
+        painter.drawLine(QPointF(left + 10, self.height() - 12), QPointF(left + 30, self.height() - 12))
         painter.setPen(QColor("#e2e8f0"))
-        painter.drawText(QRectF(left + 313, self.height() - 25, 230, 18), Qt.AlignmentFlag.AlignLeft, "Side-adjusted Spearman correlation")
+        painter.drawText(QRectF(left + 36, self.height() - 20, 90, 16), Qt.AlignmentFlag.AlignLeft, "Pearson")
+        painter.setPen(QPen(QColor("#fbbf24"), 2.2))
+        painter.drawLine(QPointF(left + 130, self.height() - 12), QPointF(left + 150, self.height() - 12))
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left + 156, self.height() - 20, 100, 16), Qt.AlignmentFlag.AlignLeft, "Spearman")
         painter.end()
 
 
@@ -462,16 +535,28 @@ class SignalEvaluationWindow(QMainWindow):
         horizon_layout = QVBoxLayout(horizon_page)
         self.horizon_chart = HorizonCurvesChart()
         horizon_layout.addWidget(self.horizon_chart, 3)
-        self.horizon_table = QTableWidget(0, 10)
+        self.horizon_table = QTableWidget(0, 11)
         self.horizon_table.setHorizontalHeaderLabels([
-            "Horizon (days)", "Dates with IC", "Bond-date pairs", "Mean daily Pearson IC",
-            "Mean daily Spearman IC", "Pooled Pearson IC", "Pooled Spearman IC", "Mean side-adjusted performance (bps)",
-            "Median side-adjusted performance (bps)", "Yield-change coverage (%)",
+            "Horizon (days)", *[f"D{decile} outperformance (bps)" for decile in range(1, 11)],
         ])
         self.horizon_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.horizon_table.horizontalHeader().setStretchLastSection(True)
         horizon_layout.addWidget(self.horizon_table, 2)
         self.tabs.addTab(horizon_page, "Horizon performance")
+
+        correlation_page = QWidget()
+        correlation_layout = QVBoxLayout(correlation_page)
+        self.correlation_chart = CorrelationHorizonChart()
+        correlation_layout.addWidget(self.correlation_chart, 2)
+        self.correlation_table = QTableWidget(0, 6)
+        self.correlation_table.setHorizontalHeaderLabels([
+            "Horizon (days)", "Dates with IC", "Mean daily Pearson", "Mean daily Spearman",
+            "Pooled Pearson", "Pooled Spearman",
+        ])
+        self.correlation_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.correlation_table.horizontalHeader().setStretchLastSection(True)
+        correlation_layout.addWidget(self.correlation_table, 1)
+        self.tabs.addTab(correlation_page, "Signal correlations")
 
         scatter_page = QWidget()
         scatter_layout = QVBoxLayout(scatter_page)
@@ -735,12 +820,16 @@ class SignalEvaluationWindow(QMainWindow):
         self._fill_table(
             self.horizon_table,
             event_rows,
+            ("horizon_days", *[f"decile_{decile}_outperformance_bps" for decile in range(1, 11)]),
+        )
+        self.correlation_chart.set_rows(event_rows)
+        self._fill_table(
+            self.correlation_table,
+            event_rows,
             (
-                "horizon_days", "dates_with_correlation", "bond_date_pairs",
-                "mean_daily_side_adjusted_pearson", "mean_daily_side_adjusted_spearman",
-                "pooled_side_adjusted_pearson", "pooled_side_adjusted_spearman",
-                "mean_daily_side_adjusted_performance_bps", "median_daily_side_adjusted_performance_bps",
-                "mean_long_short_change_coverage_pct",
+                "horizon_days", "dates_with_correlation", "mean_daily_side_adjusted_pearson",
+                "mean_daily_side_adjusted_spearman", "pooled_side_adjusted_pearson",
+                "pooled_side_adjusted_spearman",
             ),
         )
         rebalance_rows = result["rebalance_results"]

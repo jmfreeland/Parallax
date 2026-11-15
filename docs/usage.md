@@ -157,11 +157,14 @@ time before the signal; changes resume after two post-signal prints. For
 Nelson-Siegel residuals, dates with fewer than five eligible bond changes are
 omitted. The signal-to-change correlations reverse
 the change sign so that positive correlation means the residual correctly
-indicated tightening. The **Horizon performance** chart plots average
-side-adjusted long-short performance and Spearman correlation from T+1 through
-T+end; its table includes Pearson and Spearman results, both daily-averaged and
-pooled. Signal staleness, maximum gap between yield changes, minimum curve size,
-price age, horizon, and long-short tail quantile are configurable.
+indicated tightening. **Horizon performance** ranks the full daily signal
+cross-section into ten equal-count groups, then plots each group's average
+cumulative duration-adjusted return proxy relative to that date's population
+average from T+1 through T+end. It does not apply the long/short tail cutoffs.
+The separate **Signal correlations** panel shows daily-averaged and pooled
+Pearson and Spearman IC. Signal staleness, maximum gap between yield changes,
+minimum curve size, price age, horizon, and long-short tail quantile are
+configurable.
 
 Use **Signal vs. return** to inspect a bond-level cross-section. After an
 evaluation completes, change the signal date or forward horizon directly in
@@ -273,6 +276,18 @@ print(result.total_return_pct)
 Coupon dates are estimated by rolling a semiannual schedule back from maturity
 because actual issue/coupon dates are not in the snapshot. Coupon cash is not
 reinvested; fees, taxes, defaults, and settlement lag are not included.
+
+Use **Analyze bond return series** in the launcher to create business-day bond
+total-return and financing-excess series for one ISIN. Select a short-rate CSV
+with a date field (`date`, `observation_date`, `trade_date`, or `effective_date`)
+and a rate column expressed in percent. The user-entered annualized financing
+spread is added in basis points. At each interval, the rate known at the
+interval start is used, with ACT/365 simple accrual; the log excess return is
+`log(1 + bond total return) - log(1 + financing accrual)`. TRACE prices carry
+forward between prints and their age is reported. The output includes interval
+log excess returns and cumulative bond, financing, and excess indices, with CSV
+and summary JSON export. The local `main` branch currently has no tracked
+government-yield history file, so provide the short-rate history CSV explicitly.
 
 ## Reproducibility
 

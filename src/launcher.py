@@ -147,6 +147,10 @@ class LauncherWindow(QMainWindow):
         fit_curves.clicked.connect(lambda: self._launch("src.nelson_siegel_app"))
         self.buttons.append(fit_curves)
         portfolio_actions.addWidget(fit_curves, 1, 1)
+        analyze_bond_returns = QPushButton("Analyze bond return series")
+        analyze_bond_returns.clicked.connect(lambda: self._launch("src.bond_return_analysis_app"))
+        self.buttons.append(analyze_bond_returns)
+        portfolio_actions.addWidget(analyze_bond_returns, 2, 0)
         portfolio_layout.addLayout(portfolio_actions)
         self.portfolio_archive_table = QTableWidget(0, 5)
         self.portfolio_archive_table.setHorizontalHeaderLabels(

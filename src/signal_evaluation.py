@@ -255,6 +255,10 @@ def evaluate_nelson_siegel_signal(
     scatter_results: list[dict[str, Any]] = []
     rebalance_results: list[dict[str, Any]] = []
     event_rows_by_horizon: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    decile_returns_by_horizon: dict[int, dict[int, list[float]]] = {
+        horizon: {decile: [] for decile in range(10)}
+        for horizon in range(1, horizon_days + 1)
+    }
     event_pairs_by_horizon: dict[int, tuple[list[float], list[float]]] = {
         horizon: ([], []) for horizon in range(1, horizon_days + 1)
     }
@@ -387,6 +391,11 @@ def evaluate_nelson_siegel_signal(
             }
         portfolio_signals = [row for row in signals if row["maturity_date"] > forward_start_boundary]
         ordered = sorted(portfolio_signals, key=lambda row: (row["signal_value_pct"], row["isin"]))
+        ordered_signal_rows = sorted(signals, key=lambda row: (row["signal_value_pct"], row["isin"]))
+        signal_deciles = {
+            row["isin"]: min(9, rank * 10 // len(ordered_signal_rows))
+            for rank, row in enumerate(ordered_signal_rows)
+        } if ordered_signal_rows else {}
         long_leg: list[dict[str, Any]] = []
         short_leg: list[dict[str, Any]] = []
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE:
@@ -455,6 +464,21 @@ def evaluate_nelson_siegel_signal(
                 float(np.mean(long_leg_proxy) - np.mean(short_leg_proxy))
                 if long_leg and short_leg else None
             )
+            decile_bond_returns: dict[int, list[float]] = {decile: [] for decile in range(10)}
+            population_returns: list[float] = []
+            for row in pairs:
+                duration = row["modified_duration_years"]
+                if duration is None:
+                    continue
+                return_proxy = -float(duration) * cumulative_demeaned[row["isin"]]
+                population_returns.append(return_proxy)
+                decile_bond_returns[signal_deciles[row["isin"]]].append(return_proxy)
+            population_average_return = float(np.mean(population_returns)) if population_returns else None
+            for decile, returns in decile_bond_returns.items():
+                if returns and population_average_return is not None:
+                    decile_returns_by_horizon[horizon][decile].append(
+                        float(np.mean(returns)) - population_average_return
+                    )
             strategy_bonds = (*long_leg, *short_leg)
             change_coverage = (
                 100.0 * sum(row["isin"] in active_isins and row["modified_duration_years"] is not None
@@ -649,6 +673,12 @@ def evaluate_nelson_siegel_signal(
         valid_coverage = [row["long_short_change_coverage_pct"] for row in observations_at_horizon
                           if row["long_short_change_coverage_pct"] is not None]
         pooled_signals, pooled_targets = event_pairs_by_horizon[horizon]
+        decile_means = [
+            float(np.mean(decile_returns_by_horizon[horizon][decile]))
+            if decile_returns_by_horizon[horizon][decile] else None
+            for decile in range(10)
+        ]
+        decile_date_counts = [len(decile_returns_by_horizon[horizon][decile]) for decile in range(10)]
         event_curve_results.append({
             "horizon_days": horizon,
             "dates_with_correlation": len(valid_spearman),
@@ -660,6 +690,10 @@ def evaluate_nelson_siegel_signal(
             "mean_daily_side_adjusted_performance_bps": float(np.mean(valid_performance)) if valid_performance else None,
             "median_daily_side_adjusted_performance_bps": float(np.median(valid_performance)) if valid_performance else None,
             "mean_long_short_change_coverage_pct": float(np.mean(valid_coverage)) if valid_coverage else None,
+            "decile_average_outperformance_bps": decile_means,
+            "decile_dates_with_returns": decile_date_counts,
+            **{f"decile_{decile + 1}_outperformance_bps": decile_means[decile]
+               for decile in range(10)},
         })
 
     max_horizon = event_curve_results[-1]
@@ -712,6 +746,7 @@ def evaluate_nelson_siegel_signal(
         "minimum_daily_change_cross_section": MIN_DAILY_CHANGE_CROSS_SECTION
         if predictor_id == PREDICTOR_NELSON_SIEGEL else None,
         "side_adjustment_definition": "multiply the forward yield change by -1 so a positive value is favorable to a high-yield signal; residual outcomes are cross-sectionally de-meaned, percentile outcomes are not",
+        "horizon_decile_definition": "rank the full daily signal cross-section into ten equal-count deciles; within each signal date and forward horizon, calculate each decile's equal-weighted duration-adjusted return proxy from cross-sectionally de-meaned yield changes, subtract the available population average, then average daily decile outperformance across signal dates; no long-short tail cutoff is applied",
         "spread_measurement": "TRACE yield-level/change proxy; no Treasury benchmark-relative spread available",
         "percentile_definition": "mid-rank percentile of the partition median latest TRACE yield versus strictly prior partition medians in trailing history; partition signals apply to all constituent bonds and portfolio legs are bond equal-weighted"
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
