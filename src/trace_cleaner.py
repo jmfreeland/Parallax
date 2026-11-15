@@ -1,7 +1,8 @@
-"""Build a derived TRACE series with short-gap fills and reversal filtering."""
+"""Build a derived TRACE dataset with carried marks and reversal flags."""
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -10,8 +11,10 @@ from uuid import uuid4
 
 import polars as pl
 
+from .trace_cleaning import TRACE_SERIES_CLEANING_VERSION
 
-CLEANING_POLICY_VERSION = "trace-series-cleaning-v1"
+
+CLEANING_POLICY_VERSION = TRACE_SERIES_CLEANING_VERSION
 
 
 def _as_date(value: Any) -> date:
@@ -37,26 +40,30 @@ def _business_dates_between(start: date, end: date) -> list[date]:
     return dates
 
 
-def _clean_series(
+def _mark_series(
     rows_by_key: dict[tuple[str, date], dict[str, Any]],
     *,
     value_field: str,
     action_field: str,
+    mark_field: str,
+    age_field: str,
     spike_threshold: float,
     rebound_absolute_tolerance: float,
-    max_fill_business_days: int,
+    max_mark_age_business_days: int,
 ) -> tuple[int, int]:
     by_isin: dict[str, list[tuple[date, float]]] = {}
+    source_dates_by_isin: dict[str, list[date]] = {}
     for (isin, observed_date), row in rows_by_key.items():
+        source_dates_by_isin.setdefault(isin, []).append(observed_date)
         value = row.get(value_field)
         if value is not None:
             by_isin.setdefault(isin, []).append((observed_date, float(value)))
-    corrected_count = filled_count = 0
+    flagged_count = carried_count = 0
     for isin, observations in by_isin.items():
         observations.sort()
-        # Only remove an isolated, large move that reverses promptly to near
-        # its prior level. The center point is replaced by time interpolation.
-        corrected = list(observations)
+        source_dates = sorted(source_dates_by_isin[isin])
+        # Reversal detection uses a later point, so flag the original value
+        # instead of revising the point-in-time observation.
         for index in range(1, len(observations) - 1):
             before_date, before = observations[index - 1]
             spike_date, spike = observations[index]
@@ -69,45 +76,54 @@ def _clean_series(
             if (abs(first_move) < spike_threshold or first_move * reversal >= 0
                     or abs(after - before) > tolerance):
                 continue
-            span = (after_date - before_date).days
-            weight = (spike_date - before_date).days / span if span else 0.5
-            corrected[index] = (spike_date, before + weight * (after - before))
             key = (isin, spike_date)
-            rows_by_key[key][value_field] = corrected[index][1]
-            rows_by_key[key][action_field] = "reversal_spike_interpolated"
-            corrected_count += 1
+            rows_by_key[key][action_field] = "reversal_spike_flagged"
+            flagged_count += 1
 
-        for (left_date, left_value), (right_date, right_value) in zip(corrected, corrected[1:]):
-            missing_days = _business_days_between(left_date, right_date) - 1
-            if missing_days <= 0 or missing_days > max_fill_business_days:
-                continue
-            span = (right_date - left_date).days
-            if span <= 0:
-                continue
-            for fill_date in _business_dates_between(left_date, right_date):
-                key = (isin, fill_date)
-                existing = rows_by_key.get(key)
-                if existing is not None and existing.get(value_field) is not None:
-                    continue
-                value = left_value + (right_value - left_value) * ((fill_date - left_date).days / span)
-                if existing is None:
-                    template = rows_by_key[(isin, left_date)].copy()
-                    template["trade_date"] = fill_date
-                    for field in ("price_raw", "clean_price", "last_sale_yield_raw", "clean_last_sale_yield"):
-                        if field in template:
-                            template[field] = None
-                    for field in ("price_clean_status", "yield_clean_status", "retrieved_at_utc", "observation_last_run_id"):
-                        if field in template:
-                            template[field] = None
-                    template["cleaning_row_type"] = "interpolated_business_day"
-                    template["price_series_clean_action"] = "not_observed"
-                    template["yield_series_clean_action"] = "not_observed"
-                    existing = rows_by_key.setdefault(key, template)
-                existing[value_field] = value
-                if existing.get(action_field) in (None, "missing", "not_observed"):
-                    existing[action_field] = "short_gap_interpolated"
-                filled_count += 1
-    return corrected_count, filled_count
+        last_value: float | None = None
+        last_observation_date: date | None = None
+        for mark_date in _business_dates_between(observations[0][0] - timedelta(days=1), observations[-1][0] + timedelta(days=1)):
+            key = (isin, mark_date)
+            row = rows_by_key.get(key)
+            if row is not None and row.get(value_field) is not None:
+                last_value = float(row[value_field])
+                last_observation_date = mark_date
+            if row is None:
+                template_index = bisect_right(source_dates, mark_date) - 1
+                template_date = source_dates[template_index]
+                row = rows_by_key[(isin, template_date)].copy()
+                row["trade_date"] = mark_date
+                for field in ("price_raw", "clean_price", "last_sale_yield_raw", "clean_last_sale_yield"):
+                    if field in row:
+                        row[field] = None
+                for field in ("price_clean_status", "yield_clean_status", "retrieved_at_utc", "observation_last_run_id"):
+                    if field in row:
+                        row[field] = None
+                for field in ("mark_clean_price", "mark_clean_last_sale_yield", "mark_price_age_days", "mark_yield_age_days"):
+                    row[field] = None
+                row["cleaning_row_type"] = "mark_only_business_day"
+                row["price_series_clean_action"] = "not_observed"
+                row["yield_series_clean_action"] = "not_observed"
+                rows_by_key[key] = row
+            age_business_days = (
+                _business_days_between(last_observation_date, mark_date)
+                if last_observation_date is not None else None
+            )
+            if last_value is not None and age_business_days is not None and age_business_days <= max_mark_age_business_days:
+                row[mark_field] = last_value
+                row[age_field] = (mark_date - last_observation_date).days
+                if row.get(value_field) is None:
+                    row[action_field] = "carried_forward_mark"
+                    carried_count += 1
+            else:
+                row[mark_field] = None
+                row[age_field] = None
+    for row in rows_by_key.values():
+        value = row.get(value_field)
+        if value is not None:
+            row[mark_field] = float(value)
+            row[age_field] = 0
+    return flagged_count, carried_count
 
 
 def clean_preprocessed_trace(
@@ -115,15 +131,15 @@ def clean_preprocessed_trace(
     *,
     yield_spike_threshold_bps: float = 50.0,
     price_spike_threshold_points: float = 5.0,
-    max_fill_business_days: int = 3,
+    max_mark_age_business_days: int = 3,
 ) -> dict[str, Any]:
     """Create a new cleaned Parquet dataset; the preprocessed source is untouched."""
     if not input_path.exists():
         raise FileNotFoundError(f"Preprocessed TRACE file not found: {input_path}")
     if yield_spike_threshold_bps <= 0 or price_spike_threshold_points <= 0:
         raise ValueError("Spike thresholds must be positive")
-    if max_fill_business_days < 0:
-        raise ValueError("Maximum fill gap must be non-negative")
+    if max_mark_age_business_days < 0:
+        raise ValueError("Maximum mark age must be non-negative")
     frame = pl.read_parquet(input_path)
     required = {"isin", "trade_date", "clean_price", "clean_last_sale_yield"}
     if not required.issubset(frame.columns):
@@ -136,17 +152,23 @@ def clean_preprocessed_trace(
         row["cleaning_row_type"] = "observed"
         row["price_series_clean_action"] = "valid" if row.get("clean_price") is not None else "missing_or_rejected"
         row["yield_series_clean_action"] = "valid" if row.get("clean_last_sale_yield") is not None else "missing_or_rejected"
+        row["mark_clean_price"] = None
+        row["mark_clean_last_sale_yield"] = None
+        row["mark_price_age_days"] = None
+        row["mark_yield_age_days"] = None
         rows_by_key[key] = row
 
-    price_corrected, price_filled = _clean_series(
+    price_flagged, price_carried = _mark_series(
         rows_by_key, value_field="clean_price",
-        action_field="price_series_clean_action", spike_threshold=price_spike_threshold_points,
-        rebound_absolute_tolerance=1.0, max_fill_business_days=max_fill_business_days,
+        action_field="price_series_clean_action", mark_field="mark_clean_price", age_field="mark_price_age_days",
+        spike_threshold=price_spike_threshold_points,
+        rebound_absolute_tolerance=1.0, max_mark_age_business_days=max_mark_age_business_days,
     )
-    yield_corrected, yield_filled = _clean_series(
+    yield_flagged, yield_carried = _mark_series(
         rows_by_key, value_field="clean_last_sale_yield",
-        action_field="yield_series_clean_action", spike_threshold=yield_spike_threshold_bps / 100.0,
-        rebound_absolute_tolerance=0.10, max_fill_business_days=max_fill_business_days,
+        action_field="yield_series_clean_action", mark_field="mark_clean_last_sale_yield",
+        age_field="mark_yield_age_days", spike_threshold=yield_spike_threshold_bps / 100.0,
+        rebound_absolute_tolerance=0.10, max_mark_age_business_days=max_mark_age_business_days,
     )
     clean_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid4().hex[:8]}"
     output_dir = input_path.parent / f"clean_id={clean_id}"
@@ -175,16 +197,16 @@ def clean_preprocessed_trace(
         "output_rows": output.height,
         "yield_spike_threshold_bps": yield_spike_threshold_bps,
         "price_spike_threshold_points": price_spike_threshold_points,
-        "max_fill_business_days": max_fill_business_days,
+        "max_mark_age_business_days": max_mark_age_business_days,
         "max_reversal_gap_business_days": 3,
         "rebound_absolute_tolerance": {"yield_percentage_points": 0.10, "price_points": 1.0},
         "rebound_tolerance_fraction_of_spike": 0.20,
-        "reversal_spikes_corrected": {"yield": yield_corrected, "price": price_corrected},
-        "business_day_values_interpolated": {"yield": yield_filled, "price": price_filled},
+        "business_day_marks_carried_forward": {"yield": yield_carried, "price": price_carried},
+        "reversal_spikes_flagged": {"yield": yield_flagged, "price": price_flagged},
         "raw_preprocessed_values_modified": False,
-        "actions": "Per security and field, an isolated large observation is interpolated only when it reverses within three business days and the following value is near the prior value. Missing business days are linearly interpolated only between valid endpoints with no more than the configured number of missing business days.",
-        "point_in_time_safe": False,
-        "lookahead_note": "Reversal detection and gap interpolation use a later endpoint. Treat this as a retrospective cleaned dataset; do not use corrected/interpolated values as if they were known on that date in a live or point-in-time backtest.",
+        "actions": "Observed policy-cleaned price and yield values are unchanged. For marking, carry the latest value forward for at most the configured number of missing business days and record the mark age. Large isolated moves promptly reversed toward the prior level are flagged using the later observation; the original value is retained because the flag is retrospective.",
+        "lookahead_used_to_build_observed_values": False,
+        "reversal_flags_are_retrospective": True,
     }
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

@@ -10,6 +10,7 @@ from .data_preprocessing import FieldPolicy, classify_value, clean_value_sql, re
 SENTINEL_MAGNITUDE_LIMIT = 10_000.0
 KNOWN_TRACE_SENTINELS = (999_999.99,)
 TRACE_POLICY_VERSION = "finra-trace-v1"
+TRACE_SERIES_CLEANING_VERSION = "trace-series-cleaning-v2"
 
 TRACE_FIELD_POLICIES = {
     "price": FieldPolicy(

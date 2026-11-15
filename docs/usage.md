@@ -60,14 +60,15 @@ time-series-cleaned version, use **Clean preprocessed TRACE data** in the
 launcher and select an `observations.parquet` file from a preprocessed run.
 This explicit step writes a new versioned dataset beneath the selected
 preprocessed folder, plus a diagnostics JSON; it does not change the preprocessed
-source or automatically alter signal evaluation inputs. It fills missing
-business days by linear interpolation between valid endpoints when the gap is
-within the configured limit (default three missing business days). It also
-replaces an isolated large price or yield move only if the next valid
-observation promptly reverses it and is close to the prior level. Corrected and
-interpolated values are marked per field in the output. Both operations use a
-later endpoint, so the result is retrospective and is not point-in-time safe for
-a backtest unless the cleaning delay is modeled. The inspector displays
+source. The signal evaluator can select this output and defaults to the latest
+cleaned dataset. It creates missing business-day mark columns by carrying the last observed value forward for up to
+the configured age (default three business days). The observed `clean_price`
+and `clean_last_sale_yield` columns remain unchanged; carried marks and their
+ages are separate fields. Large isolated moves that promptly reverse near the
+prior level are flagged per field, while their observed values remain unchanged
+because the flag requires a later print. Those flags are retrospective. The
+signal evaluator reads the unchanged observed columns and ignores mark and flag
+columns. The inspector displays
 individual bonds or equal-bond-weighted group levels. Its volatility and
 momentum columns are changes in a plotted level, not an investable return
 signal. See [signal methodology](signal_methodology.tex).
@@ -140,7 +141,12 @@ includes tickers that could not be fitted and their minimum-data reason.
 The launcher **Signal inventory** tab lists implemented signals and their
 validation status. Choose **Evaluate credit predictors** to compare the
 Nelson-Siegel residual with a historical partition percentile over a selected
-start/end range. On every TRACE yield
+start/end range. Select **Cleaned Parquet**, **Preprocessed Parquet**, or **Raw
+DuckDB history** as the input source; cleaned data is the default and the
+latest cleaned dataset is selected automatically. The report records the
+selected source and path. The cleaner's carried marks and reversal flags are
+separate from observed values; the evaluator reads the observed columns and
+ignores those marks and retrospective flags. On every TRACE yield
 date in that range, the evaluator fits the ticker curves using observations
 available by that date and records each bond's yield residual. From each
 signal date, it measures post-signal changes and accumulates them by horizon.

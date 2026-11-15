@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 from collections import defaultdict
+import json
 import math
 from bisect import bisect_right
 from datetime import date, datetime, timedelta, timezone
@@ -15,13 +16,22 @@ import numpy as np
 
 from .bond_returns import calculate_historical_bond_total_return
 from .nelson_siegel import METHODOLOGY, _basis, _fit_curve
-from .trace_cleaning import TRACE_POLICY_VERSION, clean_trace_value
+from .trace_cleaning import TRACE_POLICY_VERSION, TRACE_SERIES_CLEANING_VERSION, clean_trace_value
 
 
 ProgressCallback = Callable[[int, int], None]
 MIN_DAILY_CHANGE_CROSS_SECTION = 5
 PREDICTOR_NELSON_SIEGEL = "nelson_siegel_residual"
 PREDICTOR_PARTITION_PERCENTILE = "historical_partition_percentile"
+
+
+def _has_current_cleaning_version(path: Path) -> bool:
+    report_path = path.parent / "diagnostics.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return report.get("policy_version") == TRACE_SERIES_CLEANING_VERSION
 
 
 def _rank(values: np.ndarray) -> np.ndarray:
@@ -80,6 +90,8 @@ def evaluate_nelson_siegel_signal(
     maximum_yield_change_gap_days: int = 7,
     maximum_price_age_days: int = 7,
     long_short_quantile: float = 0.2,
+    data_source: str = "cleaned_parquet",
+    data_path: Path | None = None,
     predictor_id: str = PREDICTOR_NELSON_SIEGEL,
     partition_field: str = "sector",
     percentile_lookback_days: int = 1095,
@@ -118,6 +130,30 @@ def evaluate_nelson_siegel_signal(
         raise FileNotFoundError(f"Bond list not found: {bond_list_path}")
     if not database_path.exists():
         raise FileNotFoundError(f"TRACE history database not found: {database_path}")
+    if data_source not in {"raw_duckdb", "preprocessed_parquet", "cleaned_parquet"}:
+        raise ValueError(f"Unsupported TRACE data source: {data_source}")
+    if data_source == "raw_duckdb":
+        resolved_data_path = database_path.expanduser().resolve()
+    else:
+        if data_path is None:
+            root = database_path.parent / "preprocessed"
+            parent_prefix = "clean_id=" if data_source == "cleaned_parquet" else "preprocess_id="
+            candidates = [
+                path for path in root.rglob("observations.parquet")
+                if path.parent.name.startswith(parent_prefix)
+                and (data_source != "cleaned_parquet" or _has_current_cleaning_version(path))
+            ] if root.exists() else []
+            if candidates:
+                data_path = max(candidates, key=lambda path: path.stat().st_mtime)
+        if data_path is None or not data_path.exists():
+            expected = "a cleaned" if data_source == "cleaned_parquet" else "a preprocessed"
+            raise FileNotFoundError(f"Select {expected} TRACE observations.parquet dataset")
+        resolved_data_path = data_path.expanduser().resolve()
+        if data_source == "cleaned_parquet" and not _has_current_cleaning_version(resolved_data_path):
+            raise ValueError(
+                "This cleaned dataset uses an outdated or unknown cleaning policy. "
+                "Run Clean preprocessed TRACE data again to create the current carried-mark dataset."
+            )
 
     bonds: dict[str, dict[str, Any]] = {}
     with bond_list_path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -169,14 +205,28 @@ def evaluate_nelson_siegel_signal(
         percentile_lookback_days if predictor_id == PREDICTOR_PARTITION_PERCENTILE else 0,
     ))
     query_end = end_date + timedelta(days=horizon_days)
-    connection = duckdb.connect(str(database_path), read_only=True)
+    connection = (
+        duckdb.connect(str(database_path), read_only=True)
+        if data_source == "raw_duckdb" else duckdb.connect(":memory:")
+    )
     try:
-        records = connection.execute(
-            "SELECT isin, trade_date, last_sale_yield, price FROM observations "
-            "WHERE trade_date BETWEEN ? AND ? AND isin IN ("
-            + ",".join("?" for _ in bonds) + ") ORDER BY isin, trade_date",
-            [query_start, query_end, *bonds],
-        ).fetchall()
+        placeholders = ",".join("?" for _ in bonds)
+        if data_source == "raw_duckdb":
+            query = (
+                "SELECT isin, trade_date, last_sale_yield, price FROM observations "
+                f"WHERE trade_date BETWEEN ? AND ? AND isin IN ({placeholders}) ORDER BY isin, trade_date"
+            )
+            query_parameters: list[Any] = [query_start, query_end, *bonds]
+        else:
+            yield_column, price_column = "clean_last_sale_yield", "clean_price"
+            parquet_path_sql = "'" + resolved_data_path.as_posix().replace("'", "''") + "'"
+            query = (
+                f"SELECT isin, trade_date, {yield_column} AS last_sale_yield, {price_column} AS price "
+                f"FROM read_parquet({parquet_path_sql}) "
+                f"WHERE trade_date BETWEEN ? AND ? AND isin IN ({placeholders}) ORDER BY isin, trade_date"
+            )
+            query_parameters = [query_start, query_end, *bonds]
+        records = connection.execute(query, query_parameters).fetchall()
     finally:
         connection.close()
 
@@ -633,6 +683,10 @@ def evaluate_nelson_siegel_signal(
         "horizon_days": horizon_days,
         "bond_list_path": str(bond_list_path.resolve()),
         "trace_database_path": str(database_path.resolve()),
+        "data_source": data_source,
+        "data_source_path": str(resolved_data_path),
+        "data_source_uses_retrospective_cleaning": False,
+        "data_source_contains_retrospective_outlier_flags": data_source == "cleaned_parquet",
         "minimum_bonds_per_ticker": minimum_bonds if predictor_id == PREDICTOR_NELSON_SIEGEL else None,
         "minimum_bonds_per_partition": minimum_bonds if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
         "partition_field": partition_field if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,

@@ -28,12 +28,12 @@ class CleanerWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, input_path: Path, yield_threshold: float, price_threshold: float, gap_days: int) -> None:
+    def __init__(self, input_path: Path, yield_threshold: float, price_threshold: float, mark_age_days: int) -> None:
         super().__init__()
         self.input_path = input_path
         self.yield_threshold = yield_threshold
         self.price_threshold = price_threshold
-        self.gap_days = gap_days
+        self.mark_age_days = mark_age_days
 
     def run(self) -> None:
         try:
@@ -41,7 +41,7 @@ class CleanerWorker(QThread):
                 self.input_path,
                 yield_spike_threshold_bps=self.yield_threshold,
                 price_spike_threshold_points=self.price_threshold,
-                max_fill_business_days=self.gap_days,
+                max_mark_age_business_days=self.mark_age_days,
             )
         except Exception as error:
             self.failed.emit(str(error))
@@ -81,18 +81,18 @@ class TraceCleanerWindow(QMainWindow):
         self.price_threshold.setSuffix(" points per 100 par")
         self.price_threshold.setValue(5)
         form.addRow("Minimum isolated price move to check", self.price_threshold)
-        self.gap_days = QSpinBox()
-        self.gap_days.setRange(0, 20)
-        self.gap_days.setValue(3)
-        self.gap_days.setSuffix(" business days")
-        form.addRow("Maximum gap to interpolate", self.gap_days)
+        self.mark_age_days = QSpinBox()
+        self.mark_age_days.setRange(0, 20)
+        self.mark_age_days.setValue(3)
+        self.mark_age_days.setSuffix(" business days")
+        form.addRow("Maximum age for carried marks", self.mark_age_days)
         layout.addLayout(form)
 
         layout.addWidget(QLabel(
-            "An isolated move is replaced only when the next observation promptly reverses it and is close to the prior "
-            "level. Short gaps are linearly interpolated between valid observations. Synthetic and corrected values "
-            "are flagged in the output. Both operations use a later endpoint, so this is a retrospective dataset and "
-            "is not point-in-time safe for a backtest unless the cleaning delay is modeled."
+            "Observed cleaned values remain unchanged. Separate mark columns carry the last value forward for short gaps, "
+            "and include the mark's age. Large moves that promptly reverse near the prior level are flagged, not revised, "
+            "because confirming a reversal requires a later observation. The flag is retrospective; evaluator inputs use "
+            "the unchanged observed columns."
         ))
         self.status = QLabel("Ready")
         self.status.setWordWrap(True)
@@ -126,7 +126,7 @@ class TraceCleanerWindow(QMainWindow):
             self.input_path,
             self.yield_threshold.value(),
             self.price_threshold.value(),
-            self.gap_days.value(),
+            self.mark_age_days.value(),
         )
         self.worker.succeeded.connect(self._completed)
         self.worker.failed.connect(self._failed)
@@ -135,10 +135,10 @@ class TraceCleanerWindow(QMainWindow):
     def _completed(self, report: dict[str, Any]) -> None:
         self.status.setText(
             f"Created {report['output_rows']:,} rows from {report['input_rows']:,}. "
-            f"Corrected reversals: yield {report['reversal_spikes_corrected']['yield']:,}, "
-            f"price {report['reversal_spikes_corrected']['price']:,}. "
-            f"Interpolated values: yield {report['business_day_values_interpolated']['yield']:,}, "
-            f"price {report['business_day_values_interpolated']['price']:,}.\n"
+            f"Flagged reversals: yield {report['reversal_spikes_flagged']['yield']:,}, "
+            f"price {report['reversal_spikes_flagged']['price']:,}. "
+            f"Carried forward marks: yield {report['business_day_marks_carried_forward']['yield']:,}, "
+            f"price {report['business_day_marks_carried_forward']['price']:,}.\n"
             f"Output: {report['output_cleaned_parquet']}\nDiagnostics: {report['diagnostics_report']}"
         )
         self.run_button.setEnabled(True)

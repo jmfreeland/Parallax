@@ -37,7 +37,8 @@ from .signal_evaluation import (
     PREDICTOR_PARTITION_PERCENTILE,
     evaluate_nelson_siegel_signal,
 )
-from .trace_history import DATABASE_PATH, DEFAULT_SNAPSHOT
+from .trace_history import DATABASE_PATH, DEFAULT_SNAPSHOT, TRACE_DIR
+from .trace_cleaning import TRACE_SERIES_CLEANING_VERSION
 
 
 class HorizonCurvesChart(QWidget):
@@ -301,6 +302,27 @@ class SignalEvaluationWindow(QMainWindow):
         source.addWidget(browse)
         layout.addLayout(source)
 
+        data_source_row = QHBoxLayout()
+        data_source_row.addWidget(QLabel("TRACE data source"))
+        self.data_source = QComboBox()
+        self.data_source.addItem("Cleaned Parquet (default)", "cleaned_parquet")
+        self.data_source.addItem("Preprocessed Parquet", "preprocessed_parquet")
+        self.data_source.addItem("Raw DuckDB history", "raw_duckdb")
+        data_source_row.addWidget(self.data_source)
+        self.data_path = QLineEdit()
+        data_source_row.addWidget(self.data_path, 1)
+        self.data_browse = QPushButton("Browse…")
+        self.data_browse.clicked.connect(self._browse_data_source)
+        data_source_row.addWidget(self.data_browse)
+        self.data_source_paths = {
+            "cleaned_parquet": self._latest_dataset_path("clean_id="),
+            "preprocessed_parquet": self._latest_dataset_path("preprocess_id="),
+        }
+        self.data_path.textChanged.connect(self._remember_data_path)
+        self.data_source.currentIndexChanged.connect(self._data_source_changed)
+        self._data_source_changed()
+        layout.addLayout(data_source_row)
+
         predictor_row = QHBoxLayout()
         predictor_row.addWidget(QLabel("Predictor"))
         self.predictor = QComboBox()
@@ -383,7 +405,7 @@ class SignalEvaluationWindow(QMainWindow):
         row_two.addStretch(1)
         layout.addLayout(row_two)
 
-        self.status = QLabel(f"Credit signal evaluation | TRACE database: {DATABASE_PATH}")
+        self.status = QLabel(f"Credit signal evaluation | default cleaned dataset under: {TRACE_DIR / 'preprocessed'}")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.progress = QProgressBar()
@@ -486,6 +508,62 @@ class SignalEvaluationWindow(QMainWindow):
         self.setCentralWidget(central)
         self._refresh_partition_fields()
 
+    @staticmethod
+    def _latest_dataset_path(parent_prefix: str) -> str:
+        root = TRACE_DIR / "preprocessed"
+        if not root.exists():
+            return ""
+        candidates = [
+            path for path in root.rglob("observations.parquet")
+            if path.parent.name.startswith(parent_prefix)
+            and (
+                parent_prefix != "clean_id="
+                or self._has_current_cleaning_version(path)
+            )
+        ]
+        if not candidates:
+            return ""
+        return str(max(candidates, key=lambda path: path.stat().st_mtime))
+
+    @staticmethod
+    def _has_current_cleaning_version(path: Path) -> bool:
+        try:
+            report = json.loads((path.parent / "diagnostics.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return report.get("policy_version") == TRACE_SERIES_CLEANING_VERSION
+
+    def _data_source_changed(self, *_args: Any) -> None:
+        source = self.data_source.currentData()
+        is_raw = source == "raw_duckdb"
+        if is_raw:
+            path = str(DATABASE_PATH)
+        else:
+            path = self.data_source_paths.get(source, "")
+        self.data_path.setText(path)
+        self.data_path.setReadOnly(is_raw)
+        self.data_browse.setEnabled(not is_raw)
+        if hasattr(self, "status"):
+            self.status.setText(f"Selected {self.data_source.currentText()}: {path or 'no dataset selected'}")
+
+    def _remember_data_path(self, path: str) -> None:
+        source = self.data_source.currentData()
+        if source != "raw_duckdb":
+            self.data_source_paths[source] = path
+
+    def _browse_data_source(self) -> None:
+        source = self.data_source.currentData()
+        current = self.data_path.text() or str(TRACE_DIR / "preprocessed")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select TRACE Parquet dataset",
+            current,
+            "Parquet files (*.parquet)",
+        )
+        if path:
+            self.data_source_paths[source] = path
+            self.data_path.setText(path)
+
     def _browse(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
             self, "Select bond list", self.bond_list.text(), "CSV files (*.csv)"
@@ -529,12 +607,26 @@ class SignalEvaluationWindow(QMainWindow):
         if end < start:
             QMessageBox.warning(self, "Invalid date range", "Test end must be on or after test start.")
             return
+        selected_data_source = self.data_source.currentData()
+        selected_data_path = None
+        if selected_data_source != "raw_duckdb":
+            selected_data_path = Path(self.data_path.text()).expanduser() if self.data_path.text().strip() else None
+            if selected_data_path is None or not selected_data_path.is_file():
+                expected = "cleaned" if selected_data_source == "cleaned_parquet" else "preprocessed"
+                QMessageBox.warning(
+                    self,
+                    "TRACE dataset required",
+                    f"Select a {expected} observations.parquet dataset. To create a cleaned dataset, use the separate cleaner from the launcher.",
+                )
+                return
         parameters = {
             "start_date": start,
             "end_date": end,
             "horizon_days": self.horizon_days.value(),
             "bond_list_path": Path(self.bond_list.text()).expanduser(),
             "database_path": DATABASE_PATH,
+            "data_source": selected_data_source,
+            "data_path": selected_data_path,
             "minimum_bonds": self.minimum_bonds.value(),
             "maximum_signal_age_days": self.signal_age.value(),
             "maximum_yield_change_gap_days": self.change_gap.value(),
@@ -551,7 +643,10 @@ class SignalEvaluationWindow(QMainWindow):
         self.result = None
         self.date_table.setRowCount(0)
         self.detail_table.setRowCount(0)
-        self.status.setText("Building point-in-time predictor values and evaluating forward observations...")
+        self.status.setText(
+            f"Evaluating from {self.data_source.currentText()}: "
+            f"{selected_data_path if selected_data_path is not None else DATABASE_PATH}"
+        )
         self.progress.setRange(0, 0)
         self.worker = EvaluationWorker(parameters, self)
         self.worker.progress.connect(self._progress)
@@ -667,8 +762,13 @@ class SignalEvaluationWindow(QMainWindow):
             "For stale signal yields, the first later print is excluded because it spans pre-signal time; "
             "forward changes resume after two post-signal prints. "
         )
+        data_source_note = (
+            "This cleaned dataset includes retrospective reversal flags, but the evaluator uses unchanged observed-value columns and ignores flags and carried marks. "
+            if summary["data_source_contains_retrospective_outlier_flags"] else ""
+        )
         self.summary.setText(
-            f"{summary['signal_name']} | {summary['test_start_date']} to {summary['test_end_date']} | "
+            f"{summary['signal_name']} | Source: {summary['data_source']} ({summary['data_source_path']}) | "
+            f"{summary['test_start_date']} to {summary['test_end_date']} | "
             f"At T+{summary['horizon_days']}, mean daily side-adjusted Pearson/Spearman IC: "
             f"{display(summary['mean_daily_pearson_correlation_side_adjusted'])} / "
             f"{display(summary['mean_daily_spearman_correlation_side_adjusted'])}; pooled Spearman IC: "
@@ -682,7 +782,7 @@ class SignalEvaluationWindow(QMainWindow):
             f"Rebalanced indices from 100: covered total-return contribution "
             f"{display(summary['rebalanced_covered_total_return_nav_index'])}, yield-only proxy "
             f"{display(summary['rebalanced_yield_only_nav_index'])}, across {summary['rebalanced_periods']} periods. "
-            f"{predictor_description}{outcome_description}"
+            f"{predictor_description}{outcome_description}{data_source_note}"
             "positive side-adjusted IC/performance is favorable. "
             "The horizon total return uses a synthetic coupon schedule and excludes costs/defaults; horizon windows overlap. "
             "The rebalanced index is a duration-adjusted yield-only proxy. Past TRACE revisions and the current bond-list snapshot may affect results."
@@ -690,7 +790,8 @@ class SignalEvaluationWindow(QMainWindow):
         self.status.setText(
             f"Completed {summary['signal_dates']:,} signal dates; "
             f"{summary['dates_with_correlation']:,} dates had enough pairs for correlation. "
-            f"Excluded {summary['stale_first_prints_excluded']:,} first post-signal prints from stale yield baselines."
+            f"Excluded {summary['stale_first_prints_excluded']:,} first post-signal prints from stale yield baselines. "
+            f"Source: {summary['data_source']}."
         )
         self.export_button.setEnabled(bool(detail_rows))
         self.export_report_button.setEnabled(bool(date_rows))
