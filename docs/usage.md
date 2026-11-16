@@ -298,17 +298,19 @@ Use **Analyze bond return series** on the launcher's **Data** page to create
 business-day bond total-return and financing-excess series for one ISIN. Select
 a bond by typing part of its ISIN, issuer, coupon, or maturity; each entry shows
 all four identifying details. Select a Treasury curve tenor from the history
-stored in the shared DuckDB. The
-user-entered annualized financing spread is added in basis points. At each
-interval, the latest Treasury observation known at the interval start is used,
-with ACT/365 simple accrual; financing cost is reported as a negative return
-contribution, and no bond G-spread is required for financing. A default-on
-**G-spread-hedged return** accrues the prior observed G-spread as carry, then
+stored in the shared DuckDB when using the unhedged financing mode. The
+default-on **G-spread-hedged mode** accrues the prior observed G-spread as carry, then
 adds a duration-based price proxy of `-modified duration × change in G-spread`.
-The unhedged total return remains available whether the hedge is on or off. The
-return chart includes a separate cumulative G-spread carry line alongside the
-negative financing-cost line, and a lower panel plots actual G-spread snapshot
-observations for the selected bond. The log excess return is
+The unhedged bond total return remains visible in either mode. Financing
+controls and financing-excess results are hidden while the hedge is on. Turn
+the hedge off to use Treasury-rate financing: the latest rate known at each
+interval start accrues using ACT/365, and the negative funding-cost line assumes
+the full unhedged bond notional is financed. Financing cost is not charged to
+the G-spread-hedged series, treated as approximately cash neutral; residual
+cash, repo, and margin financing are not modeled. The hedge mode's chart shows
+cumulative G-spread carry; the unhedged mode's chart shows funding cost and log
+excess return. A lower panel plots actual G-spread snapshot observations in
+either mode. The log excess return is
 `log(1 + bond total return) - log(1 + financing accrual)`. TRACE prices carry
 forward between prints and their age is reported. The output includes interval
 log excess returns and cumulative bond, financing, and excess indices, with CSV

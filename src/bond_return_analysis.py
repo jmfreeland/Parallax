@@ -149,6 +149,7 @@ def analyze_bond_return_series(
     treasury_tenor_years: float = 1.0 / 12.0,
     financing_spread_bps: float = 0.0,
     include_g_spread_hedge: bool = True,
+    include_financing_comparison: bool = True,
     maximum_price_age_days: int = 30,
     maximum_financing_rate_age_days: int = 7,
     bond_list_path: Path = DEFAULT_SNAPSHOT,
@@ -178,7 +179,10 @@ def analyze_bond_return_series(
     maturity_date: date = terms["maturity_date"]
     if maturity_date <= start_date:
         raise ValueError("The bond matures on or before the selected start date")
-    rates = _load_treasury_history(Path(database_path), treasury_tenor_years)
+    rates = (
+        _load_treasury_history(Path(database_path), treasury_tenor_years)
+        if include_financing_comparison else []
+    )
     rate_dates = [observed_date for observed_date, _ in rates]
     g_spread_snapshot_id: str | None = None
     g_spread_history: list[tuple[date, float, float]] = []
@@ -235,13 +239,13 @@ def analyze_bond_return_series(
         "bond_total_return_pct": 0.0,
         "financing_rate_pct": None,
         "financing_spread_bps": financing_spread_bps,
-        "financing_cost_return_pct": 0.0,
-        "financing_log_return": 0.0,
+        "financing_cost_return_pct": 0.0 if include_financing_comparison else None,
+        "financing_log_return": 0.0 if include_financing_comparison else None,
         "bond_log_return": 0.0,
-        "log_excess_return": 0.0,
+        "log_excess_return": 0.0 if include_financing_comparison else None,
         "cumulative_bond_index": 100.0,
-        "cumulative_financing_index": 100.0,
-        "cumulative_excess_index": 100.0,
+        "cumulative_financing_index": 100.0 if include_financing_comparison else None,
+        "cumulative_excess_index": 100.0 if include_financing_comparison else None,
         "treasury_hedge_yield_pct": start_spread_row[1] if start_spread_row else None,
         "g_spread_observation_date": start_spread_row[0].isoformat() if start_spread_row else None,
         "g_spread_bps": start_spread_row[2] if start_spread_row else None,
@@ -269,23 +273,27 @@ def analyze_bond_return_series(
         if mark_date > maturity_date:
             break
         period_days = (mark_date - previous_date).days
-        rate_index = bisect_right(rate_dates, previous_date) - 1
-        if rate_index < 0:
-            raise ValueError(f"No financing-rate observation on or before {previous_date}")
-        rate_date, base_rate_pct = rates[rate_index]
-        rate_age_days = (previous_date - rate_date).days
-        if rate_age_days > maximum_financing_rate_age_days:
-            raise ValueError(
-                f"Financing rate is {rate_age_days} days old at {previous_date}; "
-                f"limit is {maximum_financing_rate_age_days}"
-            )
-        financing_rate_pct = base_rate_pct + financing_spread_bps / 100.0
-        financing_simple_return = (financing_rate_pct / 100.0) * period_days / 365.0
-        if financing_simple_return <= -1.0:
-            raise ValueError("Financing accrual implies a loss of 100% or more")
-        # Financing is the cost of holding the bond position, so represent it
-        # as a negative contribution in the return series.
-        financing_log_return = -math.log1p(financing_simple_return)
+        financing_rate_pct: float | None = None
+        base_rate_pct: float | None = None
+        rate_date: date | None = None
+        rate_age_days: int | None = None
+        financing_log_return: float | None = None
+        if include_financing_comparison:
+            rate_index = bisect_right(rate_dates, previous_date) - 1
+            if rate_index < 0:
+                raise ValueError(f"No financing-rate observation on or before {previous_date}")
+            rate_date, base_rate_pct = rates[rate_index]
+            rate_age_days = (previous_date - rate_date).days
+            if rate_age_days > maximum_financing_rate_age_days:
+                raise ValueError(
+                    f"Financing rate is {rate_age_days} days old at {previous_date}; "
+                    f"limit is {maximum_financing_rate_age_days}"
+                )
+            financing_rate_pct = base_rate_pct + financing_spread_bps / 100.0
+            financing_simple_return = (financing_rate_pct / 100.0) * period_days / 365.0
+            if financing_simple_return <= -1.0:
+                raise ValueError("Financing accrual implies a loss of 100% or more")
+            financing_log_return = -math.log1p(financing_simple_return)
         bond_result = calculate_historical_bond_total_return(
             isin=normalized_isin,
             start_date=previous_date,
@@ -304,7 +312,10 @@ def analyze_bond_return_series(
                 f"limit is {maximum_price_age_days}"
             )
         bond_log_return = math.log1p(bond_result.total_return)
-        excess_log_return = bond_log_return + financing_log_return
+        excess_log_return = (
+            bond_log_return + financing_log_return
+            if financing_log_return is not None else None
+        )
         hedge_yield: float | None = None
         spread_date: date | None = None
         spread_bps: float | None = None
@@ -339,9 +350,10 @@ def analyze_bond_return_series(
             cumulative_g_spread_hedged_log += hedged_log_return
             previous_spread_index = spread_index
         cumulative_bond_log += bond_log_return
-        cumulative_financing_log += financing_log_return
-        cumulative_excess_log += excess_log_return
-        daily_excess_logs.append(excess_log_return)
+        if financing_log_return is not None and excess_log_return is not None:
+            cumulative_financing_log += financing_log_return
+            cumulative_excess_log += excess_log_return
+            daily_excess_logs.append(excess_log_return)
         price_age = bond_result.end_price_age_days
         rows.append({
             "date": mark_date.isoformat(),
@@ -351,17 +363,26 @@ def analyze_bond_return_series(
             "period_days": period_days,
             "bond_total_return_pct": bond_result.total_return_pct,
             "financing_rate_pct": financing_rate_pct,
-            "financing_cost_return_pct": 100.0 * math.expm1(financing_log_return),
+            "financing_cost_return_pct": (
+                100.0 * math.expm1(financing_log_return)
+                if financing_log_return is not None else None
+            ),
             "base_short_rate_pct": base_rate_pct,
-            "financing_rate_observation_date": rate_date.isoformat(),
+            "financing_rate_observation_date": rate_date.isoformat() if rate_date else None,
             "financing_rate_age_days": rate_age_days,
             "financing_spread_bps": financing_spread_bps,
             "financing_log_return": financing_log_return,
             "bond_log_return": bond_log_return,
             "log_excess_return": excess_log_return,
             "cumulative_bond_index": 100.0 * math.exp(cumulative_bond_log),
-            "cumulative_financing_index": 100.0 * math.exp(cumulative_financing_log),
-            "cumulative_excess_index": 100.0 * math.exp(cumulative_excess_log),
+            "cumulative_financing_index": (
+                100.0 * math.exp(cumulative_financing_log)
+                if include_financing_comparison else None
+            ),
+            "cumulative_excess_index": (
+                100.0 * math.exp(cumulative_excess_log)
+                if include_financing_comparison else None
+            ),
             "treasury_hedge_yield_pct": hedge_yield,
             "g_spread_observation_date": spread_date.isoformat() if spread_date else None,
             "g_spread_bps": spread_bps,
@@ -416,11 +437,12 @@ def analyze_bond_return_series(
         "requested_start_date": start_date.isoformat(),
         "requested_end_date": end_date.isoformat(),
         "effective_end_date": rows[-1]["date"],
-        "treasury_tenor_years": treasury_tenor_years,
+        "treasury_tenor_years": treasury_tenor_years if include_financing_comparison else None,
         "bond_list_path": str(Path(bond_list_path).resolve()),
         "trace_database_path": str(Path(database_path).resolve()),
         "financing_spread_bps": financing_spread_bps,
         "include_g_spread_hedge": include_g_spread_hedge,
+        "financing_comparison_calculated": include_financing_comparison,
         "g_spread_snapshot_id": g_spread_snapshot_id,
         "cumulative_g_spread_hedged_return_pct": (
             100.0 * math.expm1(cumulative_g_spread_hedged_log)
@@ -437,16 +459,25 @@ def analyze_bond_return_series(
         "financing_definition": (
             "latest observation of the selected Treasury curve tenor known at interval start plus configured spread; "
             "ACT/365 simple accrual; financing cost is recorded as a negative return contribution and added to bond log return"
+            if include_financing_comparison else "not calculated while the G-spread hedge is active"
         ),
         "price_marking_definition": "business-day marks use the latest valid TRACE clean price on or before the mark date; clean price carries forward and age is reported; accrued interest and synthetic coupon schedule are included",
         "mark_count": max(0, len(rows) - 1),
         "cumulative_bond_return_pct": 100.0 * math.expm1(cumulative_bond_log),
-        "cumulative_financing_return_pct": 100.0 * math.expm1(cumulative_financing_log),
+        "cumulative_financing_return_pct": (
+            100.0 * math.expm1(cumulative_financing_log)
+            if include_financing_comparison else None
+        ),
         "cumulative_log_excess_return": cumulative_excess_log,
-        "cumulative_excess_return_pct": 100.0 * math.expm1(cumulative_excess_log),
-        "annualized_log_excess_return_pct": annualized_excess_pct,
-        "annualized_excess_volatility_pct": 100.0 * excess_volatility if excess_volatility is not None else None,
-        "excess_sharpe_ratio": sharpe,
+        "cumulative_excess_return_pct": (
+            100.0 * math.expm1(cumulative_excess_log)
+            if include_financing_comparison else None
+        ),
+        "annualized_log_excess_return_pct": annualized_excess_pct if include_financing_comparison else None,
+        "annualized_excess_volatility_pct": (
+            100.0 * excess_volatility if include_financing_comparison and excess_volatility is not None else None
+        ),
+        "excess_sharpe_ratio": sharpe if include_financing_comparison else None,
         "maximum_price_age_days": maximum_price_age_days,
         "maximum_financing_rate_age_days": maximum_financing_rate_age_days,
     }

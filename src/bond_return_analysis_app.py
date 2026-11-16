@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QDate, QPointF, QRectF, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -57,7 +58,9 @@ class ReturnSeriesChart(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.rows: list[dict[str, Any]] = []
+        self._hover_index: int | None = None
         self.setMinimumHeight(340)
+        self.setMouseTracking(True)
 
     def set_rows(self, rows: list[dict[str, Any]]) -> None:
         self.rows = rows
@@ -72,11 +75,12 @@ class ReturnSeriesChart(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Run an analysis to plot return indices.")
             painter.end()
             return
-        series = (
-            ("cumulative_bond_index", "Bond total return", "#38bdf8"),
-            ("cumulative_financing_index", "Financing cost", "#fb7185"),
-            ("cumulative_excess_index", "Log excess return", "#34d399"),
-        )
+        series = (("cumulative_bond_index", "Bond total return (unhedged)", "#38bdf8"),)
+        if self.rows[0].get("cumulative_financing_index") is not None:
+            series += (
+                ("cumulative_financing_index", "Funding cost (unhedged long)", "#fb7185"),
+                ("cumulative_excess_index", "Bond less funding (unhedged)", "#34d399"),
+            )
         if self.rows[0].get("cumulative_g_spread_hedged_index") is not None:
             series += (("cumulative_g_spread_hedged_index", "G-spread hedged", "#c084fc"),)
             series += (("cumulative_g_spread_carry_index", "G-spread carry", "#2dd4bf"),)
@@ -92,7 +96,7 @@ class ReturnSeriesChart(QWidget):
         y_map = lambda value: bottom - (value - low) / (high - low) * (bottom - top)
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 22), Qt.AlignmentFlag.AlignLeft,
-                         "Growth of 100 | bond, financing, excess and hedge indices")
+                         "Cumulative return indices | 100 at start of window")
         for step in range(5):
             value = low + step * (high - low) / 4
             y = y_map(value)
@@ -101,6 +105,12 @@ class ReturnSeriesChart(QWidget):
             painter.setPen(QColor("#94a3b8"))
             painter.drawText(QRectF(4, y - 9, 70, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                              f"{value:.2f}")
+        painter.save()
+        painter.translate(15, (top + bottom) / 2)
+        painter.rotate(-90)
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(QRectF(-90, -10, 180, 18), Qt.AlignmentFlag.AlignCenter, "Index (start = 100)")
+        painter.restore()
         for key, _, color in series:
             path = QPainterPath()
             for index, row in enumerate(self.rows):
@@ -123,6 +133,46 @@ class ReturnSeriesChart(QWidget):
             legend_x += 195
         painter.end()
 
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if len(self.rows) < 2:
+            return
+        left, right = 82.0, float(self.width() - 24)
+        x = event.position().x()
+        if not left <= x <= right:
+            QToolTip.hideText()
+            self._hover_index = None
+            return
+        index = round((x - left) / (right - left) * (len(self.rows) - 1))
+        index = max(0, min(len(self.rows) - 1, index))
+        if index == self._hover_index:
+            return
+        self._hover_index = index
+        row = self.rows[index]
+        details = [
+            f"Date: {row['date']}",
+            f"Unhedged bond total return: {float(row.get('bond_total_return_pct') or 0):.4f}%",
+            f"Bond index: {float(row['cumulative_bond_index']):.3f}",
+        ]
+        if row.get("g_spread_bps") is not None:
+            details.append(
+                f"G-spread: {float(row['g_spread_bps']):.1f} bp "
+                f"(observed {row.get('g_spread_observation_date')})"
+            )
+        if row.get("g_spread_carry_return_pct") is not None:
+            details += [
+                f"G-spread carry: {float(row['g_spread_carry_return_pct']):.4f}%",
+                f"Spread price move: {float(row.get('g_spread_price_return_pct') or 0):.4f}%",
+                f"G-spread-hedged return: {float(row.get('g_spread_hedged_return_pct') or 0):.4f}%",
+                f"Hedged index: {float(row['cumulative_g_spread_hedged_index']):.3f}",
+            ]
+        if row.get("financing_cost_return_pct") is not None:
+            details += [
+                f"Unhedged funding cost: {float(row['financing_cost_return_pct']):.4f}%",
+                f"Bond less funding index: {float(row['cumulative_excess_index']):.3f}",
+            ]
+        QToolTip.showText(event.globalPosition().toPoint(), "\n".join(details), self)
+        super().mouseMoveEvent(event)
+
 
 class GSpreadHistoryChart(QWidget):
     """Show actual, uncarried G-spread observations for the selected bond."""
@@ -131,6 +181,7 @@ class GSpreadHistoryChart(QWidget):
         super().__init__()
         self.rows: list[dict[str, Any]] = []
         self.setMinimumHeight(190)
+        self.setMouseTracking(True)
 
     def set_rows(self, rows: list[dict[str, Any]]) -> None:
         self.rows = rows
@@ -187,6 +238,27 @@ class GSpreadHistoryChart(QWidget):
                          f"{first_date} to {last_date} | {len(points):,} observations")
         painter.end()
 
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        points = [
+            (index, row)
+            for index, row in enumerate(self.rows)
+            if row.get("g_spread_bps") is not None
+            and row.get("g_spread_observation_date") == row.get("date")
+        ]
+        if len(points) < 2:
+            return
+        left, right = 78.0, float(self.width() - 26)
+        index = round((event.position().x() - left) / (right - left) * (len(self.rows) - 1))
+        index = max(0, min(len(self.rows) - 1, index))
+        _row_index, row = min(points, key=lambda point: abs(point[0] - index))
+        text = (
+            f"Observation date: {row['g_spread_observation_date']}\n"
+            f"G-spread: {float(row['g_spread_bps']):.1f} bp\n"
+            f"Matched Treasury yield: {float(row['treasury_hedge_yield_pct']):.3f}%"
+        )
+        QToolTip.showText(event.globalPosition().toPoint(), text, self)
+        super().mouseMoveEvent(event)
+
 
 class BondReturnAnalysisWindow(QMainWindow):
     def __init__(self) -> None:
@@ -224,7 +296,8 @@ class BondReturnAnalysisWindow(QMainWindow):
         layout.addLayout(favorites_row)
 
         rate_source = QHBoxLayout()
-        rate_source.addWidget(QLabel("Treasury curve tenor"))
+        self.treasury_tenor_label = QLabel("Treasury curve tenor")
+        rate_source.addWidget(self.treasury_tenor_label)
         self.treasury_tenor = QComboBox()
         self.treasury_tenor.setMinimumWidth(180)
         self.treasury_tenor.setToolTip(f"Reads stored curve history from {DATABASE_PATH}")
@@ -243,7 +316,8 @@ class BondReturnAnalysisWindow(QMainWindow):
         if short_tenor_index >= 0:
             self.treasury_tenor.setCurrentIndex(short_tenor_index)
         rate_source.addWidget(self.treasury_tenor)
-        rate_source.addWidget(QLabel("(from shared Treasury curve history)"))
+        self.treasury_source_note = QLabel("(from shared Treasury curve history)")
+        rate_source.addWidget(self.treasury_source_note)
         layout.addLayout(rate_source)
 
         controls = QHBoxLayout()
@@ -268,7 +342,8 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.end_date.setDisplayFormat("yyyy-MM-dd")
         self.end_date.setDate(QDate.currentDate().addDays(-1))
         controls.addWidget(self.end_date)
-        controls.addWidget(QLabel("Financing spread (bp)"))
+        self.financing_spread_label = QLabel("Financing spread (bp)")
+        controls.addWidget(self.financing_spread_label)
         self.spread = QDoubleSpinBox()
         self.spread.setRange(-5000.0, 10000.0)
         self.spread.setDecimals(1)
@@ -279,28 +354,28 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.price_age.setRange(0, 365)
         self.price_age.setValue(30)
         controls.addWidget(self.price_age)
-        controls.addWidget(QLabel("Max rate age (days)"))
+        self.rate_age_label = QLabel("Max rate age (days)")
+        controls.addWidget(self.rate_age_label)
         self.rate_age = QSpinBox()
         self.rate_age.setRange(0, 90)
         self.rate_age.setValue(7)
         controls.addWidget(self.rate_age)
-        self.g_spread_hedge = QCheckBox("Calculate G-spread-hedged return")
+        self.g_spread_hedge = QCheckBox("Use G-spread-hedged return")
         self.g_spread_hedge.setChecked(True)
         self.g_spread_hedge.setToolTip(
-            "Default on. Subtracts the duration-scaled move in the maturity-matched Treasury yield "
-            "stored with the bond's G-spread observations. Requires a valid G-spread snapshot and bond duration."
+            "Default on. Uses G-spread carry plus the duration-scaled G-spread move. "
+            "Financing comparisons are hidden in this mode. Requires a valid G-spread snapshot and bond duration."
         )
+        self.g_spread_hedge.toggled.connect(self._return_mode_changed)
         controls.addWidget(self.g_spread_hedge)
         self.run_button = QPushButton("Analyze return series")
         self.run_button.clicked.connect(self._run)
         controls.addWidget(self.run_button)
         layout.addLayout(controls)
 
-        layout.addWidget(QLabel(
-            "Financing rate = selected Treasury curve tenor + optional additional spread, "
-            "all known at the start of each interval. "
-            "Financing cost is shown as negative. G-spread hedge proxy = spread carry − modified duration × spread change."
-        ))
+        self.method_note = QLabel()
+        self.method_note.setWordWrap(True)
+        layout.addWidget(self.method_note)
         self.summary = QLabel("Select a bond, dates and Treasury curve tenor, then run the analysis.")
         self.summary.setWordWrap(True)
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -319,7 +394,7 @@ class BondReturnAnalysisWindow(QMainWindow):
             "G-spread observation date", "G-spread (bp)", "Matched Treasury yield (%)",
             "Spread carry (%)", "Spread price move (%)", "G-spread-hedged return (%)",
             "Cumulative hedge index", "Financing rate (%)", "Financing cost (%)",
-            "Financing cost log return", "Bond log return", "Excess log return",
+            "Unhedged funding cost log return", "Bond log return", "Excess log return",
             "Cumulative excess index", "Mark status",
         ])
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -335,6 +410,7 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.setCentralWidget(central)
         self._refresh_bonds()
         self._refresh_favorites()
+        self._return_mode_changed()
 
     @staticmethod
     def _read_favorites() -> list[dict[str, str]]:
@@ -409,6 +485,39 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.favorites = [item for item in self.favorites if item["isin"] != isin]
         self._save_favorites()
 
+    def _return_mode_changed(self, *_args: Any) -> None:
+        use_hedge = self.g_spread_hedge.isChecked()
+        for widget in (
+            self.treasury_tenor_label,
+            self.treasury_tenor,
+            self.treasury_source_note,
+            self.financing_spread_label,
+            self.spread,
+            self.rate_age_label,
+            self.rate_age,
+        ):
+            widget.setVisible(not use_hedge)
+        for column in (6, 7, 8, 16, 17, 18, 20, 21):
+            self.table.setColumnHidden(column, use_hedge)
+        if use_hedge:
+            self.method_note.setText(
+                "G-spread-hedged return = accrued spread carry − modified duration × spread change. "
+                "The separate Treasury financing comparison is hidden in this mode."
+            )
+        else:
+            self.method_note.setText(
+                "Unhedged financing cost assumes the full bond notional is funded at the selected Treasury tenor "
+                "plus any additional spread. Cost is shown as negative; log excess return is bond log return less funding accrual."
+            )
+        if self.result is not None:
+            self.result = None
+            self.chart.set_rows([])
+            self.g_spread_chart.set_rows([])
+            self.table.setRowCount(0)
+            self.export_button.setEnabled(False)
+            self.summary.setText("Return mode changed. Run the analysis again to refresh the results.")
+            self.status.setText("Ready")
+
     def _browse_bond_list(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(self, "Select bond list", self.bond_list.text(), "CSV files (*.csv)")
         if selected:
@@ -451,7 +560,8 @@ class BondReturnAnalysisWindow(QMainWindow):
         selected_isin = self.isin.currentData()
         if not selected_isin:
             selected_isin = self.isin.currentText().split("|", 1)[0].strip().upper()
-        if not selected_isin or self.treasury_tenor.currentData() is None:
+        include_financing = not self.g_spread_hedge.isChecked()
+        if not selected_isin or (include_financing and self.treasury_tenor.currentData() is None):
             QMessageBox.warning(self, "Missing input", "Select an ISIN and a Treasury curve tenor.")
             return
         self.run_button.setEnabled(False)
@@ -459,14 +569,22 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.table.setRowCount(0)
         self.chart.set_rows([])
         self.g_spread_chart.set_rows([])
-        self.status.setText("Calculating business-day total and financing-excess returns...")
+        self.status.setText(
+            "Calculating total and G-spread-hedged returns..."
+            if self.g_spread_hedge.isChecked()
+            else "Calculating total and Treasury-financed excess returns..."
+        )
         parameters = {
             "isin": selected_isin,
             "start_date": start,
             "end_date": end,
-            "treasury_tenor_years": float(self.treasury_tenor.currentData()),
+            "treasury_tenor_years": (
+                float(self.treasury_tenor.currentData())
+                if self.treasury_tenor.currentData() is not None else 1.0 / 12.0
+            ),
             "financing_spread_bps": self.spread.value(),
             "include_g_spread_hedge": self.g_spread_hedge.isChecked(),
+            "include_financing_comparison": include_financing,
             "maximum_price_age_days": self.price_age.value(),
             "maximum_financing_rate_age_days": self.rate_age.value(),
             "bond_list_path": Path(self.bond_list.text()).expanduser(),
@@ -492,24 +610,30 @@ class BondReturnAnalysisWindow(QMainWindow):
         def format_optional(value: Any, suffix: str = "") -> str:
             return f"{float(value):.3f}{suffix}" if value is not None else "n/a"
 
-        tenor_years = float(summary["treasury_tenor_years"])
-        tenor_label = f"{tenor_years * 12:.0f}-month" if tenor_years < 1 else f"{tenor_years:g}-year"
-        self.summary.setText(
+        summary_parts = [
             f"{summary['isin']} | {summary['issuer_name']} | coupon {summary['coupon_pct']:.3f}% | "
             f"maturity {summary['maturity_date']} | modified duration "
             f"{summary['modified_duration_years'] if summary['modified_duration_years'] is not None else 'n/a'} | "
             f"{summary['requested_start_date']} to "
-            f"{summary['effective_end_date']} | Bond return {format_optional(summary['cumulative_bond_return_pct'], '%')} | "
-            f"Financing cost {format_optional(summary['cumulative_financing_return_pct'], '%')} | "
-            f"Cumulative excess return {format_optional(summary['cumulative_excess_return_pct'], '%')} | "
-            f"Annualized excess {format_optional(summary['annualized_log_excess_return_pct'], '%')} | "
-            f"Excess volatility {format_optional(summary['annualized_excess_volatility_pct'], '%')} | "
-            f"Excess Sharpe {format_optional(summary['excess_sharpe_ratio'])} | "
-            f"G-spread carry {format_optional(summary['cumulative_g_spread_carry_return_pct'], '%')} | "
-            f"G-spread-hedged return {format_optional(summary['cumulative_g_spread_hedged_return_pct'], '%')} | "
-            f"Financing: {tenor_label} Treasury tenor"
-            f" + {summary['financing_spread_bps']:.1f} bp additional spread"
-        )
+            f"{summary['effective_end_date']} | Bond total return {format_optional(summary['cumulative_bond_return_pct'], '%')}"
+        ]
+        if summary["financing_comparison_calculated"]:
+            tenor_years = float(summary["treasury_tenor_years"])
+            tenor_label = f"{tenor_years * 12:.0f}-month" if tenor_years < 1 else f"{tenor_years:g}-year"
+            summary_parts.extend([
+                f"Unhedged funding cost {format_optional(summary['cumulative_financing_return_pct'], '%')}",
+                f"Bond less funding {format_optional(summary['cumulative_excess_return_pct'], '%')}",
+                f"Annualized excess {format_optional(summary['annualized_log_excess_return_pct'], '%')}",
+                f"Excess volatility {format_optional(summary['annualized_excess_volatility_pct'], '%')}",
+                f"Excess Sharpe {format_optional(summary['excess_sharpe_ratio'])}",
+                f"Funding rate: {tenor_label} Treasury + {summary['financing_spread_bps']:.1f} bp",
+            ])
+        if summary["include_g_spread_hedge"]:
+            summary_parts.extend([
+                f"G-spread carry {format_optional(summary['cumulative_g_spread_carry_return_pct'], '%')}",
+                f"G-spread-hedged return {format_optional(summary['cumulative_g_spread_hedged_return_pct'], '%')}",
+            ])
+        self.summary.setText(" | ".join(summary_parts))
         self.chart.set_rows(result["time_series"])
         self.g_spread_chart.set_rows(result["time_series"])
         fields = (
@@ -522,6 +646,8 @@ class BondReturnAnalysisWindow(QMainWindow):
             "mark_status",
         )
         rows = result["time_series"]
+        for column in (6, 7, 8, 16, 17, 18, 20, 21):
+            self.table.setColumnHidden(column, summary["include_g_spread_hedge"])
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             for column, field in enumerate(fields):
