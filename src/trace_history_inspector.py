@@ -35,6 +35,18 @@ from .trace_history import DATABASE_PATH, TRACE_DIR
 PREPROCESSED_DIR = TRACE_DIR / "preprocessed"
 
 
+class SortableTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = self.data(Qt.ItemDataRole.UserRole)
+        right = other.data(Qt.ItemDataRole.UserRole)
+        if left is not None and right is not None:
+            try:
+                return left < right
+            except TypeError:
+                pass
+        return self.text().casefold() < other.text().casefold()
+
+
 def _measure_sql(measure: str) -> tuple[str, str]:
     if measure == "Yield":
         return "clean_last_sale_yield", "Yield (%)"
@@ -976,6 +988,7 @@ class TraceHistoryInspector(QMainWindow):
             "Current value minus the value 252 selected-view intervals earlier."
         )
         self.stats.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.stats.setSortingEnabled(True)
         self.stats.setAlternatingRowColors(True)
         self.tabs.addTab(self.stats, "Partition statistics")
         layout.addWidget(self.tabs, 1)
@@ -1184,6 +1197,7 @@ class TraceHistoryInspector(QMainWindow):
         )
 
     def _fill_stats(self, rows: list[tuple[Any, ...]], group_mode: bool) -> None:
+        self.stats.setSortingEnabled(False)
         self.stats.setRowCount(len(rows))
         self.tabs.setTabText(1, "Group statistics" if group_mode else "Bond time-bucket statistics")
         headers = [
@@ -1221,13 +1235,15 @@ class TraceHistoryInspector(QMainWindow):
                     text = f"{float(value):.1f}%"
                 else:
                     text = f"{float(value):.3f}"
-                item = QTableWidgetItem(text)
+                item = SortableTableWidgetItem(text)
+                item.setData(Qt.ItemDataRole.UserRole, value)
                 if column == 0:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.stats.setItem(row_index, column, item)
         self.stats.resizeColumnsToContents()
+        self.stats.setSortingEnabled(True)
 
 
 def main() -> None:

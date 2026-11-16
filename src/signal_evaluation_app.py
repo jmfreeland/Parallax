@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QDate, QPointF, QRectF, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -40,6 +41,18 @@ from .signal_evaluation import (
 )
 from .trace_history import DATABASE_PATH, DEFAULT_SNAPSHOT, TRACE_DIR
 from .trace_cleaning import TRACE_SERIES_CLEANING_VERSION
+
+
+class SortableTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = self.data(Qt.ItemDataRole.UserRole)
+        right = other.data(Qt.ItemDataRole.UserRole)
+        if left is not None and right is not None:
+            try:
+                return left < right
+            except TypeError:
+                pass
+        return self.text().casefold() < other.text().casefold()
 
 
 class HorizonCurvesChart(QWidget):
@@ -221,11 +234,35 @@ class SignalReturnScatterChart(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.rows: list[dict[str, Any]] = []
+        self._point_positions: list[tuple[QPointF, dict[str, Any]]] = []
         self.setMinimumHeight(360)
+        self.setMouseTracking(True)
 
     def set_rows(self, rows: list[dict[str, Any]]) -> None:
         self.rows = rows
+        self._point_positions = []
         self.update()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._point_positions:
+            point = event.position()
+            nearest, row = min(
+                self._point_positions,
+                key=lambda item: (item[0].x() - point.x()) ** 2 + (item[0].y() - point.y()) ** 2,
+            )
+            distance_squared = (nearest.x() - point.x()) ** 2 + (nearest.y() - point.y()) ** 2
+            if distance_squared <= 12 ** 2:
+                identity = row.get("ticker") or row.get("partition_value") or "—"
+                self.setToolTip(
+                    f"ISIN: {row.get('isin', '—')}\n"
+                    f"Ticker / partition: {identity}\n"
+                    f"Signal value: {float(row['signal_value_pct']):.4f}\n"
+                    f"Side-adjusted outcome: {float(row['side_adjusted_forward_yield_change_bps']):.2f} bp"
+                )
+                QToolTip.showText(event.globalPosition().toPoint(), self.toolTip(), self)
+                return
+        self.setToolTip("Hover over a point to see its bond and signal details.")
+        super().mouseMoveEvent(event)
 
     def paintEvent(self, _event: Any) -> None:
         painter = QPainter(self)
@@ -286,8 +323,11 @@ class SignalReturnScatterChart(QWidget):
             )
         painter.setPen(QPen(QColor("#38bdf8"), 1))
         painter.setBrush(QColor(56, 189, 248, 170))
-        for x_value, y_value in zip(xs, ys):
-            painter.drawEllipse(QPointF(x_map(x_value), y_map(y_value)), 4.0, 4.0)
+        self._point_positions = []
+        for row, x_value, y_value in zip(self.rows, xs, ys):
+            point = QPointF(x_map(x_value), y_map(y_value))
+            self._point_positions.append((point, row))
+            painter.drawEllipse(point, 4.0, 4.0)
         if fit_line is not None:
             painter.setPen(QPen(QColor("#fbbf24"), 2, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(left + 18, self.height() - 13), QPointF(left + 44, self.height() - 13))
@@ -322,7 +362,6 @@ class RebalancedPortfolioChart(QWidget):
             ("covered_total_return_nav_index", "Long-short total return", "#38bdf8"),
             ("long_only_gross_nav_index", "Long-only gross", "#fbbf24"),
             ("long_only_net_nav_index", "Long-only net of financing", "#fb7185"),
-            ("yield_only_nav_index", "Yield-only L/S proxy", "#34d399"),
         )
         values = [
             float(row[key]) for row in rows for key, _, _ in series if row.get(key) is not None
@@ -545,14 +584,15 @@ class SignalEvaluationWindow(QMainWindow):
         self.summary.setWordWrap(True)
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         dates_layout.addWidget(self.summary)
-        self.date_table = QTableWidget(0, 11)
+        self.date_table = QTableWidget(0, 10)
         self.date_table.setHorizontalHeaderLabels([
             "Signal date", "Horizon end", "Signals with forward changes", "Groups/signals",
             "Side-adjust Pearson IC", "Side-adjust Spearman IC", "Long positions", "Short positions",
-            "L/S total return (%)", "Price coverage (%)", "Yield-only proxy (bps)",
+            "L/S total return (%)", "Price coverage (%)",
         ])
         self.date_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.date_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.date_table.setSortingEnabled(True)
         self.date_table.horizontalHeader().setStretchLastSection(True)
         self.date_table.currentCellChanged.connect(self._show_date_details)
         dates_layout.addWidget(self.date_table, 1)
@@ -567,6 +607,7 @@ class SignalEvaluationWindow(QMainWindow):
             "Horizon (days)", *[f"D{decile} outperformance (bps)" for decile in range(1, 11)],
         ])
         self.horizon_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.horizon_table.setSortingEnabled(True)
         self.horizon_table.horizontalHeader().setStretchLastSection(True)
         horizon_layout.addWidget(self.horizon_table, 2)
         self.tabs.addTab(horizon_page, "Horizon performance")
@@ -581,6 +622,7 @@ class SignalEvaluationWindow(QMainWindow):
             "Pooled Pearson", "Pooled Spearman",
         ])
         self.correlation_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.correlation_table.setSortingEnabled(True)
         self.correlation_table.horizontalHeader().setStretchLastSection(True)
         correlation_layout.addWidget(self.correlation_table, 1)
         self.tabs.addTab(correlation_page, "Signal correlations")
@@ -623,20 +665,27 @@ class SignalEvaluationWindow(QMainWindow):
         portfolio_layout.addWidget(self.rebalance_summary)
         self.portfolio_chart = RebalancedPortfolioChart()
         portfolio_layout.addWidget(self.portfolio_chart, 2)
-        self.rebalance_table = QTableWidget(0, 13)
+        self.rebalance_table = QTableWidget(0, 12)
         self.rebalance_table.setHorizontalHeaderLabels([
             "Signal date", "Holding date", "Period days", "Long positions", "Short positions",
-            "L/S total return (%)", "Yield-only L/S proxy (bps)", "Long-only gross (%)",
+            "L/S total return (%)", "Long-only gross (%)",
             "Financing cost (%)", "Long-only net (%)", "Financing coverage (%)",
             "Long-leg return coverage (%)", "L/S return coverage (%)",
         ])
         self.rebalance_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.rebalance_table.setSortingEnabled(True)
         self.rebalance_table.horizontalHeader().setStretchLastSection(True)
         portfolio_layout.addWidget(self.rebalance_table, 3)
         self.tabs.addTab(portfolio_page, "Rebalanced portfolio")
 
         details_page = QWidget()
         details_layout = QVBoxLayout(details_page)
+        detail_date_controls = QHBoxLayout()
+        detail_date_controls.addWidget(QLabel("Signal date"))
+        self.detail_date = QComboBox()
+        self.detail_date.currentTextChanged.connect(self._show_details_for_date)
+        detail_date_controls.addWidget(self.detail_date, 1)
+        details_layout.addLayout(detail_date_controls)
         self.detail_status = QLabel("Select a signal date to inspect the included bond observations and strategy legs.")
         details_layout.addWidget(self.detail_status)
         self.detail_table = QTableWidget(0, 13)
@@ -647,6 +696,7 @@ class SignalEvaluationWindow(QMainWindow):
         ])
         self.detail_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.detail_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.detail_table.setSortingEnabled(True)
         self.detail_table.horizontalHeader().setStretchLastSection(True)
         details_layout.addWidget(self.detail_table)
         self.tabs.addTab(details_page, "Bond observations")
@@ -841,6 +891,10 @@ class SignalEvaluationWindow(QMainWindow):
         self.scatter_date.clear()
         self.scatter_date.addItems([row["as_of_date"] for row in date_rows])
         self.scatter_date.blockSignals(False)
+        self.detail_date.blockSignals(True)
+        self.detail_date.clear()
+        self.detail_date.addItems([row["as_of_date"] for row in date_rows])
+        self.detail_date.blockSignals(False)
         self._fill_table(
             self.date_table,
             date_rows,
@@ -848,7 +902,7 @@ class SignalEvaluationWindow(QMainWindow):
                 "as_of_date", "horizon_end_date", "signal_bonds_with_forward_change", "ticker_curves_fitted",
                 "pearson_side_adjusted_outcome", "spearman_side_adjusted_outcome",
                 "long_positions", "short_positions", "long_short_total_return_pct",
-                "long_short_total_return_coverage_pct", "side_adjusted_long_short_yield_return_proxy_bps",
+                "long_short_total_return_coverage_pct",
             ),
         )
         self.date_table.setHorizontalHeaderItem(
@@ -894,7 +948,7 @@ class SignalEvaluationWindow(QMainWindow):
             rebalance_rows,
             (
                 "signal_date", "holding_date", "holding_period_days", "long_positions", "short_positions",
-                "long_short_total_return_pct", "side_adjusted_yield_return_proxy_bps",
+                "long_short_total_return_pct",
                 "long_only_gross_return_pct", "long_only_financing_cost_pct",
                 "long_only_net_return_pct", "financing_coverage_pct",
                 "long_only_total_return_coverage_pct", "total_return_coverage_pct",
@@ -963,16 +1017,13 @@ class SignalEvaluationWindow(QMainWindow):
             f"{display(summary['mean_daily_pearson_correlation_side_adjusted'])} / "
             f"{display(summary['mean_daily_spearman_correlation_side_adjusted'])}; pooled Spearman IC: "
             f"{display(summary['pooled_spearman_correlation_side_adjusted'])}. "
-            f"Mean daily side-adjusted long-short performance: "
-            f"{display(summary['mean_daily_long_short_yield_return_proxy_bps'], ' bps')}. "
             f"Mean actual total-return long-short: {display(summary['mean_daily_long_short_total_return_pct'], '%')} "
             f"on {summary['dates_with_total_return']} dates with priced positions (unpriced bonds contribute zero; mean leg coverage "
             f"{display(summary['mean_long_short_total_return_coverage_pct'], '%')}; positive on "
             f"{display(summary['total_return_positive_date_fraction'] * 100 if summary['total_return_positive_date_fraction'] is not None else None, '%')}). "
             f"Rebalanced indices from 100: long-short total return "
             f"{display(summary['rebalanced_covered_total_return_nav_index'])}, long-only net of financing "
-            f"{display(summary['rebalanced_long_only_net_nav_index'])}, yield-only proxy "
-            f"{display(summary['rebalanced_yield_only_nav_index'])}, across {summary['rebalanced_periods']} periods. "
+            f"{display(summary['rebalanced_long_only_net_nav_index'])}, across {summary['rebalanced_periods']} periods. "
             f"{predictor_description}{outcome_description}{data_source_note}"
             "positive side-adjusted IC/performance is favorable. "
             "The horizon total return uses a synthetic coupon schedule, treats unpriced positions as zero contribution, and excludes costs/defaults; horizon windows overlap. "
@@ -992,12 +1043,27 @@ class SignalEvaluationWindow(QMainWindow):
             self.detail_table.setRowCount(0)
             self.scatter_chart.set_rows([])
             return
-        as_of = self.result["date_results"][row]["as_of_date"]
+        date_item = self.date_table.item(row, 0)
+        as_of = date_item.text() if date_item is not None else ""
+        self.detail_date.blockSignals(True)
+        self.detail_date.setCurrentText(as_of)
+        self.detail_date.blockSignals(False)
+        self._show_details_for_date(as_of)
+
+    def _show_details_for_date(self, as_of: str) -> None:
+        if self.result is None or not as_of:
+            self.detail_table.setRowCount(0)
+            return
         details = [item for item in self.result["bond_results"] if item["as_of_date"] == as_of]
         self.scatter_date.blockSignals(True)
         self.scatter_date.setCurrentText(as_of)
         self.scatter_date.blockSignals(False)
         self._update_scatter_plot()
+        matching_rows = self.date_table.findItems(as_of, Qt.MatchFlag.MatchExactly)
+        if matching_rows:
+            self.date_table.blockSignals(True)
+            self.date_table.setCurrentCell(matching_rows[0].row(), 0)
+            self.date_table.blockSignals(False)
         percentile_mode = self.result["summary"]["signal_id"] == PREDICTOR_PARTITION_PERCENTILE
         self.detail_table.setHorizontalHeaderItem(
             1, QTableWidgetItem("Partition" if percentile_mode else "Ticker")
@@ -1027,6 +1093,7 @@ class SignalEvaluationWindow(QMainWindow):
 
     @staticmethod
     def _fill_table(table: QTableWidget, rows: list[dict[str, Any]], fields: tuple[str, ...]) -> None:
+        table.setSortingEnabled(False)
         table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             for column, key in enumerate(fields):
@@ -1037,8 +1104,11 @@ class SignalEvaluationWindow(QMainWindow):
                     display = f"{value:.4f}"
                 else:
                     display = str(value)
-                table.setItem(row_index, column, QTableWidgetItem(display))
+                item = SortableTableWidgetItem(display)
+                item.setData(Qt.ItemDataRole.UserRole, value)
+                table.setItem(row_index, column, item)
         table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
 
     def _show_error(self, message: str) -> None:
         self.progress.setRange(0, 1)
