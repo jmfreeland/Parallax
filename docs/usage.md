@@ -299,9 +299,15 @@ business-day bond total-return and financing-excess series for one ISIN. Select
 a bond by typing part of its ISIN, issuer, coupon, or maturity; each entry shows
 all four identifying details. Select a Treasury curve tenor from the history
 stored in the shared DuckDB when using the unhedged financing mode. The
-default-on **G-spread-hedged mode** accrues the prior observed G-spread as carry, then
-adds a duration-based price proxy of `-modified duration × change in G-spread`.
-The unhedged bond total return remains visible in either mode. Financing
+default-on **Treasury-hedged total return** subtracts a duration-matched Treasury
+benchmark return from the bond's realized total return. The benchmark includes
+par-yield carry and a duration-scaled price move using Treasury yields stored
+with the bond's G-spread observations. Hedge duration is recomputed with
+QuantLib from each point-in-time observed bond yield, rather than using today's
+duration for the full history. The actual bond total return already
+includes coupon carry; the G-spread carry and spread-price estimates are shown
+separately as diagnostics, not added a second time. The unhedged bond total
+return remains visible in either mode. Financing
 controls and financing-excess results are hidden while the hedge is on. Turn
 the hedge off to use Treasury-rate financing: the latest rate known at each
 interval start accrues using ACT/365, and the negative funding-cost line assumes

@@ -85,6 +85,45 @@ def _bond_for_window(
     )
 
 
+def calculate_modified_duration_from_yield(
+    *,
+    as_of_date: date,
+    maturity_date: date,
+    coupon_pct: float,
+    yield_pct: float,
+    coupon_frequency: int = 2,
+) -> float:
+    """Calculate point-in-time modified duration from the bond's observed yield."""
+    if maturity_date <= as_of_date:
+        raise ValueError("maturity_date must be after as_of_date")
+    if not 0 <= coupon_pct < 100:
+        raise ValueError("coupon_pct must be between 0 and 100")
+    if not -100 < yield_pct < 1000:
+        raise ValueError("yield_pct is outside the supported range")
+    if coupon_frequency not in {1, 2, 4, 12}:
+        raise ValueError("coupon_frequency must be 1, 2, 4, or 12")
+    bond = _bond_for_window(
+        start_date=as_of_date,
+        maturity_date=maturity_date,
+        coupon_pct=coupon_pct,
+        coupon_frequency=coupon_frequency,
+    )
+    settings = ql.Settings.instance()
+    previous_evaluation_date = settings.evaluationDate
+    try:
+        settings.evaluationDate = _ql_date(as_of_date)
+        return float(ql.BondFunctions.duration(
+            bond,
+            yield_pct / 100.0,
+            ql.ActualActual(ql.ActualActual.Bond),
+            ql.Compounded,
+            coupon_frequency,
+            ql.Duration.Modified,
+        ))
+    finally:
+        settings.evaluationDate = previous_evaluation_date
+
+
 def calculate_historical_bond_total_return(
     *,
     isin: str,

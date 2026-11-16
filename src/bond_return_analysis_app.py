@@ -82,7 +82,7 @@ class ReturnSeriesChart(QWidget):
                 ("cumulative_excess_index", "Bond less funding (unhedged)", "#34d399"),
             )
         if self.rows[0].get("cumulative_g_spread_hedged_index") is not None:
-            series += (("cumulative_g_spread_hedged_index", "G-spread hedged", "#c084fc"),)
+            series += (("cumulative_g_spread_hedged_index", "Treasury-hedged total return", "#c084fc"),)
             series += (("cumulative_g_spread_carry_index", "G-spread carry", "#2dd4bf"),)
         left, right = 82.0, float(self.width() - 24)
         top, bottom = 40.0, float(self.height() - 56)
@@ -162,7 +162,9 @@ class ReturnSeriesChart(QWidget):
             details += [
                 f"G-spread carry: {float(row['g_spread_carry_return_pct']):.4f}%",
                 f"Spread price move: {float(row.get('g_spread_price_return_pct') or 0):.4f}%",
-                f"G-spread-hedged return: {float(row.get('g_spread_hedged_return_pct') or 0):.4f}%",
+                f"Hedge modified duration: {float(row.get('hedge_modified_duration_years') or 0):.2f} years",
+                f"Treasury benchmark deducted: {float(row.get('treasury_benchmark_return_pct') or 0):.4f}%",
+                f"Treasury-hedged total return: {float(row.get('g_spread_hedged_return_pct') or 0):.4f}%",
                 f"Hedged index: {float(row['cumulative_g_spread_hedged_index']):.3f}",
             ]
         if row.get("financing_cost_return_pct") is not None:
@@ -360,11 +362,11 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.rate_age.setRange(0, 90)
         self.rate_age.setValue(7)
         controls.addWidget(self.rate_age)
-        self.g_spread_hedge = QCheckBox("Use G-spread-hedged return")
+        self.g_spread_hedge = QCheckBox("Use Treasury-hedged total return")
         self.g_spread_hedge.setChecked(True)
         self.g_spread_hedge.setToolTip(
-            "Default on. Uses G-spread carry plus the duration-scaled G-spread move. "
-            "Financing comparisons are hidden in this mode. Requires a valid G-spread snapshot and bond duration."
+            "Default on. Subtracts a duration-matched Treasury benchmark return from the bond's realized total return. "
+            "G-spread carry and price moves are shown separately. Financing comparisons are hidden in this mode."
         )
         self.g_spread_hedge.toggled.connect(self._return_mode_changed)
         controls.addWidget(self.g_spread_hedge)
@@ -387,12 +389,14 @@ class BondReturnAnalysisWindow(QMainWindow):
         layout.addWidget(QLabel("G-spread history"))
         self.g_spread_chart = GSpreadHistoryChart()
         layout.addWidget(self.g_spread_chart, 1)
-        self.table = QTableWidget(0, 23)
+        self.table = QTableWidget(0, 25)
         self.table.setHorizontalHeaderLabels([
             "Date", "Price mark date", "Price age (days)", "Clean price", "Period days",
             "Bond return (%)", "Rate observation date", "Rate age (days)", "Treasury yield (%)",
             "G-spread observation date", "G-spread (bp)", "Matched Treasury yield (%)",
-            "Spread carry (%)", "Spread price move (%)", "G-spread-hedged return (%)",
+            "Point-in-time hedge duration (years)",
+            "Treasury benchmark return (%)", "G-spread carry (%)", "Spread price move (%)",
+            "Treasury-hedged total return (%)",
             "Cumulative hedge index", "Financing rate (%)", "Financing cost (%)",
             "Unhedged funding cost log return", "Bond log return", "Excess log return",
             "Cumulative excess index", "Mark status",
@@ -497,12 +501,14 @@ class BondReturnAnalysisWindow(QMainWindow):
             self.rate_age,
         ):
             widget.setVisible(not use_hedge)
-        for column in (6, 7, 8, 16, 17, 18, 20, 21):
+        for column in (6, 7, 8, 18, 19, 20, 22, 23):
             self.table.setColumnHidden(column, use_hedge)
         if use_hedge:
             self.method_note.setText(
-                "G-spread-hedged return = accrued spread carry − modified duration × spread change. "
-                "The separate Treasury financing comparison is hidden in this mode."
+                "Treasury-hedged total return = realized bond total return less a duration-matched Treasury benchmark return, "
+                "including benchmark carry and price movement. Hedge duration is recalculated from each historical yield "
+                "with QuantLib. G-spread carry and price moves are explanatory components; "
+                "the separate financing comparison is hidden in this mode."
             )
         else:
             self.method_note.setText(
@@ -570,7 +576,7 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.chart.set_rows([])
         self.g_spread_chart.set_rows([])
         self.status.setText(
-            "Calculating total and G-spread-hedged returns..."
+            "Calculating bond and Treasury-hedged total returns..."
             if self.g_spread_hedge.isChecked()
             else "Calculating total and Treasury-financed excess returns..."
         )
@@ -612,7 +618,7 @@ class BondReturnAnalysisWindow(QMainWindow):
 
         summary_parts = [
             f"{summary['isin']} | {summary['issuer_name']} | coupon {summary['coupon_pct']:.3f}% | "
-            f"maturity {summary['maturity_date']} | modified duration "
+            f"maturity {summary['maturity_date']} | snapshot modified duration "
             f"{summary['modified_duration_years'] if summary['modified_duration_years'] is not None else 'n/a'} | "
             f"{summary['requested_start_date']} to "
             f"{summary['effective_end_date']} | Bond total return {format_optional(summary['cumulative_bond_return_pct'], '%')}"
@@ -631,7 +637,7 @@ class BondReturnAnalysisWindow(QMainWindow):
         if summary["include_g_spread_hedge"]:
             summary_parts.extend([
                 f"G-spread carry {format_optional(summary['cumulative_g_spread_carry_return_pct'], '%')}",
-                f"G-spread-hedged return {format_optional(summary['cumulative_g_spread_hedged_return_pct'], '%')}",
+                f"Treasury-hedged total return {format_optional(summary['cumulative_g_spread_hedged_return_pct'], '%')}",
             ])
         self.summary.setText(" | ".join(summary_parts))
         self.chart.set_rows(result["time_series"])
@@ -640,13 +646,15 @@ class BondReturnAnalysisWindow(QMainWindow):
             "date", "price_observation_date", "price_age_days", "clean_price_per_100", "period_days",
             "bond_total_return_pct", "financing_rate_observation_date", "financing_rate_age_days",
             "base_short_rate_pct", "g_spread_observation_date", "g_spread_bps", "treasury_hedge_yield_pct",
-            "g_spread_carry_return_pct", "g_spread_price_return_pct", "g_spread_hedged_return_pct",
+            "hedge_modified_duration_years",
+            "treasury_benchmark_return_pct", "g_spread_carry_return_pct", "g_spread_price_return_pct",
+            "g_spread_hedged_return_pct",
             "cumulative_g_spread_hedged_index", "financing_rate_pct", "financing_cost_return_pct",
             "financing_log_return", "bond_log_return", "log_excess_return", "cumulative_excess_index",
             "mark_status",
         )
         rows = result["time_series"]
-        for column in (6, 7, 8, 16, 17, 18, 20, 21):
+        for column in (6, 7, 8, 18, 19, 20, 22, 23):
             self.table.setColumnHidden(column, summary["include_g_spread_hedge"])
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):

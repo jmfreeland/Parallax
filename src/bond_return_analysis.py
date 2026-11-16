@@ -11,7 +11,7 @@ from typing import Any
 
 import duckdb
 
-from .bond_returns import calculate_historical_bond_total_return
+from .bond_returns import calculate_historical_bond_total_return, calculate_modified_duration_from_yield
 from .trace_cleaning import clean_trace_value
 from .trace_history import DATABASE_PATH, DEFAULT_SNAPSHOT
 
@@ -102,7 +102,7 @@ def _load_treasury_history(
 
 def _load_g_spread_history(
     database_path: Path, isin: str
-) -> tuple[str, list[tuple[date, float, float]]]:
+) -> tuple[str, list[tuple[date, float, float, float]]]:
     """Load matched Treasury yields and G-spreads from the latest usable snapshot."""
     connection = duckdb.connect(str(database_path), read_only=True)
     try:
@@ -113,10 +113,11 @@ def _load_g_spread_history(
             raise ValueError("No G-spread snapshot is available. Build one from the Data page.")
         snapshot_id = str(latest[0])
         rows = connection.execute(
-            """SELECT trade_date, treasury_par_yield_pct, g_spread_bps
+            """SELECT trade_date, treasury_par_yield_pct, g_spread_bps, trace_yield_pct
                FROM bond_spread_observations
                WHERE snapshot_id=? AND upper(isin)=? AND treasury_par_yield_pct IS NOT NULL
-                 AND g_spread_bps IS NOT NULL AND NOT yield_reversal_flagged
+                 AND g_spread_bps IS NOT NULL AND trace_yield_pct IS NOT NULL
+                 AND NOT yield_reversal_flagged
                ORDER BY trade_date""",
             [snapshot_id, isin],
         ).fetchall()
@@ -124,8 +125,8 @@ def _load_g_spread_history(
         raise ValueError("A valid G-spread snapshot is required for the Treasury hedge.") from error
     finally:
         connection.close()
-    history = [(observed_date, float(treasury_yield), float(spread_bps))
-               for observed_date, treasury_yield, spread_bps in rows]
+    history = [(observed_date, float(treasury_yield), float(spread_bps), float(trace_yield))
+               for observed_date, treasury_yield, spread_bps, trace_yield in rows]
     if not history:
         raise ValueError(f"The latest G-spread snapshot has no valid observations for {isin}.")
     return snapshot_id, history
@@ -185,19 +186,17 @@ def analyze_bond_return_series(
     )
     rate_dates = [observed_date for observed_date, _ in rates]
     g_spread_snapshot_id: str | None = None
-    g_spread_history: list[tuple[date, float, float]] = []
+    g_spread_history: list[tuple[date, float, float, float]] = []
     g_spread_dates: list[date] = []
     try:
         g_spread_snapshot_id, g_spread_history = _load_g_spread_history(
             Path(database_path), normalized_isin
         )
-        g_spread_dates = [observed_date for observed_date, _tsy, _spread in g_spread_history]
+        g_spread_dates = [observed_date for observed_date, _tsy, _spread, _ytm in g_spread_history]
     except ValueError:
         if include_g_spread_hedge:
             raise
     if include_g_spread_hedge:
-        if terms["modified_duration_years"] is None:
-            raise ValueError(f"Bond {normalized_isin} has no valid modified duration in the bond list.")
         start_spread_index = bisect_right(g_spread_dates, start_date) - 1
         if start_spread_index < 0:
             raise ValueError(f"No G-spread observation on or before {start_date} for {normalized_isin}.")
@@ -229,7 +228,24 @@ def analyze_bond_return_series(
     if not mark_dates:
         raise ValueError("No business-day marks fall in the requested period")
 
+    duration_cache: dict[int, float] = {}
+
+    def duration_at_history_index(index: int) -> float:
+        if index not in duration_cache:
+            observed_date, _tsy, _spread, yield_pct = g_spread_history[index]
+            duration_cache[index] = calculate_modified_duration_from_yield(
+                as_of_date=observed_date,
+                maturity_date=maturity_date,
+                coupon_pct=float(terms["coupon_pct"]),
+                yield_pct=yield_pct,
+            )
+        return duration_cache[index]
+
     start_spread_row = g_spread_history[start_spread_index] if start_spread_index >= 0 else None
+    start_hedge_duration = (
+        duration_at_history_index(start_spread_index)
+        if include_g_spread_hedge and start_spread_index >= 0 else None
+    )
     rows: list[dict[str, Any]] = [{
         "date": start_date.isoformat(),
         "price_observation_date": None,
@@ -247,6 +263,8 @@ def analyze_bond_return_series(
         "cumulative_financing_index": 100.0 if include_financing_comparison else None,
         "cumulative_excess_index": 100.0 if include_financing_comparison else None,
         "treasury_hedge_yield_pct": start_spread_row[1] if start_spread_row else None,
+        "hedge_modified_duration_years": start_hedge_duration,
+        "treasury_benchmark_return_pct": 0.0 if include_g_spread_hedge else None,
         "g_spread_observation_date": start_spread_row[0].isoformat() if start_spread_row else None,
         "g_spread_bps": start_spread_row[2] if start_spread_row else None,
         "g_spread_change_bps": 0.0 if include_g_spread_hedge else None,
@@ -322,11 +340,13 @@ def analyze_bond_return_series(
         spread_change_bps: float | None = None
         spread_carry_log_return: float | None = None
         spread_price_log_return: float | None = None
+        treasury_benchmark_log_return: float | None = None
+        hedge_duration: float | None = None
         hedged_log_return: float | None = None
         hedged_return_pct: float | None = None
         spread_index = bisect_right(g_spread_dates, mark_date) - 1 if g_spread_dates else -1
         if spread_index >= 0:
-            spread_date, hedge_yield, spread_bps = g_spread_history[spread_index]
+            spread_date, hedge_yield, spread_bps, _trace_yield = g_spread_history[spread_index]
             spread_age = (mark_date - spread_date).days
             if include_g_spread_hedge and spread_age > maximum_price_age_days:
                 raise ValueError(
@@ -337,14 +357,22 @@ def analyze_bond_return_series(
             if spread_index < 0:
                 raise ValueError(f"No G-spread observation on or before {mark_date} for {normalized_isin}.")
             previous_spread_bps = g_spread_history[previous_spread_index][2]
-            duration = float(terms["modified_duration_years"])
-            # Credit hedge return consists of accrued G-spread carry plus the
-            # duration-scaled price move from changes in that spread.
+            previous_treasury_yield = g_spread_history[previous_spread_index][1]
+            duration = duration_at_history_index(previous_spread_index)
+            hedge_duration = duration
+            # The hedge removes a duration-matched Treasury benchmark return
+            # from the bond's realized total return. G-spread carry and price
+            # moves remain separately available as explanatory diagnostics.
             spread_carry_simple_return = previous_spread_bps / 10_000.0 * period_days / 365.0
             spread_carry_log_return = math.log1p(spread_carry_simple_return)
             spread_change_bps = spread_bps - previous_spread_bps
             spread_price_log_return = -duration * spread_change_bps / 10_000.0
-            hedged_log_return = spread_carry_log_return + spread_price_log_return
+            treasury_carry_simple_return = previous_treasury_yield / 100.0 * period_days / 365.0
+            treasury_price_log_return = -duration * (hedge_yield - previous_treasury_yield) / 100.0
+            treasury_benchmark_log_return = (
+                math.log1p(treasury_carry_simple_return) + treasury_price_log_return
+            )
+            hedged_log_return = bond_log_return - treasury_benchmark_log_return
             hedged_return_pct = 100.0 * math.expm1(hedged_log_return)
             cumulative_g_spread_carry_log += spread_carry_log_return
             cumulative_g_spread_hedged_log += hedged_log_return
@@ -384,6 +412,11 @@ def analyze_bond_return_series(
                 if include_financing_comparison else None
             ),
             "treasury_hedge_yield_pct": hedge_yield,
+            "hedge_modified_duration_years": hedge_duration,
+            "treasury_benchmark_return_pct": (
+                100.0 * math.expm1(treasury_benchmark_log_return)
+                if treasury_benchmark_log_return is not None else None
+            ),
             "g_spread_observation_date": spread_date.isoformat() if spread_date else None,
             "g_spread_bps": spread_bps,
             "g_spread_change_bps": spread_change_bps,
@@ -449,7 +482,7 @@ def analyze_bond_return_series(
             if include_g_spread_hedge else None
         ),
         "g_spread_hedge_definition": (
-            "G-spread carry accrued at the prior observed spread plus the duration-scaled price proxy from G-spread changes; price component is -modified duration times change in spread; duration is from the bond-list snapshot"
+            "realized bond log total return less the duration-matched Treasury benchmark log return; benchmark return includes par-yield carry and a duration-scaled price move; duration is recalculated with QuantLib from each point-in-time observed bond yield; G-spread carry and spread-price moves are reported separately"
             if include_g_spread_hedge else "not calculated"
         ),
         "cumulative_g_spread_carry_return_pct": (
