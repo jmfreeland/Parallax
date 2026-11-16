@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from .signal_evaluation import (
     PREDICTOR_NELSON_SIEGEL,
     PREDICTOR_PARTITION_PERCENTILE,
+    PREDICTOR_PARTITION_ZSCORE,
     SIGNAL_SPACE_PRICE,
     SIGNAL_SPACE_SPREAD,
     SIGNAL_SPACE_YIELD,
@@ -451,7 +452,7 @@ class SignalEvaluationWindow(QMainWindow):
         self.worker: EvaluationWorker | None = None
         self.result: dict[str, Any] | None = None
         self.scatter_rows_by_date: dict[str, list[dict[str, Any]]] = {}
-        self._last_percentile_mode = False
+        self._last_partition_mode = False
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -491,6 +492,7 @@ class SignalEvaluationWindow(QMainWindow):
         self.predictor = QComboBox()
         self.predictor.addItem("Nelson-Siegel ticker residual", PREDICTOR_NELSON_SIEGEL)
         self.predictor.addItem("Historical partition percentile", PREDICTOR_PARTITION_PERCENTILE)
+        self.predictor.addItem("Historical partition z-score", PREDICTOR_PARTITION_ZSCORE)
         self.predictor.currentIndexChanged.connect(self._predictor_changed)
         predictor_row.addWidget(self.predictor)
         predictor_row.addWidget(QLabel("Signal space"))
@@ -506,7 +508,7 @@ class SignalEvaluationWindow(QMainWindow):
         predictor_row.addWidget(QLabel("Partition field"))
         self.partition_field = QComboBox()
         predictor_row.addWidget(self.partition_field)
-        predictor_row.addWidget(QLabel("Percentile lookback (days)"))
+        predictor_row.addWidget(QLabel("History lookback (days)"))
         self.percentile_lookback = QSpinBox()
         self.percentile_lookback.setRange(30, 3650)
         self.percentile_lookback.setValue(1095)
@@ -668,16 +670,16 @@ class SignalEvaluationWindow(QMainWindow):
         portfolio_page = QWidget()
         portfolio_layout = QVBoxLayout(portfolio_page)
         self.rebalance_financing = QCheckBox(
-            "Apply 1-month Treasury + bond G-spread financing to long-only returns"
+            "Apply 1-month Treasury financing to long-only returns"
         )
         self.rebalance_financing.setChecked(True)
         self.rebalance_financing.setToolTip(
-            "Proxy for financing: ACT/365 accrual on the latest 1-month Treasury rate plus the bond's latest G-spread. "
-            "Uses the latest stored G-spread snapshot."
+            "Proxy for financing: ACT/365 accrual on the latest available 1-month Treasury rate. "
+            "This government funding cost applies to all long positions and does not require bond G-spreads."
         )
         portfolio_layout.addWidget(self.rebalance_financing)
         self.rebalance_summary = QLabel(
-            "Annualized volatility will be shown after evaluation. Funding uses the latest available G-spread snapshot."
+            "Annualized volatility will be shown after evaluation. Funding uses stored 1-month Treasury history."
         )
         self.rebalance_summary.setWordWrap(True)
         portfolio_layout.addWidget(self.rebalance_summary)
@@ -804,17 +806,17 @@ class SignalEvaluationWindow(QMainWindow):
         self._predictor_changed()
 
     def _predictor_changed(self, *_args: Any) -> None:
-        percentile_mode = self.predictor.currentData() == PREDICTOR_PARTITION_PERCENTILE
-        self.partition_field.setEnabled(percentile_mode)
-        self.percentile_lookback.setEnabled(percentile_mode)
-        self.minimum_history.setEnabled(percentile_mode)
-        minimum_bonds = 1 if percentile_mode else 5
+        partition_mode = self.predictor.currentData() in {PREDICTOR_PARTITION_PERCENTILE, PREDICTOR_PARTITION_ZSCORE}
+        self.partition_field.setEnabled(partition_mode)
+        self.percentile_lookback.setEnabled(partition_mode)
+        self.minimum_history.setEnabled(partition_mode)
+        minimum_bonds = 1 if partition_mode else 5
         self.minimum_bonds.setMinimum(minimum_bonds)
-        if percentile_mode and not self._last_percentile_mode and self.minimum_bonds.value() == 5:
+        if partition_mode and not self._last_partition_mode and self.minimum_bonds.value() == 5:
             self.minimum_bonds.setValue(1)
-        elif not percentile_mode and self._last_percentile_mode and self.minimum_bonds.value() == 1:
+        elif not partition_mode and self._last_partition_mode and self.minimum_bonds.value() == 1:
             self.minimum_bonds.setValue(5)
-        self._last_percentile_mode = percentile_mode
+        self._last_partition_mode = partition_mode
         if self.minimum_bonds.value() < minimum_bonds:
             self.minimum_bonds.setValue(minimum_bonds)
 
@@ -998,8 +1000,7 @@ class SignalEvaluationWindow(QMainWindow):
                 f"{format_volatility(summary['rebalanced_long_only_net_annualized_volatility_pct'])} | "
                 f"Long-only net ending index: "
                 f"{format_index(summary['rebalanced_long_only_net_nav_index'])} | "
-                f"Funding snapshot: {str(summary['rebalanced_financing_snapshot_id'])[:8]} | "
-                "1-month Treasury + bond G-spread; raw period returns, without de-meaning."
+                "Funding: 1-month Treasury history only; raw period returns, without de-meaning."
             )
         else:
             self.rebalance_summary.setText(
@@ -1010,21 +1011,23 @@ class SignalEvaluationWindow(QMainWindow):
                 "Financing cost disabled; long-only net comparison is omitted."
             )
         percentile_mode = summary["signal_id"] == PREDICTOR_PARTITION_PERCENTILE
+        partition_mode = summary["signal_id"] in {PREDICTOR_PARTITION_PERCENTILE, PREDICTOR_PARTITION_ZSCORE}
         signal_space = summary["signal_space"]
 
         def display(value: Any, suffix: str = "") -> str:
             return "n/a" if value is None else f"{float(value):.3f}{suffix}"
 
         predictor_description = (
-            f"{summary['partition_field']} group median TRACE {signal_space} ranked against strictly prior "
-            f"{summary['percentile_lookback_days']}-day history; high scores indicate cheaper levels. "
-            f"Requires {summary['minimum_history_observations']} prior group observations. "
-            if percentile_mode else
+            f"{summary['partition_field']} group median TRACE {signal_space} scored against strictly prior "
+            f"{summary['percentile_lookback_days']}-day history using a "
+            f"{'mid-rank percentile' if percentile_mode else 'sample-standard-deviation z-score'}; "
+            f"high scores indicate cheaper levels. Requires {summary['minimum_history_observations']} prior group observations. "
+            if partition_mode else
             f"Positive Nelson-Siegel residual means cheap versus the fitted issuer {signal_space} curve. "
         )
         outcome_description = (
             f"Forward outcomes use raw, non-demeaned {signal_space} changes. "
-            if percentile_mode else f"Forward outcomes use cross-sectionally de-meaned {signal_space} changes. "
+            if partition_mode else f"Forward outcomes use cross-sectionally de-meaned {signal_space} changes. "
         )
         outcome_description += (
             "For stale signal observations, the first later print is excluded because it spans pre-signal time; "
@@ -1061,7 +1064,7 @@ class SignalEvaluationWindow(QMainWindow):
             f"Excluded {summary['stale_first_prints_excluded']:,} first post-signal prints from stale signal baselines. "
             f"Source: {summary['data_source']}."
         )
-        if signal_count == 0 and summary["signal_id"] == PREDICTOR_PARTITION_PERCENTILE:
+        if signal_count == 0 and partition_mode:
             status_text += (
                 " No scores were produced: verify the minimum group size, history lookback, "
                 "minimum prior observations, and selected date range."
@@ -1096,20 +1099,23 @@ class SignalEvaluationWindow(QMainWindow):
             self.date_table.blockSignals(True)
             self.date_table.setCurrentCell(matching_rows[0].row(), 0)
             self.date_table.blockSignals(False)
-        percentile_mode = self.result["summary"]["signal_id"] == PREDICTOR_PARTITION_PERCENTILE
+        predictor_id = self.result["summary"]["signal_id"]
+        percentile_mode = predictor_id == PREDICTOR_PARTITION_PERCENTILE
+        partition_mode = predictor_id in {PREDICTOR_PARTITION_PERCENTILE, PREDICTOR_PARTITION_ZSCORE}
         self.detail_table.setHorizontalHeaderItem(
-            1, QTableWidgetItem("Partition" if percentile_mode else "Ticker")
+            1, QTableWidgetItem("Partition" if partition_mode else "Ticker")
         )
         self.detail_table.setHorizontalHeaderItem(
             6,
             QTableWidgetItem(
-                f"De-meaned cumulative {self.result['summary']['signal_space']} change (bps)"
+                f"Cumulative {self.result['summary']['signal_space']} change (bps)"
             ),
         )
         self.detail_table.setHorizontalHeaderItem(
             3,
             QTableWidgetItem(
                 "Cheapness percentile (0-100)" if percentile_mode
+                else "Historical z-score" if predictor_id == PREDICTOR_PARTITION_ZSCORE
                 else f"{self.result['summary']['signal_space'].title()} residual"
             ),
         )
@@ -1118,7 +1124,7 @@ class SignalEvaluationWindow(QMainWindow):
             self.detail_table,
             details,
             (
-                "as_of_date", "partition_value" if percentile_mode else "ticker", "isin", "signal_value_pct", "signal_observation_date",
+                "as_of_date", "partition_value" if partition_mode else "ticker", "isin", "signal_value_pct", "signal_observation_date",
                 "raw_cumulative_signal_change_bps", "cumulative_signal_change_bps",
                 "side_adjusted_signal_change_bps", "strategy_leg", "bond_total_return_pct",
                 "bond_total_return_status", "modified_duration_years", "issuer_name",

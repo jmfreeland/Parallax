@@ -23,6 +23,8 @@ ProgressCallback = Callable[[int, int], None]
 MIN_DAILY_CHANGE_CROSS_SECTION = 5
 PREDICTOR_NELSON_SIEGEL = "nelson_siegel_residual"
 PREDICTOR_PARTITION_PERCENTILE = "historical_partition_percentile"
+PREDICTOR_PARTITION_ZSCORE = "historical_partition_zscore"
+PARTITION_PREDICTORS = {PREDICTOR_PARTITION_PERCENTILE, PREDICTOR_PARTITION_ZSCORE}
 SIGNAL_SPACE_YIELD = "yield"
 SIGNAL_SPACE_SPREAD = "spread"
 SIGNAL_SPACE_PRICE = "price"
@@ -64,17 +66,11 @@ def _correlation(left: list[float], right: list[float], *, spearman: bool = Fals
 
 
 def _load_rebalance_financing_history(
-    database_path: Path, isins: list[str]
-) -> tuple[str, list[tuple[date, float]], dict[str, list[tuple[date, float]]]]:
-    """Load 1-month Treasury rates and latest snapshot G-spreads for the portfolio universe."""
+    database_path: Path,
+) -> list[tuple[date, float]]:
+    """Load the historical 1-month Treasury financing rate series."""
     connection = duckdb.connect(str(database_path), read_only=True)
     try:
-        snapshot = connection.execute(
-            "SELECT snapshot_id FROM spread_snapshot_runs ORDER BY generated_at_utc DESC LIMIT 1"
-        ).fetchone()
-        if not snapshot:
-            raise ValueError("No G-spread snapshot is available. Build a G-spread snapshot first.")
-        snapshot_id = str(snapshot[0])
         treasury_rows = connection.execute(
             """SELECT observation_date, par_yield_pct FROM (
                    SELECT o.observation_date, o.par_yield_pct,
@@ -88,30 +84,14 @@ def _load_rebalance_financing_history(
                ) WHERE vintage_rank=1 ORDER BY observation_date""",
             [1.0 / 12.0],
         ).fetchall()
-        if not isins:
-            raise ValueError("No bonds are available for the rebalanced financing comparison.")
-        placeholders = ",".join("?" for _ in isins)
-        spread_rows = connection.execute(
-            f"""SELECT upper(isin), trade_date, g_spread_bps
-                FROM bond_spread_observations
-                WHERE snapshot_id=? AND upper(isin) IN ({placeholders})
-                  AND g_spread_bps IS NOT NULL
-                ORDER BY upper(isin), trade_date""",
-            [snapshot_id, *isins],
-        ).fetchall()
     except duckdb.Error as error:
-        raise ValueError(
-            "Treasury history and a G-spread snapshot are required for the financing comparison."
-        ) from error
+        raise ValueError("Treasury history is required for the financing comparison.") from error
     finally:
         connection.close()
     treasury_history = [(observed_date, float(rate)) for observed_date, rate in treasury_rows]
     if not treasury_history:
         raise ValueError("No 1-month Treasury rate history is stored.")
-    spreads_by_isin: dict[str, list[tuple[date, float]]] = defaultdict(list)
-    for isin, observed_date, spread_bps in spread_rows:
-        spreads_by_isin[isin].append((observed_date, float(spread_bps)))
-    return snapshot_id, treasury_history, dict(spreads_by_isin)
+    return treasury_history
 
 
 def _annualized_period_volatility(rows: list[dict[str, Any]], return_field: str) -> float | None:
@@ -158,6 +138,30 @@ def _historical_percentile(
     return percentile, history_count
 
 
+def _historical_zscore(
+    history: list[tuple[date, float]],
+    value: float,
+    *,
+    as_of_date: date,
+    lookback_days: int,
+    minimum_observations: int,
+) -> tuple[float | None, int]:
+    """Standardize a partition level against its strictly prior trailing history."""
+    cutoff = as_of_date - timedelta(days=lookback_days)
+    first = bisect_left(history, (cutoff, float("-inf")))
+    stop = bisect_left(history, (as_of_date, float("-inf")))
+    prior = np.fromiter(
+        (level for _observed_date, level in history[first:stop]), dtype=float, count=stop - first
+    )
+    history_count = int(prior.size)
+    if history_count < minimum_observations:
+        return None, history_count
+    standard_deviation = float(np.std(prior, ddof=1))
+    if not math.isfinite(standard_deviation) or standard_deviation <= 0:
+        return None, history_count
+    return float((value - float(np.mean(prior))) / standard_deviation), history_count
+
+
 def evaluate_nelson_siegel_signal(
     *,
     start_date: date,
@@ -181,15 +185,15 @@ def evaluate_nelson_siegel_signal(
     maximum_financing_rate_age_days: int = 7,
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Evaluate a Nelson-Siegel residual or historical partition percentile.
+    """Evaluate a Nelson-Siegel residual or historical partition signal.
 
     For every horizon, accumulate consecutive post-T changes in the selected
     signal space and compare the score with side-adjusted cumulative changes.
     Yield and G-spread changes are reversed; price log returns retain their sign.
-    Partition percentile scores rank each partition's current median level
-    against strictly prior values in a trailing lookback. The event-study
+    Partition scores compare each partition's current median level against
+    strictly prior values in a trailing lookback. The event-study
     and rebalanced series use raw, non-demeaned portfolio returns. Rebalanced
-    results can subtract a 1-month Treasury plus bond G-spread financing proxy
+    results can subtract a 1-month Treasury financing proxy
     from the long-only leg; the maximum-horizon strategy also reports historical
     total bond returns where prices and coupon data are available.
     """
@@ -197,7 +201,7 @@ def evaluate_nelson_siegel_signal(
         raise ValueError("end_date must be on or after start_date")
     if horizon_days < 2:
         raise ValueError("horizon_days must be at least 2")
-    if predictor_id not in {PREDICTOR_NELSON_SIEGEL, PREDICTOR_PARTITION_PERCENTILE}:
+    if predictor_id not in {PREDICTOR_NELSON_SIEGEL, *PARTITION_PREDICTORS}:
         raise ValueError(f"Unsupported predictor_id: {predictor_id}")
     if signal_space not in SIGNAL_SPACES:
         raise ValueError(f"Unsupported signal_space: {signal_space}")
@@ -249,7 +253,7 @@ def evaluate_nelson_siegel_signal(
             required.add("equity_ticker")
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             raise ValueError(f"Bond list must contain {', '.join(sorted(required))} columns")
-        if predictor_id == PREDICTOR_PARTITION_PERCENTILE and partition_field not in reader.fieldnames:
+        if predictor_id in PARTITION_PREDICTORS and partition_field not in reader.fieldnames:
             raise ValueError(f"Partition field {partition_field!r} is not in the bond list")
         for raw in reader:
             isin = (raw.get("isin") or "").strip().upper()
@@ -285,23 +289,15 @@ def evaluate_nelson_siegel_signal(
     if not bonds:
         raise ValueError("No bonds with valid ISIN and maturity date were found")
 
-    funding_snapshot_id: str | None = None
     treasury_funding_rates: list[tuple[date, float]] = []
-    g_spreads_by_isin: dict[str, list[tuple[date, float]]] = {}
     if include_financing_cost:
-        funding_snapshot_id, treasury_funding_rates, g_spreads_by_isin = (
-            _load_rebalance_financing_history(database_path, list(bonds))
-        )
+        treasury_funding_rates = _load_rebalance_financing_history(database_path)
     treasury_funding_dates = [observed_date for observed_date, _ in treasury_funding_rates]
-    g_spread_dates_by_isin = {
-        isin: [observed_date for observed_date, _ in rows]
-        for isin, rows in g_spreads_by_isin.items()
-    }
 
     query_start = start_date - timedelta(days=max(
         maximum_signal_age_days,
         maximum_price_age_days,
-        percentile_lookback_days if predictor_id == PREDICTOR_PARTITION_PERCENTILE else 0,
+        percentile_lookback_days if predictor_id in PARTITION_PREDICTORS else 0,
     ))
     query_end = end_date + timedelta(days=horizon_days)
     connection = (
@@ -340,7 +336,7 @@ def evaluate_nelson_siegel_signal(
             observations[isin].append((trade_date, value))
             if start_date <= trade_date <= end_date:
                 signal_dates.add(trade_date)
-            elif predictor_id == PREDICTOR_PARTITION_PERCENTILE and query_start <= trade_date < start_date:
+            elif predictor_id in PARTITION_PREDICTORS and query_start <= trade_date < start_date:
                 percentile_history_dates.add(trade_date)
         if clean_price is not None:
             price_observations[isin].append((trade_date, clean_price))
@@ -384,7 +380,7 @@ def evaluate_nelson_siegel_signal(
     if not signal_dates:
         raise ValueError(f"No valid TRACE {signal_space} observations fall within the selected test range")
     observation_dates = {isin: [row[0] for row in rows] for isin, rows in observations.items()}
-    if predictor_id == PREDICTOR_PARTITION_PERCENTILE:
+    if predictor_id in PARTITION_PREDICTORS:
         percentile_history_dates = {
             observed_date for history in observations.values()
             for observed_date, _ in history if query_start <= observed_date < start_date
@@ -482,33 +478,43 @@ def evaluate_nelson_siegel_signal(
                 if len(rows) < minimum_bonds:
                     continue
                 partition_median = float(np.median([row["observed_yield_pct"] for row in rows]))
-                percentile: float | None = None
+                score: float | None = None
                 history_count = 0
                 if as_of >= start_date:
-                    percentile, history_count = _historical_percentile(
+                    scorer = (
+                        _historical_percentile
+                        if predictor_id == PREDICTOR_PARTITION_PERCENTILE
+                        else _historical_zscore
+                    )
+                    score, history_count = scorer(
                         partition_history[partition_value],
                         partition_median,
                         as_of_date=as_of,
                         lookback_days=percentile_lookback_days,
                         minimum_observations=minimum_history_observations,
                     )
-                if percentile is not None:
+                if score is not None:
                     if signal_space == SIGNAL_SPACE_PRICE:
-                        percentile = 100.0 - percentile
+                        score = (100.0 - score) if predictor_id == PREDICTOR_PARTITION_PERCENTILE else -score
                     for row in rows:
                         signals.append({
                             **row,
                             "as_of_date": as_of,
                             "signal_space": signal_space,
-                            "signal_value": percentile,
+                            "signal_value": score,
                             "fitted_signal_level": None,
                             "partition_median_signal_level": partition_median,
-                            "signal_id": PREDICTOR_PARTITION_PERCENTILE,
-                            "signal_name": f"{partition_field} historical median-{signal_space} percentile",
-                            "signal_value_pct": percentile,
+                            "signal_id": predictor_id,
+                            "signal_name": (
+                                f"{partition_field} historical median-{signal_space} percentile"
+                                if predictor_id == PREDICTOR_PARTITION_PERCENTILE
+                                else f"{partition_field} historical median-{signal_space} z-score"
+                            ),
+                            "signal_value_pct": score,
                             "partition_field": partition_field,
                             "partition_median_yield_pct": partition_median,
                             "percentile_history_observations": history_count,
+                            "partition_zscore": score if predictor_id == PREDICTOR_PARTITION_ZSCORE else None,
                             "fitted_yield_pct": None,
                             "curve_rmse_pct": None,
                             "tau_selection_loo_rmse_pct": None,
@@ -553,7 +559,7 @@ def evaluate_nelson_siegel_signal(
                 observation_index += 1
         demeaned_changes_after_signal: dict[date, dict[str, float]] = {}
         for trade_date, changes in raw_changes_after_signal.items():
-            if predictor_id == PREDICTOR_PARTITION_PERCENTILE:
+            if predictor_id in PARTITION_PREDICTORS:
                 # A regime signal should retain the market-wide level move;
                 # cross-sectional demeaning would remove the effect being tested.
                 demeaned_changes_after_signal[trade_date] = dict(changes)
@@ -573,7 +579,7 @@ def evaluate_nelson_siegel_signal(
         } if ordered_signal_rows else {}
         long_leg: list[dict[str, Any]] = []
         short_leg: list[dict[str, Any]] = []
-        if predictor_id == PREDICTOR_PARTITION_PERCENTILE:
+        if predictor_id in PARTITION_PREDICTORS:
             partition_scores = {
                 row["partition_value"]: float(row["signal_value_pct"])
                 for row in portfolio_signals
@@ -862,48 +868,32 @@ def evaluate_nelson_siegel_signal(
                 total_return_nav_proxy *= 1.0 + long_short_return
                 long_only_gross_nav_proxy *= 1.0 + long_contribution
 
-                financing_cost_by_isin: dict[str, float] = {}
+                long_only_financing_cost: float | None = None
                 if include_financing_cost:
-                    for position in long_leg:
-                        isin = position["isin"]
-                        spread_history = g_spreads_by_isin.get(isin, [])
-                        spread_dates = g_spread_dates_by_isin.get(isin, [])
-                        if not spread_history:
-                            continue
-                        current_date = as_of
-                        financing_log_cost = 0.0
-                        has_complete_cost = True
-                        while current_date < next_signal_date:
-                            interval_end = min(current_date + timedelta(days=1), next_signal_date)
-                            interval_days = (interval_end - current_date).days
-                            treasury_index = bisect_right(treasury_funding_dates, current_date) - 1
-                            spread_index = bisect_right(spread_dates, current_date) - 1
-                            if treasury_index < 0 or spread_index < 0:
-                                has_complete_cost = False
-                                break
-                            treasury_date, treasury_rate_pct = treasury_funding_rates[treasury_index]
-                            spread_date, spread_bps = spread_history[spread_index]
-                            if ((current_date - treasury_date).days > maximum_financing_rate_age_days
-                                    or (current_date - spread_date).days > maximum_financing_rate_age_days):
-                                has_complete_cost = False
-                                break
-                            funding_rate_pct = treasury_rate_pct + spread_bps / 100.0
-                            simple_financing_return = funding_rate_pct / 100.0 * interval_days / 365.0
-                            if simple_financing_return <= -1.0:
-                                has_complete_cost = False
-                                break
-                            financing_log_cost += math.log1p(simple_financing_return)
-                            current_date = interval_end
-                        if has_complete_cost:
-                            financing_cost_by_isin[isin] = math.expm1(financing_log_cost)
+                    current_date = as_of
+                    financing_log_cost = 0.0
+                    has_complete_cost = True
+                    while current_date < next_signal_date:
+                        interval_end = min(current_date + timedelta(days=1), next_signal_date)
+                        interval_days = (interval_end - current_date).days
+                        treasury_index = bisect_right(treasury_funding_dates, current_date) - 1
+                        if treasury_index < 0:
+                            has_complete_cost = False
+                            break
+                        treasury_date, treasury_rate_pct = treasury_funding_rates[treasury_index]
+                        if (current_date - treasury_date).days > maximum_financing_rate_age_days:
+                            has_complete_cost = False
+                            break
+                        simple_financing_return = treasury_rate_pct / 100.0 * interval_days / 365.0
+                        if simple_financing_return <= -1.0:
+                            has_complete_cost = False
+                            break
+                        financing_log_cost += math.log1p(simple_financing_return)
+                        current_date = interval_end
+                    if has_complete_cost:
+                        long_only_financing_cost = math.expm1(financing_log_cost)
 
-                financing_coverage_pct = (
-                    100.0 * len(financing_cost_by_isin) / len(long_leg) if long_leg else 0.0
-                )
-                long_only_financing_cost = (
-                    sum(financing_cost_by_isin.values()) / len(long_leg)
-                    if len(financing_cost_by_isin) == len(long_leg) else None
-                )
+                financing_coverage_pct = 100.0 if long_only_financing_cost is not None else 0.0
                 long_only_net_return = (
                     long_contribution - long_only_financing_cost
                     if long_only_financing_cost is not None else None
@@ -1003,15 +993,24 @@ def evaluate_nelson_siegel_signal(
     ]
     metadata = {
         "signal_id": predictor_id,
-        "signal_name": f"Nelson-Siegel ticker {signal_space} residual"
-        if predictor_id == PREDICTOR_NELSON_SIEGEL
-        else f"Historical partition median-{signal_space} percentile",
+        "signal_name": (
+            f"Nelson-Siegel ticker {signal_space} residual"
+            if predictor_id == PREDICTOR_NELSON_SIEGEL else
+            f"Historical partition median-{signal_space} percentile"
+            if predictor_id == PREDICTOR_PARTITION_PERCENTILE else
+            f"Historical partition median-{signal_space} z-score"
+        ),
         "methodology": METHODOLOGY if predictor_id == PREDICTOR_NELSON_SIEGEL
-        else f"Trailing empirical percentile of partition median TRACE {signal_space}",
+        else (
+            f"Trailing empirical percentile of partition median TRACE {signal_space}"
+            if predictor_id == PREDICTOR_PARTITION_PERCENTILE else
+            f"Trailing standardized score of partition median TRACE {signal_space}"
+        ),
         "signal_space": signal_space,
         "spread_snapshot_id": spread_snapshot_id,
         "model_version": "nelson_siegel_loo_tau_v2" if predictor_id == PREDICTOR_NELSON_SIEGEL
-        else "partition_yield_percentile_trailing_v1",
+        else "partition_yield_percentile_trailing_v1"
+        if predictor_id == PREDICTOR_PARTITION_PERCENTILE else "partition_level_zscore_trailing_v1",
         "evaluation_version": "daily_demeaned_side_adjusted_v2"
         if predictor_id == PREDICTOR_NELSON_SIEGEL else "daily_raw_yield_change_side_adjusted_v1",
         "trace_cleaning_policy_version": TRACE_POLICY_VERSION,
@@ -1026,16 +1025,17 @@ def evaluate_nelson_siegel_signal(
         "data_source_uses_retrospective_cleaning": False,
         "data_source_contains_retrospective_outlier_flags": data_source == "cleaned_parquet",
         "minimum_bonds_per_ticker": minimum_bonds if predictor_id == PREDICTOR_NELSON_SIEGEL else None,
-        "minimum_bonds_per_partition": minimum_bonds if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
-        "partition_field": partition_field if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
+        "minimum_bonds_per_partition": minimum_bonds if predictor_id in PARTITION_PREDICTORS else None,
+        "partition_field": partition_field if predictor_id in PARTITION_PREDICTORS else None,
         "signal_value_unit": (
             {SIGNAL_SPACE_YIELD: "yield_percentage_points", SIGNAL_SPACE_SPREAD: "spread_basis_points",
              SIGNAL_SPACE_PRICE: "clean_price_per_100"}[signal_space]
             if predictor_id == PREDICTOR_NELSON_SIEGEL
             else "cheapness_percentile_0_to_100"
+            if predictor_id == PREDICTOR_PARTITION_PERCENTILE else "historical_zscore_standard_deviations"
         ),
-        "percentile_lookback_days": percentile_lookback_days if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
-        "minimum_history_observations": minimum_history_observations if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
+        "percentile_lookback_days": percentile_lookback_days if predictor_id in PARTITION_PREDICTORS else None,
+        "minimum_history_observations": minimum_history_observations if predictor_id in PARTITION_PREDICTORS else None,
         "maximum_signal_age_days": maximum_signal_age_days,
         "maximum_yield_change_gap_days": maximum_yield_change_gap_days,
         "maximum_price_age_days": maximum_price_age_days,
@@ -1045,7 +1045,7 @@ def evaluate_nelson_siegel_signal(
             if signal_space == SIGNAL_SPACE_PRICE else
             f"post-signal {signal_space} changes expressed in basis points; consecutive observations only; long gaps omitted"
         ),
-        "daily_demeaning_definition": "not applied to the historical partition percentile; Nelson-Siegel residual outcomes subtract the per-date cross-sectional mean and omit dates with fewer than five changes",
+        "daily_demeaning_definition": "not applied to historical partition signals; Nelson-Siegel residual outcomes subtract the per-date cross-sectional mean and omit dates with fewer than five changes",
         "stale_signal_observation_policy": "when a bond's signal observation predates the signal date, omit its first later change because that move spans time before the signal; include changes only after two post-signal observations are available",
         "minimum_daily_change_cross_section": MIN_DAILY_CHANGE_CROSS_SECTION
         if predictor_id == PREDICTOR_NELSON_SIEGEL else None,
@@ -1061,18 +1061,20 @@ def evaluate_nelson_siegel_signal(
         ),
         "percentile_definition": f"mid-rank percentile of the partition median TRACE {signal_space} versus strictly prior partition medians in trailing history; scores are oriented so higher means cheaper; partition signals apply to all constituent bonds and portfolio legs are bond equal-weighted"
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
+        "zscore_definition": f"partition median TRACE {signal_space} minus the strictly prior trailing-history mean, divided by the sample standard deviation (ddof=1); no winsorization; higher scores mean cheaper, with price-space sign inverted; partition signals apply to all constituent bonds"
+        if predictor_id == PREDICTOR_PARTITION_ZSCORE else None,
         "strategy_return_definition": (
             "equal-weighted clean-price log-return proxy in basis points"
             if signal_space == SIGNAL_SPACE_PRICE else
             f"equal-weighted modified-duration-adjusted {signal_space}-change proxy in basis points"
-        ) + "; top signal quantile is long, bottom is short; percentile signals select whole partition tails; missing changes contribute zero and coverage is reported",
+        ) + "; top signal quantile is long, bottom is short; partition signals select whole partition tails; missing changes contribute zero and coverage is reported",
         "total_return_definition": "at maximum horizon, equal-weighted long minus short fixed-rate bond total return; unpriced positions contribute zero at their target weight and coverage is reported",
-        "rebalanced_series_definition": f"daily signal selection held to next TRACE signal date; report the raw {signal_space}-change long-short proxy, covered total-return long-short contribution, long-only gross total return, and long-only total return net of 1-month Treasury plus bond G-spread financing; no cross-sectional demeaning is applied to portfolio returns; missing position and financing coverage are reported",
+        "rebalanced_series_definition": f"daily signal selection held to next TRACE signal date; report the raw {signal_space}-change long-short proxy, covered total-return long-short contribution, long-only gross total return, and long-only total return net of 1-month Treasury financing; no cross-sectional demeaning is applied to portfolio returns; missing position and Treasury-rate coverage are reported",
         "rebalanced_financing_definition": (
-            "for each long-only position, accrue the latest 1-month Treasury par yield plus the latest bond G-spread known at each interval start using ACT/365 simple accrual; G-spread observations are from the latest immutable spread snapshot"
+            "accrue the latest 1-month Treasury par yield known at each interval start using ACT/365 simple accrual; does not depend on bond G-spreads"
             if include_financing_cost else "not applied"
         ),
-        "rebalanced_financing_snapshot_id": funding_snapshot_id,
+        "rebalanced_financing_snapshot_id": None,
         "rebalanced_volatility_definition": "annualized volatility from non-overlapping raw holding-period log returns, with holding periods weighted by calendar days; no cross-sectional demeaning",
     }
     summary = {
@@ -1103,7 +1105,7 @@ def evaluate_nelson_siegel_signal(
         "rebalanced_covered_total_return_nav_index": rebalance_results[-1]["covered_total_return_nav_index"] if rebalance_results else 100.0,
         "rebalanced_long_only_gross_nav_index": rebalance_results[-1]["long_only_gross_nav_index"] if rebalance_results else 100.0,
         "rebalanced_long_only_net_nav_index": valid_long_only_net_indices[-1] if valid_long_only_net_indices else None,
-        "rebalanced_financing_snapshot_id": funding_snapshot_id,
+        "rebalanced_financing_snapshot_id": None,
         "rebalanced_long_short_annualized_volatility_pct": _annualized_period_volatility(
             rebalance_results, "long_short_total_return_pct"
         ),

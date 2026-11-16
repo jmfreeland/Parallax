@@ -14,6 +14,7 @@ from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QCompleter,
     QComboBox,
     QDateEdit,
     QDoubleSpinBox,
@@ -31,8 +32,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .bond_return_analysis import analyze_bond_return_series, financing_rate_columns
+from .bond_return_analysis import analyze_bond_return_series, available_treasury_tenors
 from .trace_history import DATABASE_PATH, DEFAULT_SNAPSHOT
+
+FAVORITES_PATH = Path.home() / ".parallax" / "bond_return_favorites.json"
 
 
 class BondReturnWorker(QThread):
@@ -71,9 +74,12 @@ class ReturnSeriesChart(QWidget):
             return
         series = (
             ("cumulative_bond_index", "Bond total return", "#38bdf8"),
-            ("cumulative_financing_index", "Financing", "#fbbf24"),
+            ("cumulative_financing_index", "Financing cost", "#fb7185"),
             ("cumulative_excess_index", "Log excess return", "#34d399"),
         )
+        if self.rows[0].get("cumulative_g_spread_hedged_index") is not None:
+            series += (("cumulative_g_spread_hedged_index", "G-spread hedged", "#c084fc"),)
+            series += (("cumulative_g_spread_carry_index", "G-spread carry", "#2dd4bf"),)
         left, right = 82.0, float(self.width() - 24)
         top, bottom = 40.0, float(self.height() - 56)
         values = [float(row[key]) for row in self.rows for key, _, _ in series]
@@ -86,7 +92,7 @@ class ReturnSeriesChart(QWidget):
         y_map = lambda value: bottom - (value - low) / (high - low) * (bottom - top)
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 22), Qt.AlignmentFlag.AlignLeft,
-                         "Growth of 100 | bond, financing and excess indices")
+                         "Growth of 100 | bond, financing, excess and hedge indices")
         for step in range(5):
             value = low + step * (high - low) / 4
             y = y_map(value)
@@ -118,6 +124,70 @@ class ReturnSeriesChart(QWidget):
         painter.end()
 
 
+class GSpreadHistoryChart(QWidget):
+    """Show actual, uncarried G-spread observations for the selected bond."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, Any]] = []
+        self.setMinimumHeight(190)
+
+    def set_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.update()
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0b1220"))
+        points = [
+            (index, float(row["g_spread_bps"]))
+            for index, row in enumerate(self.rows)
+            if row.get("g_spread_bps") is not None
+            and row.get("g_spread_observation_date") == row.get("date")
+        ]
+        if len(points) < 2:
+            painter.setPen(QColor("#94a3b8"))
+            message = "No G-spread observations in this window; build a G-spread snapshot to populate this panel."
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, message)
+            painter.end()
+            return
+        left, right = 78.0, float(self.width() - 26)
+        top, bottom = 32.0, float(self.height() - 38)
+        values = [value for _index, value in points]
+        low, high = min(values), max(values)
+        pad = max((high - low) * 0.12, 5.0)
+        low, high = low - pad, high + pad
+        x_map = lambda index: left + index / max(1, len(self.rows) - 1) * (right - left)
+        y_map = lambda value: bottom - (value - low) / (high - low) * (bottom - top)
+        painter.setPen(QColor("#e2e8f0"))
+        painter.drawText(QRectF(left, 5, right - left, 20), Qt.AlignmentFlag.AlignLeft,
+                         "Observed G-spread | matched Treasury curve (bp)")
+        for step in range(5):
+            value = low + step * (high - low) / 4
+            y = y_map(value)
+            painter.setPen(QPen(QColor("#263449"), 1))
+            painter.drawLine(QPointF(left, y), QPointF(right, y))
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(QRectF(4, y - 9, 66, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"{value:.0f}")
+        path = QPainterPath()
+        for point_index, (index, value) in enumerate(points):
+            point = QPointF(x_map(index), y_map(value))
+            if point_index == 0:
+                path.moveTo(point)
+            else:
+                path.lineTo(point)
+        painter.setPen(QPen(QColor("#60a5fa"), 2.2))
+        painter.drawPath(path)
+        first_date = self.rows[points[0][0]]["date"]
+        last_date = self.rows[points[-1][0]]["date"]
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(QRectF(left, bottom + 5, right - left, 18), Qt.AlignmentFlag.AlignCenter,
+                         f"{first_date} to {last_date} | {len(points):,} observations")
+        painter.end()
+
+
 class BondReturnAnalysisWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -125,6 +195,7 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.resize(1500, 940)
         self.result: dict[str, Any] | None = None
         self.worker: BondReturnWorker | None = None
+        self.favorites = self._read_favorites()
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -138,21 +209,41 @@ class BondReturnAnalysisWindow(QMainWindow):
         bond_source.addWidget(browse_bonds)
         layout.addLayout(bond_source)
 
+        favorites_row = QHBoxLayout()
+        favorites_row.addWidget(QLabel("Bond favorites"))
+        self.favorite_picker = QComboBox()
+        self.favorite_picker.setMinimumWidth(360)
+        self.favorite_picker.currentIndexChanged.connect(self._favorite_selected)
+        favorites_row.addWidget(self.favorite_picker, 1)
+        add_favorite = QPushButton("Add selected bond")
+        add_favorite.clicked.connect(self._add_favorite)
+        favorites_row.addWidget(add_favorite)
+        remove_favorite = QPushButton("Remove favorite")
+        remove_favorite.clicked.connect(self._remove_favorite)
+        favorites_row.addWidget(remove_favorite)
+        layout.addLayout(favorites_row)
+
         rate_source = QHBoxLayout()
-        rate_source.addWidget(QLabel("Short-rate history CSV"))
-        self.rate_file = QLineEdit()
-        self.rate_file.textChanged.connect(self._refresh_rate_columns)
-        rate_source.addWidget(self.rate_file, 1)
-        browse_rates = QPushButton("Browse...")
-        browse_rates.clicked.connect(self._browse_rate_file)
-        rate_source.addWidget(browse_rates)
-        rate_source.addWidget(QLabel("Rate column (%)"))
-        self.rate_column = QComboBox()
-        self.rate_column.setMinimumWidth(130)
-        rate_source.addWidget(self.rate_column)
-        self.use_g_spread = QCheckBox("Add bond G-spread from latest snapshot")
-        self.use_g_spread.setChecked(True)
-        rate_source.addWidget(self.use_g_spread)
+        rate_source.addWidget(QLabel("Treasury curve tenor"))
+        self.treasury_tenor = QComboBox()
+        self.treasury_tenor.setMinimumWidth(180)
+        self.treasury_tenor.setToolTip(f"Reads stored curve history from {DATABASE_PATH}")
+        try:
+            tenors = available_treasury_tenors(DATABASE_PATH)
+        except (OSError, ValueError):
+            tenors = []
+        for tenor in tenors:
+            label = f"{tenor * 12:.0f} month" if tenor < 1 else f"{tenor:g} year"
+            self.treasury_tenor.addItem(label, tenor)
+        short_tenor_index = next(
+            (index for index in range(self.treasury_tenor.count())
+             if abs(float(self.treasury_tenor.itemData(index)) - 1.0 / 12.0) < 1e-8),
+            -1,
+        )
+        if short_tenor_index >= 0:
+            self.treasury_tenor.setCurrentIndex(short_tenor_index)
+        rate_source.addWidget(self.treasury_tenor)
+        rate_source.addWidget(QLabel("(from shared Treasury curve history)"))
         layout.addLayout(rate_source)
 
         controls = QHBoxLayout()
@@ -160,6 +251,12 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.isin = QComboBox()
         self.isin.setEditable(True)
         self.isin.setMinimumWidth(310)
+        self.isin.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        bond_completer = QCompleter(self.isin.model(), self)
+        bond_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        bond_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.isin.setCompleter(bond_completer)
+        self.isin.setToolTip("Type any part of the ISIN, issuer, coupon or maturity to search.")
         controls.addWidget(self.isin)
         controls.addWidget(QLabel("Start"))
         self.start_date = QDateEdit(calendarPopup=True)
@@ -187,17 +284,24 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.rate_age.setRange(0, 90)
         self.rate_age.setValue(7)
         controls.addWidget(self.rate_age)
+        self.g_spread_hedge = QCheckBox("Calculate G-spread-hedged return")
+        self.g_spread_hedge.setChecked(True)
+        self.g_spread_hedge.setToolTip(
+            "Default on. Subtracts the duration-scaled move in the maturity-matched Treasury yield "
+            "stored with the bond's G-spread observations. Requires a valid G-spread snapshot and bond duration."
+        )
+        controls.addWidget(self.g_spread_hedge)
         self.run_button = QPushButton("Analyze return series")
         self.run_button.clicked.connect(self._run)
         controls.addWidget(self.run_button)
         layout.addLayout(controls)
 
         layout.addWidget(QLabel(
-            "Financing rate = latest short rate + optional bond G-spread + additional spread, "
+            "Financing rate = selected Treasury curve tenor + optional additional spread, "
             "all known at the start of each interval. "
-            "Excess log return = log(1 + bond total return) − log(1 + financing accrual), ACT/365."
+            "Financing cost is shown as negative. G-spread hedge proxy = spread carry − modified duration × spread change."
         ))
-        self.summary = QLabel("Select a bond, dates, a short-rate CSV and rate column, then run the analysis.")
+        self.summary = QLabel("Select a bond, dates and Treasury curve tenor, then run the analysis.")
         self.summary.setWordWrap(True)
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.summary)
@@ -205,12 +309,17 @@ class BondReturnAnalysisWindow(QMainWindow):
         layout.addWidget(self.status)
         self.chart = ReturnSeriesChart()
         layout.addWidget(self.chart, 2)
-        self.table = QTableWidget(0, 18)
+        layout.addWidget(QLabel("G-spread history"))
+        self.g_spread_chart = GSpreadHistoryChart()
+        layout.addWidget(self.g_spread_chart, 1)
+        self.table = QTableWidget(0, 23)
         self.table.setHorizontalHeaderLabels([
             "Date", "Price mark date", "Price age (days)", "Clean price", "Period days",
-            "Bond return (%)", "Rate observation date", "Rate age (days)", "Base short rate (%)",
-            "G-spread observation date", "G-spread (bp)", "G-spread age (days)",
-            "Financing rate (%)", "Financing log return", "Bond log return", "Excess log return",
+            "Bond return (%)", "Rate observation date", "Rate age (days)", "Treasury yield (%)",
+            "G-spread observation date", "G-spread (bp)", "Matched Treasury yield (%)",
+            "Spread carry (%)", "Spread price move (%)", "G-spread-hedged return (%)",
+            "Cumulative hedge index", "Financing rate (%)", "Financing cost (%)",
+            "Financing cost log return", "Bond log return", "Excess log return",
             "Cumulative excess index", "Mark status",
         ])
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -225,26 +334,98 @@ class BondReturnAnalysisWindow(QMainWindow):
         layout.addLayout(actions)
         self.setCentralWidget(central)
         self._refresh_bonds()
+        self._refresh_favorites()
+
+    @staticmethod
+    def _read_favorites() -> list[dict[str, str]]:
+        try:
+            data = json.loads(FAVORITES_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [
+            {"isin": str(item["isin"]).strip().upper(), "label": str(item["label"])}
+            for item in data
+            if isinstance(item, dict) and item.get("isin") and item.get("label")
+        ]
+
+    def _save_favorites(self) -> None:
+        try:
+            FAVORITES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            FAVORITES_PATH.write_text(json.dumps(self.favorites, indent=2), encoding="utf-8")
+        except OSError as error:
+            QMessageBox.warning(self, "Could not save favorites", str(error))
+            return
+        self._refresh_favorites()
+
+    def _refresh_favorites(self, selected_isin: str | None = None) -> None:
+        if not hasattr(self, "favorite_picker"):
+            return
+        selected_isin = selected_isin or self.favorite_picker.currentData()
+        self.favorite_picker.blockSignals(True)
+        self.favorite_picker.clear()
+        self.favorite_picker.addItem("Select a saved bond…", None)
+        for favorite in self.favorites:
+            self.favorite_picker.addItem(favorite["label"], favorite["isin"])
+        index = self.favorite_picker.findData(selected_isin)
+        self.favorite_picker.setCurrentIndex(index if index >= 0 else 0)
+        self.favorite_picker.blockSignals(False)
+
+    def _favorite_selected(self, index: int) -> None:
+        if index <= 0:
+            return
+        isin = self.favorite_picker.itemData(index)
+        bond_index = self.isin.findData(isin)
+        if bond_index >= 0:
+            self.isin.setCurrentIndex(bond_index)
+        else:
+            QMessageBox.information(
+                self,
+                "Bond not in current list",
+                f"{isin} is saved as a favorite but does not appear in the current bond list.",
+            )
+
+    def _add_favorite(self) -> None:
+        index = self.isin.currentIndex()
+        isin = self.isin.currentData()
+        if index < 0 or not isin:
+            QMessageBox.information(self, "Select a bond", "Choose a bond from the searchable bond list first.")
+            return
+        label = self.isin.currentText()
+        existing = next((item for item in self.favorites if item["isin"] == isin), None)
+        if existing:
+            existing["label"] = label
+        else:
+            self.favorites.append({"isin": str(isin), "label": label})
+        self._save_favorites()
+        self.favorite_picker.setCurrentIndex(self.favorite_picker.findData(isin))
+
+    def _remove_favorite(self) -> None:
+        isin = self.favorite_picker.currentData()
+        if not isin:
+            QMessageBox.information(self, "Select a favorite", "Choose a saved bond to remove.")
+            return
+        self.favorites = [item for item in self.favorites if item["isin"] != isin]
+        self._save_favorites()
 
     def _browse_bond_list(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(self, "Select bond list", self.bond_list.text(), "CSV files (*.csv)")
         if selected:
             self.bond_list.setText(selected)
 
-    def _browse_rate_file(self) -> None:
-        selected, _ = QFileDialog.getOpenFileName(self, "Select short-rate history", "", "CSV files (*.csv)")
-        if selected:
-            self.rate_file.setText(selected)
-
     def _refresh_bonds(self, *_args: Any) -> None:
-        selected = self.isin.currentText() if hasattr(self, "isin") else ""
+        selected = self.isin.currentData() if hasattr(self, "isin") else ""
         entries: list[tuple[str, str]] = []
         try:
             with Path(self.bond_list.text()).expanduser().open("r", encoding="utf-8-sig", newline="") as handle:
                 for row in csv.DictReader(handle):
                     isin = (row.get("isin") or "").strip().upper()
                     if isin:
-                        label = f"{isin} | {(row.get('issuer_name') or '').strip()}"
+                        issuer = (row.get("issuer_name") or "").strip()
+                        coupon = (row.get("coupon_pct") or "").strip()
+                        maturity = (row.get("maturity_date") or "").strip()
+                        label = f"{isin} | {issuer} | {coupon}% | {maturity}"
                         entries.append((isin, label))
         except OSError:
             entries = []
@@ -259,21 +440,6 @@ class BondReturnAnalysisWindow(QMainWindow):
             self.isin.setCurrentIndex(index)
         self.isin.blockSignals(False)
 
-    def _refresh_rate_columns(self, *_args: Any) -> None:
-        selected = self.rate_column.currentText() if hasattr(self, "rate_column") else ""
-        try:
-            _, columns = financing_rate_columns(Path(self.rate_file.text()).expanduser())
-        except (OSError, ValueError):
-            columns = ()
-        if not hasattr(self, "rate_column"):
-            return
-        self.rate_column.blockSignals(True)
-        self.rate_column.clear()
-        self.rate_column.addItems(columns)
-        if selected in columns:
-            self.rate_column.setCurrentText(selected)
-        self.rate_column.blockSignals(False)
-
     def _run(self) -> None:
         if self.worker is not None and self.worker.isRunning():
             return
@@ -285,22 +451,22 @@ class BondReturnAnalysisWindow(QMainWindow):
         selected_isin = self.isin.currentData()
         if not selected_isin:
             selected_isin = self.isin.currentText().split("|", 1)[0].strip().upper()
-        if not selected_isin or not self.rate_column.currentText():
-            QMessageBox.warning(self, "Missing input", "Select an ISIN and a financing rate column.")
+        if not selected_isin or self.treasury_tenor.currentData() is None:
+            QMessageBox.warning(self, "Missing input", "Select an ISIN and a Treasury curve tenor.")
             return
         self.run_button.setEnabled(False)
         self.export_button.setEnabled(False)
         self.table.setRowCount(0)
         self.chart.set_rows([])
+        self.g_spread_chart.set_rows([])
         self.status.setText("Calculating business-day total and financing-excess returns...")
         parameters = {
             "isin": selected_isin,
             "start_date": start,
             "end_date": end,
-            "financing_rate_csv_path": Path(self.rate_file.text()).expanduser(),
-            "financing_rate_column": self.rate_column.currentText(),
+            "treasury_tenor_years": float(self.treasury_tenor.currentData()),
             "financing_spread_bps": self.spread.value(),
-            "use_g_spread_snapshot": self.use_g_spread.isChecked(),
+            "include_g_spread_hedge": self.g_spread_hedge.isChecked(),
             "maximum_price_age_days": self.price_age.value(),
             "maximum_financing_rate_age_days": self.rate_age.value(),
             "bond_list_path": Path(self.bond_list.text()).expanduser(),
@@ -326,25 +492,34 @@ class BondReturnAnalysisWindow(QMainWindow):
         def format_optional(value: Any, suffix: str = "") -> str:
             return f"{float(value):.3f}{suffix}" if value is not None else "n/a"
 
+        tenor_years = float(summary["treasury_tenor_years"])
+        tenor_label = f"{tenor_years * 12:.0f}-month" if tenor_years < 1 else f"{tenor_years:g}-year"
         self.summary.setText(
-            f"{summary['isin']} | {summary['issuer_name']} | {summary['requested_start_date']} to "
+            f"{summary['isin']} | {summary['issuer_name']} | coupon {summary['coupon_pct']:.3f}% | "
+            f"maturity {summary['maturity_date']} | modified duration "
+            f"{summary['modified_duration_years'] if summary['modified_duration_years'] is not None else 'n/a'} | "
+            f"{summary['requested_start_date']} to "
             f"{summary['effective_end_date']} | Bond return {format_optional(summary['cumulative_bond_return_pct'], '%')} | "
-            f"Financing return {format_optional(summary['cumulative_financing_return_pct'], '%')} | "
+            f"Financing cost {format_optional(summary['cumulative_financing_return_pct'], '%')} | "
             f"Cumulative excess return {format_optional(summary['cumulative_excess_return_pct'], '%')} | "
             f"Annualized excess {format_optional(summary['annualized_log_excess_return_pct'], '%')} | "
             f"Excess volatility {format_optional(summary['annualized_excess_volatility_pct'], '%')} | "
             f"Excess Sharpe {format_optional(summary['excess_sharpe_ratio'])} | "
-            f"Spread {summary['financing_spread_bps']:.1f} bp over {summary['financing_rate_column']}" +
-            (f" + bond G-spread (snapshot {summary['g_spread_snapshot_id'][:8]})"
-             if summary.get("use_g_spread_snapshot") else "")
+            f"G-spread carry {format_optional(summary['cumulative_g_spread_carry_return_pct'], '%')} | "
+            f"G-spread-hedged return {format_optional(summary['cumulative_g_spread_hedged_return_pct'], '%')} | "
+            f"Financing: {tenor_label} Treasury tenor"
+            f" + {summary['financing_spread_bps']:.1f} bp additional spread"
         )
         self.chart.set_rows(result["time_series"])
+        self.g_spread_chart.set_rows(result["time_series"])
         fields = (
             "date", "price_observation_date", "price_age_days", "clean_price_per_100", "period_days",
             "bond_total_return_pct", "financing_rate_observation_date", "financing_rate_age_days",
-            "base_short_rate_pct", "g_spread_observation_date", "g_spread_bps", "g_spread_age_days",
-            "financing_rate_pct", "financing_log_return", "bond_log_return",
-            "log_excess_return", "cumulative_excess_index", "mark_status",
+            "base_short_rate_pct", "g_spread_observation_date", "g_spread_bps", "treasury_hedge_yield_pct",
+            "g_spread_carry_return_pct", "g_spread_price_return_pct", "g_spread_hedged_return_pct",
+            "cumulative_g_spread_hedged_index", "financing_rate_pct", "financing_cost_return_pct",
+            "financing_log_return", "bond_log_return", "log_excess_return", "cumulative_excess_index",
+            "mark_status",
         )
         rows = result["time_series"]
         self.table.setRowCount(len(rows))

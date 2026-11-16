@@ -16,20 +16,6 @@ from .trace_cleaning import clean_trace_value
 from .trace_history import DATABASE_PATH, DEFAULT_SNAPSHOT
 
 
-DATE_COLUMNS = ("date", "observation_date", "trade_date", "effective_date")
-
-
-def financing_rate_columns(path: Path) -> tuple[str, tuple[str, ...]]:
-    """Return the detected date field and numeric-looking rate columns."""
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fields = tuple(reader.fieldnames or ())
-    date_column = next((name for name in fields if name.lower() in DATE_COLUMNS), "")
-    if not date_column:
-        raise ValueError(f"Financing-rate CSV needs a date column named one of: {', '.join(DATE_COLUMNS)}")
-    return date_column, tuple(field for field in fields if field != date_column)
-
-
 def _parse_date(value: Any) -> date | None:
     try:
         return date.fromisoformat(str(value or "").strip()[:10])
@@ -52,6 +38,12 @@ def _load_bond_terms(bond_list_path: Path, isin: str) -> dict[str, Any]:
                 raise ValueError(f"Bond {isin} has no valid coupon in the bond list") from error
             if not math.isfinite(coupon) or not 0 <= coupon < 100:
                 raise ValueError(f"Bond {isin} has an invalid coupon in the bond list")
+            try:
+                duration = float(row.get("modified_duration_years") or "")
+                if duration <= 0 or not math.isfinite(duration):
+                    duration = None
+            except ValueError:
+                duration = None
             maturity = _parse_date(row.get("maturity_date"))
             if maturity is None:
                 raise ValueError(f"Bond {isin} has no valid maturity date in the bond list")
@@ -60,58 +52,80 @@ def _load_bond_terms(bond_list_path: Path, isin: str) -> dict[str, Any]:
                 "issuer_name": (row.get("issuer_name") or "").strip(),
                 "coupon_pct": coupon,
                 "maturity_date": maturity,
+                "modified_duration_years": duration,
             }
     raise ValueError(f"ISIN {isin} was not found in {bond_list_path}")
 
 
-def _load_financing_history(
-    path: Path, rate_column: str
+def available_treasury_tenors(database_path: Path = DATABASE_PATH) -> list[float]:
+    """List available Treasury curve tenors from the shared research database."""
+    connection = duckdb.connect(str(database_path), read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT DISTINCT tenor_years FROM treasury_curve_observations ORDER BY tenor_years"
+        ).fetchall()
+    except duckdb.Error as error:
+        raise ValueError("No Treasury curve history is available in the shared database.") from error
+    finally:
+        connection.close()
+    return [float(row[0]) for row in rows]
+
+
+def _load_treasury_history(
+    database_path: Path, tenor_years: float
 ) -> list[tuple[date, float]]:
-    date_column, rate_columns = financing_rate_columns(path)
-    if rate_column not in rate_columns:
-        raise ValueError(f"Rate column {rate_column!r} is not in {path}")
-    observations: dict[date, float] = {}
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
-            observed_date = _parse_date(row.get(date_column))
-            raw_rate = (row.get(rate_column) or "").strip()
-            if observed_date is None or not raw_rate or raw_rate in {".", "NA", "N/A", "null"}:
-                continue
-            try:
-                rate_pct = float(raw_rate)
-            except ValueError:
-                continue
-            if math.isfinite(rate_pct) and rate_pct > -100.0:
-                observations[observed_date] = rate_pct
-    history = sorted(observations.items())
+    """Load one Treasury tenor, using the most recently retrieved value per date."""
+    connection = duckdb.connect(str(database_path), read_only=True)
+    try:
+        rows = connection.execute(
+            """SELECT observation_date, par_yield_pct FROM (
+                   SELECT o.observation_date, o.par_yield_pct,
+                          row_number() OVER (
+                              PARTITION BY o.observation_date ORDER BY r.retrieved_at_utc DESC
+                          ) AS vintage_rank
+                   FROM treasury_curve_observations o
+                   JOIN treasury_curve_runs r USING (curve_run_id)
+                   WHERE abs(o.tenor_years - ?) < 0.00000001
+                     AND o.par_yield_pct IS NOT NULL
+               ) WHERE vintage_rank=1 ORDER BY observation_date""",
+            [tenor_years],
+        ).fetchall()
+    except duckdb.Error as error:
+        raise ValueError("Treasury curve history is unavailable in the shared database.") from error
+    finally:
+        connection.close()
+    history = [(observed_date, float(rate)) for observed_date, rate in rows]
     if not history:
-        raise ValueError(f"No valid rate observations found in {path} column {rate_column!r}")
+        raise ValueError(f"No Treasury history is available for the {tenor_years:g}-year tenor.")
     return history
 
 
 def _load_g_spread_history(
     database_path: Path, isin: str
-) -> tuple[str, list[tuple[date, float]]]:
-    """Load the latest immutable G-spread snapshot for one bond."""
+) -> tuple[str, list[tuple[date, float, float]]]:
+    """Load matched Treasury yields and G-spreads from the latest usable snapshot."""
     connection = duckdb.connect(str(database_path), read_only=True)
     try:
         latest = connection.execute(
             "SELECT snapshot_id FROM spread_snapshot_runs ORDER BY generated_at_utc DESC LIMIT 1"
         ).fetchone()
         if not latest:
-            raise ValueError("No G-spread snapshot is available. Build one from the launcher first.")
+            raise ValueError("No G-spread snapshot is available. Build one from the Data page.")
         snapshot_id = str(latest[0])
         rows = connection.execute(
-            """SELECT trade_date, g_spread_bps FROM bond_spread_observations
-               WHERE snapshot_id=? AND upper(isin)=? AND g_spread_bps IS NOT NULL
+            """SELECT trade_date, treasury_par_yield_pct, g_spread_bps
+               FROM bond_spread_observations
+               WHERE snapshot_id=? AND upper(isin)=? AND treasury_par_yield_pct IS NOT NULL
+                 AND g_spread_bps IS NOT NULL AND NOT yield_reversal_flagged
                ORDER BY trade_date""",
             [snapshot_id, isin],
         ).fetchall()
     except duckdb.Error as error:
-        raise ValueError("No G-spread snapshot is available. Build one from the launcher first.") from error
+        raise ValueError("A valid G-spread snapshot is required for the Treasury hedge.") from error
     finally:
         connection.close()
-    history = [(observed_date, float(spread)) for observed_date, spread in rows]
+    history = [(observed_date, float(treasury_yield), float(spread_bps))
+               for observed_date, treasury_yield, spread_bps in rows]
     if not history:
         raise ValueError(f"The latest G-spread snapshot has no valid observations for {isin}.")
     return snapshot_id, history
@@ -132,10 +146,9 @@ def analyze_bond_return_series(
     isin: str,
     start_date: date,
     end_date: date,
-    financing_rate_csv_path: Path,
-    financing_rate_column: str,
+    treasury_tenor_years: float = 1.0 / 12.0,
     financing_spread_bps: float = 0.0,
-    use_g_spread_snapshot: bool = True,
+    include_g_spread_hedge: bool = True,
     maximum_price_age_days: int = 30,
     maximum_financing_rate_age_days: int = 7,
     bond_list_path: Path = DEFAULT_SNAPSHOT,
@@ -144,8 +157,8 @@ def analyze_bond_return_series(
     """Mark a bond on business days and calculate log excess return vs funding.
 
     TRACE clean prices are carried forward between prints. Financing rates use
-    the latest observation known at the start of each interval, then add the
-    configured annualized spread. The financing accrual uses ACT/365 simple
+    the selected Treasury curve tenor known at the start of each interval,
+    then add the configured annualized spread. The financing accrual uses ACT/365 simple
     compounding; bond total return uses the synthetic coupon schedule in
     ``bond_returns``.
     """
@@ -158,8 +171,6 @@ def analyze_bond_return_series(
         raise ValueError("Financing spread must be finite")
     if maximum_price_age_days < 0 or maximum_financing_rate_age_days < 0:
         raise ValueError("Maximum mark ages must be non-negative")
-    if not financing_rate_csv_path.exists():
-        raise FileNotFoundError(f"Financing-rate CSV not found: {financing_rate_csv_path}")
     if not Path(database_path).exists():
         raise FileNotFoundError(f"TRACE history database not found: {database_path}")
 
@@ -167,14 +178,29 @@ def analyze_bond_return_series(
     maturity_date: date = terms["maturity_date"]
     if maturity_date <= start_date:
         raise ValueError("The bond matures on or before the selected start date")
-    rates = _load_financing_history(Path(financing_rate_csv_path), financing_rate_column)
+    rates = _load_treasury_history(Path(database_path), treasury_tenor_years)
     rate_dates = [observed_date for observed_date, _ in rates]
     g_spread_snapshot_id: str | None = None
-    g_spreads: list[tuple[date, float]] = []
+    g_spread_history: list[tuple[date, float, float]] = []
     g_spread_dates: list[date] = []
-    if use_g_spread_snapshot:
-        g_spread_snapshot_id, g_spreads = _load_g_spread_history(Path(database_path), normalized_isin)
-        g_spread_dates = [observed_date for observed_date, _ in g_spreads]
+    try:
+        g_spread_snapshot_id, g_spread_history = _load_g_spread_history(
+            Path(database_path), normalized_isin
+        )
+        g_spread_dates = [observed_date for observed_date, _tsy, _spread in g_spread_history]
+    except ValueError:
+        if include_g_spread_hedge:
+            raise
+    if include_g_spread_hedge:
+        if terms["modified_duration_years"] is None:
+            raise ValueError(f"Bond {normalized_isin} has no valid modified duration in the bond list.")
+        start_spread_index = bisect_right(g_spread_dates, start_date) - 1
+        if start_spread_index < 0:
+            raise ValueError(f"No G-spread observation on or before {start_date} for {normalized_isin}.")
+        if (start_date - g_spread_dates[start_spread_index]).days > maximum_price_age_days:
+            raise ValueError(f"G-spread observation is too old at {start_date} for {normalized_isin}.")
+    else:
+        start_spread_index = bisect_right(g_spread_dates, start_date) - 1 if g_spread_dates else -1
     query_end = min(end_date, maturity_date)
     connection = duckdb.connect(str(database_path), read_only=True)
     try:
@@ -199,6 +225,7 @@ def analyze_bond_return_series(
     if not mark_dates:
         raise ValueError("No business-day marks fall in the requested period")
 
+    start_spread_row = g_spread_history[start_spread_index] if start_spread_index >= 0 else None
     rows: list[dict[str, Any]] = [{
         "date": start_date.isoformat(),
         "price_observation_date": None,
@@ -208,13 +235,25 @@ def analyze_bond_return_series(
         "bond_total_return_pct": 0.0,
         "financing_rate_pct": None,
         "financing_spread_bps": financing_spread_bps,
-        "g_spread_bps": None,
+        "financing_cost_return_pct": 0.0,
         "financing_log_return": 0.0,
         "bond_log_return": 0.0,
         "log_excess_return": 0.0,
         "cumulative_bond_index": 100.0,
         "cumulative_financing_index": 100.0,
         "cumulative_excess_index": 100.0,
+        "treasury_hedge_yield_pct": start_spread_row[1] if start_spread_row else None,
+        "g_spread_observation_date": start_spread_row[0].isoformat() if start_spread_row else None,
+        "g_spread_bps": start_spread_row[2] if start_spread_row else None,
+        "g_spread_change_bps": 0.0 if include_g_spread_hedge else None,
+        "g_spread_carry_log_return": 0.0 if include_g_spread_hedge else None,
+        "g_spread_price_log_return": 0.0 if include_g_spread_hedge else None,
+        "g_spread_carry_return_pct": 0.0 if include_g_spread_hedge else None,
+        "g_spread_price_return_pct": 0.0 if include_g_spread_hedge else None,
+        "cumulative_g_spread_carry_index": 100.0 if include_g_spread_hedge else None,
+        "g_spread_hedged_log_return": 0.0 if include_g_spread_hedge else None,
+        "g_spread_hedged_return_pct": 0.0 if include_g_spread_hedge else None,
+        "cumulative_g_spread_hedged_index": 100.0 if include_g_spread_hedge else None,
         "mark_status": "start",
     }]
     previous_date = start_date
@@ -222,6 +261,9 @@ def analyze_bond_return_series(
     cumulative_financing_log = 0.0
     cumulative_excess_log = 0.0
     daily_excess_logs: list[float] = []
+    cumulative_g_spread_hedged_log = 0.0
+    cumulative_g_spread_carry_log = 0.0
+    previous_spread_index = start_spread_index
 
     for mark_date in mark_dates:
         if mark_date > maturity_date:
@@ -237,22 +279,13 @@ def analyze_bond_return_series(
                 f"Financing rate is {rate_age_days} days old at {previous_date}; "
                 f"limit is {maximum_financing_rate_age_days}"
             )
-        g_spread_index = bisect_right(g_spread_dates, previous_date) - 1 if g_spreads else -1
-        g_spread_bps = g_spreads[g_spread_index][1] if g_spread_index >= 0 else 0.0
-        g_spread_date = g_spreads[g_spread_index][0] if g_spread_index >= 0 else None
-        if use_g_spread_snapshot and g_spread_date is None:
-            raise ValueError(f"No G-spread observation on or before {previous_date} for {normalized_isin}")
-        g_spread_age_days = (previous_date - g_spread_date).days if g_spread_date else None
-        if g_spread_age_days is not None and g_spread_age_days > maximum_financing_rate_age_days:
-            raise ValueError(
-                f"G-spread is {g_spread_age_days} days old at {previous_date}; "
-                f"limit is {maximum_financing_rate_age_days}"
-            )
-        financing_rate_pct = base_rate_pct + (financing_spread_bps + g_spread_bps) / 100.0
+        financing_rate_pct = base_rate_pct + financing_spread_bps / 100.0
         financing_simple_return = (financing_rate_pct / 100.0) * period_days / 365.0
         if financing_simple_return <= -1.0:
             raise ValueError("Financing accrual implies a loss of 100% or more")
-        financing_log_return = math.log1p(financing_simple_return)
+        # Financing is the cost of holding the bond position, so represent it
+        # as a negative contribution in the return series.
+        financing_log_return = -math.log1p(financing_simple_return)
         bond_result = calculate_historical_bond_total_return(
             isin=normalized_isin,
             start_date=previous_date,
@@ -271,7 +304,40 @@ def analyze_bond_return_series(
                 f"limit is {maximum_price_age_days}"
             )
         bond_log_return = math.log1p(bond_result.total_return)
-        excess_log_return = bond_log_return - financing_log_return
+        excess_log_return = bond_log_return + financing_log_return
+        hedge_yield: float | None = None
+        spread_date: date | None = None
+        spread_bps: float | None = None
+        spread_change_bps: float | None = None
+        spread_carry_log_return: float | None = None
+        spread_price_log_return: float | None = None
+        hedged_log_return: float | None = None
+        hedged_return_pct: float | None = None
+        spread_index = bisect_right(g_spread_dates, mark_date) - 1 if g_spread_dates else -1
+        if spread_index >= 0:
+            spread_date, hedge_yield, spread_bps = g_spread_history[spread_index]
+            spread_age = (mark_date - spread_date).days
+            if include_g_spread_hedge and spread_age > maximum_price_age_days:
+                raise ValueError(
+                    f"G-spread observation is {spread_age} days old at {mark_date}; "
+                    f"limit is {maximum_price_age_days}"
+                )
+        if include_g_spread_hedge:
+            if spread_index < 0:
+                raise ValueError(f"No G-spread observation on or before {mark_date} for {normalized_isin}.")
+            previous_spread_bps = g_spread_history[previous_spread_index][2]
+            duration = float(terms["modified_duration_years"])
+            # Credit hedge return consists of accrued G-spread carry plus the
+            # duration-scaled price move from changes in that spread.
+            spread_carry_simple_return = previous_spread_bps / 10_000.0 * period_days / 365.0
+            spread_carry_log_return = math.log1p(spread_carry_simple_return)
+            spread_change_bps = spread_bps - previous_spread_bps
+            spread_price_log_return = -duration * spread_change_bps / 10_000.0
+            hedged_log_return = spread_carry_log_return + spread_price_log_return
+            hedged_return_pct = 100.0 * math.expm1(hedged_log_return)
+            cumulative_g_spread_carry_log += spread_carry_log_return
+            cumulative_g_spread_hedged_log += hedged_log_return
+            previous_spread_index = spread_index
         cumulative_bond_log += bond_log_return
         cumulative_financing_log += financing_log_return
         cumulative_excess_log += excess_log_return
@@ -285,12 +351,10 @@ def analyze_bond_return_series(
             "period_days": period_days,
             "bond_total_return_pct": bond_result.total_return_pct,
             "financing_rate_pct": financing_rate_pct,
+            "financing_cost_return_pct": 100.0 * math.expm1(financing_log_return),
             "base_short_rate_pct": base_rate_pct,
             "financing_rate_observation_date": rate_date.isoformat(),
             "financing_rate_age_days": rate_age_days,
-            "g_spread_bps": g_spread_bps if use_g_spread_snapshot else None,
-            "g_spread_observation_date": g_spread_date.isoformat() if g_spread_date else None,
-            "g_spread_age_days": g_spread_age_days,
             "financing_spread_bps": financing_spread_bps,
             "financing_log_return": financing_log_return,
             "bond_log_return": bond_log_return,
@@ -298,6 +362,30 @@ def analyze_bond_return_series(
             "cumulative_bond_index": 100.0 * math.exp(cumulative_bond_log),
             "cumulative_financing_index": 100.0 * math.exp(cumulative_financing_log),
             "cumulative_excess_index": 100.0 * math.exp(cumulative_excess_log),
+            "treasury_hedge_yield_pct": hedge_yield,
+            "g_spread_observation_date": spread_date.isoformat() if spread_date else None,
+            "g_spread_bps": spread_bps,
+            "g_spread_change_bps": spread_change_bps,
+            "g_spread_carry_log_return": spread_carry_log_return,
+            "g_spread_price_log_return": spread_price_log_return,
+            "g_spread_carry_return_pct": (
+                100.0 * math.expm1(spread_carry_log_return)
+                if spread_carry_log_return is not None else None
+            ),
+            "cumulative_g_spread_carry_index": (
+                100.0 * math.exp(cumulative_g_spread_carry_log)
+                if include_g_spread_hedge else None
+            ),
+            "g_spread_price_return_pct": (
+                100.0 * math.expm1(spread_price_log_return)
+                if spread_price_log_return is not None else None
+            ),
+            "g_spread_hedged_log_return": hedged_log_return,
+            "g_spread_hedged_return_pct": hedged_return_pct,
+            "cumulative_g_spread_hedged_index": (
+                100.0 * math.exp(cumulative_g_spread_hedged_log)
+                if include_g_spread_hedge else None
+            ),
             "mark_status": "maturity" if mark_date == maturity_date else (
                 "stale price carried" if price_age is not None and price_age > maximum_price_age_days else "marked"
             ),
@@ -323,21 +411,32 @@ def analyze_bond_return_series(
         "isin": normalized_isin,
         "issuer_name": terms["issuer_name"],
         "coupon_pct": terms["coupon_pct"],
+        "modified_duration_years": terms["modified_duration_years"],
         "maturity_date": maturity_date.isoformat(),
         "requested_start_date": start_date.isoformat(),
         "requested_end_date": end_date.isoformat(),
         "effective_end_date": rows[-1]["date"],
-        "financing_rate_column": financing_rate_column,
-        "financing_rate_csv_path": str(Path(financing_rate_csv_path).resolve()),
+        "treasury_tenor_years": treasury_tenor_years,
         "bond_list_path": str(Path(bond_list_path).resolve()),
         "trace_database_path": str(Path(database_path).resolve()),
         "financing_spread_bps": financing_spread_bps,
-        "use_g_spread_snapshot": use_g_spread_snapshot,
+        "include_g_spread_hedge": include_g_spread_hedge,
         "g_spread_snapshot_id": g_spread_snapshot_id,
+        "cumulative_g_spread_hedged_return_pct": (
+            100.0 * math.expm1(cumulative_g_spread_hedged_log)
+            if include_g_spread_hedge else None
+        ),
+        "g_spread_hedge_definition": (
+            "G-spread carry accrued at the prior observed spread plus the duration-scaled price proxy from G-spread changes; price component is -modified duration times change in spread; duration is from the bond-list snapshot"
+            if include_g_spread_hedge else "not calculated"
+        ),
+        "cumulative_g_spread_carry_return_pct": (
+            100.0 * math.expm1(cumulative_g_spread_carry_log)
+            if include_g_spread_hedge else None
+        ),
         "financing_definition": (
-            "latest short-rate observation known at interval start plus configured spread"
-            + (" and latest bond G-spread from the selected snapshot" if use_g_spread_snapshot else "")
-            + "; ACT/365 simple accrual; log excess = log bond gross return minus log financing gross return"
+            "latest observation of the selected Treasury curve tenor known at interval start plus configured spread; "
+            "ACT/365 simple accrual; financing cost is recorded as a negative return contribution and added to bond log return"
         ),
         "price_marking_definition": "business-day marks use the latest valid TRACE clean price on or before the mark date; clean price carries forward and age is reported; accrued interest and synthetic coupon schedule are included",
         "mark_count": max(0, len(rows) - 1),

@@ -41,4 +41,16 @@ SIGNALS = (
         status="Implemented",
         validation="Exploratory single-space signal; no out-of-sample validation yet",
     ),
+    SignalDefinition(
+        signal_id="historical_partition_zscore",
+        name="Historical partition level z-score",
+        family="Credit regime",
+        construction=(
+            "Partition median yield, G-spread, or clean price standardized against strictly prior values in a trailing window; "
+            "score direction is normalized so higher values indicate cheaper levels."
+        ),
+        inputs="TRACE yield/price or G-spread snapshot and a selected bond-list partition field",
+        status="Implemented",
+        validation="Exploratory single-space signal; no out-of-sample validation yet",
+    ),
 )

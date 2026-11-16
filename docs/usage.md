@@ -146,7 +146,7 @@ includes tickers that could not be fitted and their minimum-data reason.
 
 The launcher **Signal inventory** tab lists implemented signals and their
 validation status. Choose **Evaluate credit predictors** to compare the
-Nelson-Siegel residual with a historical partition percentile over a selected
+Nelson-Siegel residual with historical partition percentile and z-score signals over a selected
 start/end range, and choose **Yield**, **G-spread**, or **Price** as the signal
 space. Signals and forward outcomes use the same selected space. G-spread mode
 uses and records the latest immutable spread snapshot. Price mode uses clean
@@ -158,7 +158,11 @@ selected source and path. The cleaner's carried marks and reversal flags are
 separate from observed values; the evaluator reads the observed columns and
 ignores those marks and retrospective flags. On every eligible observation
 date in the selected space, the evaluator fits the ticker curve in the selected
-space or computes a partition percentile. From each signal date, it measures
+space or computes a partition percentile or z-score. Both partition signals
+use the selected partition's median level against strictly prior observations
+in the trailing history window. The percentile is self-limiting to 0–100; the
+z-score reports standard deviations from the historical mean using the sample
+standard deviation, without winsorization. From each signal date, it measures
 post-signal changes and accumulates them by horizon.
 For Nelson-Siegel residuals, it subtracts the cross-sectional mean change on
 each trade date. If a signal uses a stale observation from before T, its first
@@ -290,17 +294,26 @@ Coupon dates are estimated by rolling a semiannual schedule back from maturity
 because actual issue/coupon dates are not in the snapshot. Coupon cash is not
 reinvested; fees, taxes, defaults, and settlement lag are not included.
 
-Use **Analyze bond return series** in the launcher to create business-day bond
-total-return and financing-excess series for one ISIN. Select a short-rate CSV
-with a date field (`date`, `observation_date`, `trade_date`, or `effective_date`)
-and a rate column expressed in percent. The user-entered annualized financing
-spread is added in basis points. At each interval, the rate known at the
-interval start is used, with ACT/365 simple accrual; the log excess return is
+Use **Analyze bond return series** on the launcher's **Data** page to create
+business-day bond total-return and financing-excess series for one ISIN. Select
+a bond by typing part of its ISIN, issuer, coupon, or maturity; each entry shows
+all four identifying details. Select a Treasury curve tenor from the history
+stored in the shared DuckDB. The
+user-entered annualized financing spread is added in basis points. At each
+interval, the latest Treasury observation known at the interval start is used,
+with ACT/365 simple accrual; financing cost is reported as a negative return
+contribution, and no bond G-spread is required for financing. A default-on
+**G-spread-hedged return** accrues the prior observed G-spread as carry, then
+adds a duration-based price proxy of `-modified duration × change in G-spread`.
+The unhedged total return remains available whether the hedge is on or off. The
+return chart includes a separate cumulative G-spread carry line alongside the
+negative financing-cost line, and a lower panel plots actual G-spread snapshot
+observations for the selected bond. The log excess return is
 `log(1 + bond total return) - log(1 + financing accrual)`. TRACE prices carry
 forward between prints and their age is reported. The output includes interval
 log excess returns and cumulative bond, financing, and excess indices, with CSV
-and summary JSON export. The local `main` branch currently has no tracked
-government-yield history file, so provide the short-rate history CSV explicitly.
+and summary JSON export. Treasury observations are read directly from the same
+DuckDB used for TRACE history and are selected by tenor.
 
 ## Reproducibility
 

@@ -139,6 +139,7 @@ class LauncherWindow(QMainWindow):
             ("Clean preprocessed TRACE data", "src.trace_cleaner_app"),
             ("Build G-spread snapshot", "src.spread_snapshot_app"),
             ("Inspect TRACE history", "src.trace_history_inspector"),
+            ("Analyze bond return series", "src.bond_return_analysis_app"),
         )
         for index, (label, module) in enumerate(data_tools):
             button = QPushButton(label)
@@ -167,10 +168,6 @@ class LauncherWindow(QMainWindow):
         fit_curves.clicked.connect(lambda: self._launch("src.nelson_siegel_app"))
         self.buttons.append(fit_curves)
         portfolio_actions.addWidget(fit_curves, 1, 1)
-        analyze_bond_returns = QPushButton("Analyze bond return series")
-        analyze_bond_returns.clicked.connect(lambda: self._launch("src.bond_return_analysis_app"))
-        self.buttons.append(analyze_bond_returns)
-        portfolio_actions.addWidget(analyze_bond_returns, 2, 0)
         portfolio_layout.addLayout(portfolio_actions)
         self.portfolio_archive_table = QTableWidget(0, 5)
         self.portfolio_archive_table.setHorizontalHeaderLabels(
