@@ -144,8 +144,10 @@ includes tickers that could not be fitted and their minimum-data reason.
 
 ## Signal inventory and evaluation
 
-The launcher **Signal inventory** tab lists implemented signals and their
-validation status. Choose **Evaluate credit predictors** to compare the
+The launcher **Signals** tab lists implemented signal components and their
+validation status. Use the **Strategies** tab to evaluate individual signal
+components or open **Define strategy graph** to create and save a reusable
+combination. Choose **Evaluate signal components** to compare the
 Nelson-Siegel residual with historical partition percentile and z-score signals over a selected
 start/end range, and choose **Yield**, **G-spread**, or **Price** as the signal
 space. Signals and forward outcomes use the same selected space. G-spread mode
@@ -181,22 +183,45 @@ Pearson and Spearman IC. Signal staleness, maximum gap between selected-space ch
 minimum curve size, price age, horizon, and long-short tail quantile are
 configurable.
 
-Use **Edit credit strategy** on the launcher's **Signal inventory** tab to
-create, validate, open, and save reusable strategy JSON in a node canvas. Each
+Use **Define strategy graph** on the launcher's **Strategies** tab to
+create, validate, open, and save reusable strategy JSON in a node canvas.
+Strategies default to the repository's `data/strategies/` folder. Each
 signal is a branch into the shared combination node, with its transforms shown
 in order; final transforms sit after combination. Nodes can be dragged to
-arrange the canvas, and selecting a node opens its settings. A strategy contains
-uniquely named signal components, each with a predictor, signal space, grouping
-field, weight, parameters, and an ordered transformer list. Supported
+arrange the canvas, and the canvas supports wheel zoom, drag-to-pan, and a
+**Fit graph** control. Selecting a node opens its settings. Cards summarize
+the predictor, signal space, group, weight, transform parameters, or combination
+rule; node cards also include a short explanation of their operation, and arrows
+show the score flow. **Global strategy settings** contain the strategy name;
+**Selected node settings** show only the controls for the clicked block, with the
+combination method on the combiner node and transformer type/parameters on each
+transformer node. Signal grouping uses a dropdown populated from the selected
+reference bond-list CSV, so fields absent from that universe are flagged rather
+than silently accepted. A strategy contains uniquely named signal
+components, independent transformer nodes connected between signal branches
+and the combiner, and a combiner node with its own method. Supported
 combinations are weighted mean, equal mean, weighted sum, and rank mean.
 Supported cross-sectional transforms are winsorization, z-score normalization,
-percentile rank, and min-max scaling. Component transforms run on each signal's
-daily bond cross-section before combination; strategy transforms run on the
-combined daily score. Missing component scores are omitted and mean weights are
-renormalized over the available components. The editor starts with examples
-for ticker/spread, rating/yield, ticker/price, and ISIN-level spread/yield
-z-scores. These definitions can be edited and saved independently of a test
-run.
+percentile rank, and min-max scaling. A transformer applies to the upstream
+signal or combined score feeding its input. Missing component scores are
+omitted and mean weights are renormalized over the available components. The
+editor starts with an empty graph and three block types: signal, transformer,
+and combiner. Add signal blocks, insert transformer blocks on a branch, and
+select the combiner node to set how branches are aggregated. Definitions can
+be saved independently of a test run.
+
+Use **Calculate inputs** in the strategy editor to evaluate and cache the
+individual bond/date scores for the selected date range and TRACE source. The
+cache is stored under `data/strategies/runs/`. Recalculating with the same
+date range and data source reuses unchanged signal components; newly added or
+edited signal components are calculated, while a changed date range or source
+refreshes all inputs. **Run strategy** applies the current graph to those
+cached inputs and saves the combined dated bond scores alongside the cache.
+Changing only a combiner or transformer does not require recalculating signal
+inputs. **Export latest scores** writes a CSV for the latest date present in
+the cache, including component scores, the combined score, bond details from
+the reference list, and a descending score rank. This is a ranked signal
+output; it does not assign position sizes.
 
 Use **Signal vs. outcome** to inspect a bond-level cross-section. After an
 evaluation completes, change the signal date or forward horizon directly in

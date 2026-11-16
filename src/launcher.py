@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QGridLayout,
+    QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
@@ -96,7 +97,7 @@ class LauncherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Parallax")
-        self.resize(720, 600)
+        self.resize(1500, 760)
         self.process: QProcess | None = None
         self.dependency_checker: DependencyChecker | None = None
         self.current_task_log: Path | None = None
@@ -189,30 +190,57 @@ class LauncherWindow(QMainWindow):
         signal_layout.addWidget(QLabel(
             "Signal inventory and research status. Prototype signals require walk-forward validation before interpretation as investment alpha."
         ))
+        signal_actions = QHBoxLayout()
+        evaluate_signal = QPushButton("Evaluate signal components")
+        evaluate_signal.setToolTip("Run walk-forward evaluation for an individual signal component.")
+        evaluate_signal.clicked.connect(lambda: self._launch("src.signal_evaluation_app"))
+        self.buttons.append(evaluate_signal)
+        signal_actions.addWidget(evaluate_signal)
+        signal_actions.addStretch(1)
+        signal_layout.addLayout(signal_actions)
         self.signal_table = QTableWidget(0, 6)
         self.signal_table.setHorizontalHeaderLabels(
             ["Signal", "Family", "Construction", "Inputs", "Status", "Validation"]
         )
         self.signal_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.signal_table.setWordWrap(True)
+        self.signal_table.verticalHeader().setVisible(False)
+        self.signal_table.verticalHeader().setDefaultSectionSize(68)
         self.signal_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.signal_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.signal_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.signal_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        self.signal_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.signal_table.setColumnWidth(2, 430)
+        self.signal_table.setColumnWidth(3, 360)
+        self.signal_table.setColumnWidth(5, 300)
         self.signal_table.horizontalHeader().setStretchLastSection(True)
         self.signal_table.setRowCount(len(SIGNALS))
         for row, signal in enumerate(SIGNALS):
             for column, value in enumerate((signal.name, signal.family, signal.construction, signal.inputs, signal.status, signal.validation)):
-                self.signal_table.setItem(row, column, QTableWidgetItem(value))
-            self.signal_table.setRowHeight(row, 105)
+                item = QTableWidgetItem(value)
+                if column in {2, 3, 5}:
+                    item.setToolTip(value)
+                self.signal_table.setItem(row, column, item)
+            self.signal_table.setRowHeight(row, 68)
         signal_layout.addWidget(self.signal_table, 1)
-        evaluate_signal = QPushButton("Evaluate credit predictors")
-        evaluate_signal.clicked.connect(lambda: self._launch("src.signal_evaluation_app"))
-        self.buttons.append(evaluate_signal)
-        signal_layout.addWidget(evaluate_signal, 0, Qt.AlignmentFlag.AlignLeft)
-        edit_strategy = QPushButton("Edit credit strategy")
+        self.tabs.addTab(signal_page, "Signals")
+
+        strategy_page = QWidget()
+        strategy_layout = QVBoxLayout(strategy_page)
+        strategy_layout.addWidget(QLabel(
+            "Build reusable strategies, calculate and cache their signal inputs, combine the current graph, and export the latest ranked scores. "
+            "Open the editor to find these actions on its second toolbar row."
+        ))
+        strategy_actions = QGridLayout()
+        edit_strategy = QPushButton("Open strategy builder")
+        edit_strategy.setToolTip("Build, calculate inputs, run, and inspect a multi-signal strategy.")
         edit_strategy.clicked.connect(lambda: self._launch("src.strategy_editor_app"))
         self.buttons.append(edit_strategy)
-        signal_layout.addWidget(edit_strategy, 0, Qt.AlignmentFlag.AlignLeft)
-        self.tabs.addTab(signal_page, "Signal inventory")
+        strategy_actions.addWidget(edit_strategy, 0, 0)
+        strategy_layout.addLayout(strategy_actions)
+        strategy_layout.addStretch(1)
+        self.tabs.addTab(strategy_page, "Strategies")
 
         self.diagnostics = QTextEdit()
         self.diagnostics.setReadOnly(True)

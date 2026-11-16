@@ -1,0 +1,22 @@
+{
+  "name": "Test Strategy v00",
+  "signals": [
+    {
+      "signal_id": "Zscore - ISIN - Spread",
+      "predictor_id": "historical_partition_zscore",
+      "signal_space": "spread",
+      "group_field": "isin",
+      "weight": 1.0,
+      "parameters": {
+        "lookback_days": 1095,
+        "minimum_history_observations": 20
+      },
+      "transformers": []
+    }
+  ],
+  "strategy_id": "",
+  "combination_method": "weighted_mean",
+  "transformers": [],
+  "metadata": {},
+  "schema_version": 1
+}

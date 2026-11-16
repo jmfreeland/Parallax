@@ -1,0 +1,147 @@
+{
+  "name": "Test Strategy v00",
+  "signals": [
+    {
+      "signal_id": "ZScore - Spread - ISIN",
+      "predictor_id": "historical_partition_zscore",
+      "signal_space": "spread",
+      "group_field": "isin",
+      "weight": 1.0,
+      "parameters": {
+        "lookback_days": 1095,
+        "minimum_history_observations": 20
+      }
+    },
+    {
+      "signal_id": "ZScore - Price - Isin",
+      "predictor_id": "historical_partition_zscore",
+      "signal_space": "price",
+      "group_field": "isin",
+      "weight": 1.0,
+      "parameters": {
+        "lookback_days": 1095,
+        "minimum_history_observations": 20
+      }
+    },
+    {
+      "signal_id": "Nelson Siegel - Ticker/Spread",
+      "predictor_id": "nelson_siegel_residual",
+      "signal_space": "spread",
+      "group_field": "ticker",
+      "weight": 1.0,
+      "parameters": {
+        "lookback_days": 1095,
+        "minimum_history_observations": 20
+      }
+    },
+    {
+      "signal_id": "Nelson Siegel - Ticker - Yield",
+      "predictor_id": "nelson_siegel_residual",
+      "signal_space": "yield",
+      "group_field": "isin",
+      "weight": 1.0,
+      "parameters": {
+        "lookback_days": 1095,
+        "minimum_history_observations": 20
+      }
+    }
+  ],
+  "strategy_id": "81e714dbd60e48aca465618698b94fa7",
+  "transformer_nodes": [
+    {
+      "node_id": "transform_1",
+      "input_node_id": "signal:Nelson Siegel - Ticker/Spread",
+      "transform": {
+        "type": "zscore"
+      },
+      "name": "Z-Score NS-Ticker-Spread"
+    },
+    {
+      "node_id": "transform_2",
+      "input_node_id": "signal:Nelson Siegel - Ticker - Yield",
+      "transform": {
+        "type": "zscore"
+      },
+      "name": "Z-Score NS-Ticker-Yield"
+    },
+    {
+      "node_id": "transform_3",
+      "input_node_id": "transform_1",
+      "transform": {
+        "type": "winsorize",
+        "lower": 0.03,
+        "upper": 0.97
+      },
+      "name": "Wins-NS-Ticker-Spread"
+    },
+    {
+      "node_id": "transform_4",
+      "input_node_id": "transform_2",
+      "transform": {
+        "type": "winsorize",
+        "lower": 0.03,
+        "upper": 0.97
+      },
+      "name": "Wins-NS-Ticker-Yield"
+    }
+  ],
+  "combiners": [
+    {
+      "node_id": "combiner",
+      "method": "weighted_mean",
+      "input_node_ids": [
+        "signal:ZScore - Spread - ISIN",
+        "signal:ZScore - Price - Isin",
+        "transform_3",
+        "transform_4"
+      ],
+      "name": "Combiner"
+    }
+  ],
+  "output_node_id": "combiner",
+  "metadata": {
+    "editor_node_positions": {
+      "strategy_output": [
+        945.74,
+        64.1
+      ],
+      "combiner": [
+        755.28,
+        242.22
+      ],
+      "signal:ZScore - Spread - ISIN": [
+        101.48,
+        125.29
+      ],
+      "signal:ZScore - Price - Isin": [
+        101.97,
+        -45.57
+      ],
+      "signal:Nelson Siegel - Ticker/Spread": [
+        -110.7,
+        292.49
+      ],
+      "signal:Nelson Siegel - Ticker - Yield": [
+        -130.23,
+        468.55
+      ],
+      "transform_1": [
+        194.71,
+        313.79
+      ],
+      "transform_2": [
+        169.12,
+        480.09
+      ],
+      "transform_3": [
+        437.08,
+        259.89
+      ],
+      "transform_4": [
+        475.78,
+        460.11
+      ]
+    }
+  },
+  "schema_version": 3
+}
