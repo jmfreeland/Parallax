@@ -15,10 +15,9 @@ import duckdb
 from .trace_history import DATABASE_PATH, TRACE_DIR, connect_database
 from .trace_cleaner import clean_preprocessed_trace
 from .trace_preprocessor import run_preprocessor
-from .treasury_curves import NODE_FIELDS, map_trace_yields
 
 
-POLICY_VERSION = "g-spread-linear-par-yield-v1"
+POLICY_VERSION = "g-spread-linear-par-yield-v2"
 OUTPUT_DIR = TRACE_DIR / "spread_snapshots"
 
 
@@ -41,20 +40,6 @@ def _latest_run_ids(database_path: Path) -> tuple[str, str]:
         return trace[0], curve[0]
     finally:
         connection.close()
-
-
-def _curve_rows(connection: duckdb.DuckDBPyConnection, curve_run_id: str) -> list[dict[str, object]]:
-    records: dict[date, dict[str, object]] = {}
-    rows = connection.execute(
-        """SELECT observation_date, tenor_years, par_yield_pct
-           FROM treasury_curve_observations WHERE curve_run_id=?
-           ORDER BY observation_date, tenor_years""",
-        [curve_run_id],
-    ).fetchall()
-    for observation_date, tenor, rate in rows:
-        item = records.setdefault(observation_date, {"date": observation_date})
-        item[f"yield_{float(tenor):g}y_pct"] = rate
-    return list(records.values())
 
 
 def build_spread_snapshot(
@@ -84,17 +69,6 @@ def build_spread_snapshot(
     )
     clean_path = Path(series_clean_report["output_cleaned_parquet"])
     clean_hash = hashlib.sha256(clean_path.read_bytes()).hexdigest()
-    read_connection = duckdb.connect()
-    try:
-        records = read_connection.execute(
-            """SELECT isin, trade_date, maturity_date, clean_last_sale_yield,
-                      yield_series_clean_action, observation_last_run_id, retrieval_id, record_hash
-               FROM read_parquet(?) ORDER BY isin, trade_date""",
-            [str(clean_path)],
-        ).fetchall()
-    finally:
-        read_connection.close()
-    print(f"Loaded {len(records):,} cleaned TRACE observations.", flush=True)
 
     connection = connect_database(database_path, initialize=True)
     try:
@@ -112,31 +86,15 @@ def build_spread_snapshot(
         ).fetchone()
         if not trace_meta or not curve_meta:
             raise ValueError("The selected TRACE run or Treasury curve vintage does not exist.")
-        curves = _curve_rows(connection, curve_run_id)
-        trace_rows = [
-            {
-                "isin": row[0],
-                "trade_date": row[1],
-                "maturity_date": row[2],
-                "yield_pct": row[3],
-                "yield_reversal_flagged": row[4] == "reversal_spike_flagged",
-                "trace_observation_run_id": row[5],
-                "trace_retrieval_id": row[6],
-                "trace_record_hash": row[7],
-            }
-            for row in records
-        ]
-        mapped = map_trace_yields(trace_rows, curves)
-        for row in mapped:
-            if row.get("yield_reversal_flagged"):
-                row["g_spread_bps"] = None
-        matched = sum(row.get("g_spread_bps") is not None for row in mapped)
-        print(
-            f"Mapped {len(mapped):,} observations to Treasury curves; "
-            f"{matched:,} have valid G-spreads; "
-            f"{sum(bool(row.get('yield_reversal_flagged')) for row in mapped):,} flagged reversals excluded.",
-            flush=True,
-        )
+        clean_path_sql = str(clean_path.resolve()).replace("'", "''")
+        clean_stats = connection.execute(
+            f"""SELECT min(trade_date), max(trade_date), count(*)
+                FROM read_parquet('{clean_path_sql}')"""
+        ).fetchone()
+        if not clean_stats or clean_stats[0] is None:
+            raise ValueError("The cleaned TRACE dataset contains no observations.")
+        first_clean_date, last_clean_date, row_count = clean_stats
+        print(f"Loaded {row_count:,} cleaned TRACE observations.", flush=True)
         snapshot_id = str(uuid.uuid4())
         generated_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         output_dir = output_root / f"snapshot_id={snapshot_id}"
@@ -186,26 +144,110 @@ def build_spread_snapshot(
             "ALTER TABLE bond_spread_observations "
             "ADD COLUMN IF NOT EXISTS yield_reversal_flagged BOOLEAN DEFAULT FALSE"
         )
-        spread_rows = []
-        for row in mapped:
-            digest_fields = (
-                snapshot_id, row.get("isin"), row.get("trade_date"),
-                row.get("maturity_date"), row.get("yield_pct"),
-                row.get("treasury_par_yield_pct"), row.get("g_spread_bps"),
-                row.get("trace_retrieval_id"), row.get("yield_reversal_flagged"),
-                curve_run_id, POLICY_VERSION,
+        snapshot_id_sql = snapshot_id.replace("'", "''")
+        curve_run_id_sql = str(curve_run_id).replace("'", "''")
+        connection.execute("BEGIN TRANSACTION")
+        years = list(range(first_clean_date.year, last_clean_date.year + 1))
+        print(f"Calculating and inserting spreads by year ({len(years)} years)...", flush=True)
+        for year_index, year in enumerate(years, start=1):
+            year_start = f"{year}-01-01"
+            year_end = f"{year + 1}-01-01"
+            mapping_query = f"""WITH trace AS (
+                    SELECT isin, trade_date,
+                           try_cast(maturity_date AS DATE) AS maturity_date,
+                           (date_diff('day', trade_date, try_cast(maturity_date AS DATE)) / 365.25)::DOUBLE AS maturity_years,
+                           clean_last_sale_yield AS trace_yield_pct,
+                           observation_last_run_id AS trace_observation_run_id,
+                           retrieval_id AS trace_retrieval_id,
+                           record_hash AS trace_record_hash,
+                           yield_series_clean_action = 'reversal_spike_flagged' AS yield_reversal_flagged
+                    FROM read_parquet('{clean_path_sql}')
+                    WHERE trade_date >= DATE '{year_start}' AND trade_date < DATE '{year_end}'
+                ), nodes AS (
+                    SELECT trace.*,
+                           lower_node.tenor_years AS lower_tenor,
+                           lower_node.par_yield_pct AS lower_yield,
+                           upper_node.tenor_years AS upper_tenor,
+                           upper_node.par_yield_pct AS upper_yield
+                    FROM trace
+                    LEFT JOIN LATERAL (
+                        SELECT tenor_years, par_yield_pct
+                        FROM treasury_curve_observations
+                        WHERE curve_run_id = '{curve_run_id_sql}'
+                          AND observation_date = trace.trade_date
+                          AND par_yield_pct IS NOT NULL
+                          AND tenor_years <= trace.maturity_years
+                        ORDER BY tenor_years DESC LIMIT 1
+                    ) lower_node ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT tenor_years, par_yield_pct
+                        FROM treasury_curve_observations
+                        WHERE curve_run_id = '{curve_run_id_sql}'
+                          AND observation_date = trace.trade_date
+                          AND par_yield_pct IS NOT NULL
+                          AND tenor_years >= trace.maturity_years
+                        ORDER BY tenor_years LIMIT 1
+                    ) upper_node ON TRUE
+                ), interpolated AS (
+                    SELECT *,
+                           CASE
+                             WHEN lower_tenor IS NULL OR upper_tenor IS NULL THEN NULL
+                             WHEN lower_tenor = upper_tenor THEN lower_yield
+                             ELSE lower_yield +
+                                  (maturity_years - lower_tenor) /
+                                  (upper_tenor - lower_tenor) * (upper_yield - lower_yield)
+                           END AS treasury_par_yield_pct
+                    FROM nodes
+                ), calculated AS (
+                    SELECT *,
+                           CASE WHEN yield_reversal_flagged OR trace_yield_pct IS NULL
+                                          OR treasury_par_yield_pct IS NULL THEN NULL
+                                ELSE (trace_yield_pct - treasury_par_yield_pct) * 100 END AS g_spread_bps
+                    FROM interpolated
+                )
+                SELECT '{snapshot_id_sql}' AS snapshot_id,
+                       isin, trade_date, maturity_date, maturity_years,
+                       trace_yield_pct, treasury_par_yield_pct,
+                       g_spread_bps,
+                       trace_observation_run_id, trace_retrieval_id, trace_record_hash,
+                       '{curve_run_id_sql}' AS curve_run_id,
+                       sha256(concat_ws('|', '{snapshot_id_sql}', isin,
+                           cast(trade_date AS VARCHAR), coalesce(cast(maturity_date AS VARCHAR), ''),
+                           coalesce(cast(trace_yield_pct AS VARCHAR), ''),
+                           coalesce(cast(treasury_par_yield_pct AS VARCHAR), ''),
+                           coalesce(cast(g_spread_bps AS VARCHAR), ''),
+                           coalesce(trace_retrieval_id, ''), cast(yield_reversal_flagged AS VARCHAR),
+                           '{curve_run_id_sql}', '{POLICY_VERSION}')) AS record_hash,
+                       coalesce(yield_reversal_flagged, FALSE) AS yield_reversal_flagged
+                FROM calculated"""
+            connection.execute(
+                """INSERT INTO bond_spread_observations (
+                       snapshot_id, isin, trade_date, maturity_date, maturity_years,
+                       trace_yield_pct, treasury_par_yield_pct, g_spread_bps,
+                       trace_observation_run_id, trace_retrieval_id, trace_record_hash,
+                       curve_run_id, record_hash, yield_reversal_flagged
+                   ) """ + mapping_query
             )
-            record_hash = hashlib.sha256(
-                json.dumps(digest_fields, default=str, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()
-            spread_rows.append((
-                snapshot_id, row.get("isin"), row.get("trade_date"),
-                row.get("maturity_date"), row.get("maturity_years"),
-                row.get("yield_pct"), row.get("treasury_par_yield_pct"),
-                row.get("g_spread_bps"), row.get("trace_observation_run_id"),
-                row.get("trace_retrieval_id"), row.get("trace_record_hash"),
-                curve_run_id, record_hash, bool(row.get("yield_reversal_flagged")),
-            ))
+            year_stats = connection.execute(
+                """SELECT count(*), count(*) FILTER (WHERE g_spread_bps IS NOT NULL),
+                          count(*) FILTER (WHERE yield_reversal_flagged)
+                   FROM bond_spread_observations
+                   WHERE snapshot_id=? AND trade_date >= ? AND trade_date < ?""",
+                [snapshot_id, date(year, 1, 1), date(year + 1, 1, 1)],
+            ).fetchone()
+            print(
+                f"Completed year {year} ({year_index}/{len(years)}): "
+                f"{year_stats[0]:,} rows, {year_stats[1]:,} matched spreads, "
+                f"{year_stats[2]:,} reversal flags excluded.",
+                flush=True,
+            )
+        counts = connection.execute(
+            """SELECT count(*), count(*) FILTER (WHERE g_spread_bps IS NOT NULL),
+                      count(*) FILTER (WHERE yield_reversal_flagged)
+               FROM bond_spread_observations WHERE snapshot_id=?""",
+            [snapshot_id],
+        ).fetchone()
+        row_count, matched, flagged_count = (int(value or 0) for value in counts)
         parquet_sql = str(parquet_path.resolve()).replace("'", "''")
         manifest = {
             "snapshot_id": snapshot_id,
@@ -220,9 +262,7 @@ def build_spread_snapshot(
             "cleaning_policy_version": series_clean_report["policy_version"],
             "yield_spike_threshold_bps": yield_spike_threshold_bps,
             "yield_reversal_spikes_flagged": series_clean_report["reversal_spikes_flagged"]["yield"],
-            "yield_reversal_spikes_excluded_from_g_spread": sum(
-                bool(row.get("yield_reversal_flagged")) for row in mapped
-            ),
+            "yield_reversal_spikes_excluded_from_g_spread": flagged_count,
             "clean_parquet_path": str(clean_path.resolve()),
             "clean_parquet_sha256": clean_hash,
             "curve_run_id": curve_run_id,
@@ -234,23 +274,12 @@ def build_spread_snapshot(
             "interpolation_policy": POLICY_VERSION,
             "spread_definition": "(clean TRACE last-sale yield - interpolated Treasury par yield) * 100",
             "spread_unit": "basis points",
-            "row_count": len(mapped),
+            "row_count": row_count,
             "matched_spread_count": matched,
-            "unmatched_or_invalid_count": len(mapped) - matched,
+            "unmatched_or_invalid_count": row_count - matched,
             "parquet_path": str(parquet_path.resolve()),
         }
 
-        connection.execute("BEGIN TRANSACTION")
-        print("Writing immutable snapshot, Parquet output, and manifest...", flush=True)
-        connection.executemany(
-            """INSERT INTO bond_spread_observations (
-                   snapshot_id, isin, trade_date, maturity_date, maturity_years,
-                   trace_yield_pct, treasury_par_yield_pct, g_spread_bps,
-                   trace_observation_run_id, trace_retrieval_id, trace_record_hash,
-                   curve_run_id, record_hash, yield_reversal_flagged
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            spread_rows,
-        )
         connection.execute(
             """INSERT INTO spread_snapshot_runs VALUES (
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
@@ -258,16 +287,18 @@ def build_spread_snapshot(
             [
                 snapshot_id, trace_run_id, str(trace_meta[0]), trace_meta[1],
                 curve_run_id, curve_meta[0], curve_meta[1], str(clean_path.resolve()),
-                clean_hash, POLICY_VERSION, generated_at, len(mapped), matched,
+                clean_hash, POLICY_VERSION, generated_at, row_count, matched,
                 str(parquet_path.resolve()), str(manifest_path.resolve()),
             ],
         )
+        print("Exporting spread rows to Parquet...", flush=True)
         connection.execute(
             f"""COPY (
                 SELECT * FROM bond_spread_observations
                 WHERE snapshot_id='{snapshot_id}' ORDER BY isin, trade_date
             ) TO '{parquet_sql}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
         )
+        print("Parquet export complete; writing manifest...", flush=True)
         manifest["parquet_sha256"] = hashlib.sha256(parquet_path.read_bytes()).hexdigest()
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         connection.commit()

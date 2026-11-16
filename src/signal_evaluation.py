@@ -59,6 +59,77 @@ def _correlation(left: list[float], right: list[float], *, spearman: bool = Fals
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def _load_rebalance_financing_history(
+    database_path: Path, isins: list[str]
+) -> tuple[str, list[tuple[date, float]], dict[str, list[tuple[date, float]]]]:
+    """Load 1-month Treasury rates and latest snapshot G-spreads for the portfolio universe."""
+    connection = duckdb.connect(str(database_path), read_only=True)
+    try:
+        snapshot = connection.execute(
+            "SELECT snapshot_id FROM spread_snapshot_runs ORDER BY generated_at_utc DESC LIMIT 1"
+        ).fetchone()
+        if not snapshot:
+            raise ValueError("No G-spread snapshot is available. Build a G-spread snapshot first.")
+        snapshot_id = str(snapshot[0])
+        treasury_rows = connection.execute(
+            """SELECT observation_date, par_yield_pct FROM (
+                   SELECT o.observation_date, o.par_yield_pct,
+                          row_number() OVER (
+                              PARTITION BY o.observation_date ORDER BY r.retrieved_at_utc DESC
+                          ) AS vintage_rank
+                   FROM treasury_curve_observations o
+                   JOIN treasury_curve_runs r USING (curve_run_id)
+                   WHERE abs(o.tenor_years - ?) < 0.00000001
+                     AND o.par_yield_pct IS NOT NULL
+               ) WHERE vintage_rank=1 ORDER BY observation_date""",
+            [1.0 / 12.0],
+        ).fetchall()
+        if not isins:
+            raise ValueError("No bonds are available for the rebalanced financing comparison.")
+        placeholders = ",".join("?" for _ in isins)
+        spread_rows = connection.execute(
+            f"""SELECT upper(isin), trade_date, g_spread_bps
+                FROM bond_spread_observations
+                WHERE snapshot_id=? AND upper(isin) IN ({placeholders})
+                  AND g_spread_bps IS NOT NULL
+                ORDER BY upper(isin), trade_date""",
+            [snapshot_id, *isins],
+        ).fetchall()
+    except duckdb.Error as error:
+        raise ValueError(
+            "Treasury history and a G-spread snapshot are required for the financing comparison."
+        ) from error
+    finally:
+        connection.close()
+    treasury_history = [(observed_date, float(rate)) for observed_date, rate in treasury_rows]
+    if not treasury_history:
+        raise ValueError("No 1-month Treasury rate history is stored.")
+    spreads_by_isin: dict[str, list[tuple[date, float]]] = defaultdict(list)
+    for isin, observed_date, spread_bps in spread_rows:
+        spreads_by_isin[isin].append((observed_date, float(spread_bps)))
+    return snapshot_id, treasury_history, dict(spreads_by_isin)
+
+
+def _annualized_period_volatility(rows: list[dict[str, Any]], return_field: str) -> float | None:
+    """Annualize volatility from non-overlapping raw holding-period log returns."""
+    observations: list[tuple[float, int]] = []
+    for row in rows:
+        value = row.get(return_field)
+        days = int(row.get("holding_period_days") or 0)
+        if value is None or days <= 0:
+            continue
+        simple_return = float(value) / 100.0 if return_field.endswith("_pct") else float(value)
+        if simple_return <= -1.0:
+            continue
+        observations.append((math.log1p(simple_return) / days, days))
+    total_days = sum(days for _, days in observations)
+    if len(observations) < 2 or total_days <= 1:
+        return None
+    mean_daily_log = sum(value * days for value, days in observations) / total_days
+    variance = sum(days * (value - mean_daily_log) ** 2 for value, days in observations) / (total_days - 1)
+    return 100.0 * math.sqrt(max(0.0, variance) * 365.25)
+
+
 def _historical_percentile(
     history: list[tuple[date, float]],
     value: float,
@@ -96,6 +167,8 @@ def evaluate_nelson_siegel_signal(
     partition_field: str = "sector",
     percentile_lookback_days: int = 1095,
     minimum_history_observations: int = 20,
+    include_financing_cost: bool = False,
+    maximum_financing_rate_age_days: int = 7,
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Evaluate a Nelson-Siegel residual or historical partition percentile.
@@ -107,9 +180,10 @@ def evaluate_nelson_siegel_signal(
     Partition percentile scores rank each partition's current median TRACE
     yield against strictly prior values in a trailing lookback. As no Treasury
     curve is joined here, that level is explicitly a spread proxy. The event-study
-    and rebalanced series use a duration-adjusted yield-only
-    return proxy; the maximum-horizon strategy also reports historical total
-    bond returns where prices and coupon data are available.
+    and rebalanced series use raw, non-demeaned portfolio returns. Rebalanced
+    results can subtract a 1-month Treasury plus bond G-spread financing proxy
+    from the long-only leg; the maximum-horizon strategy also reports historical
+    total bond returns where prices and coupon data are available.
     """
     if end_date < start_date:
         raise ValueError("end_date must be on or after start_date")
@@ -126,6 +200,8 @@ def evaluate_nelson_siegel_signal(
         raise ValueError("long_short_quantile must be between 0 and 0.5")
     if percentile_lookback_days < 1 or minimum_history_observations < 1:
         raise ValueError("percentile lookback and minimum history must be positive")
+    if maximum_financing_rate_age_days < 0:
+        raise ValueError("maximum_financing_rate_age_days must be non-negative")
     if not bond_list_path.exists():
         raise FileNotFoundError(f"Bond list not found: {bond_list_path}")
     if not database_path.exists():
@@ -199,6 +275,19 @@ def evaluate_nelson_siegel_signal(
     if not bonds:
         raise ValueError("No bonds with valid ISIN and maturity date were found")
 
+    funding_snapshot_id: str | None = None
+    treasury_funding_rates: list[tuple[date, float]] = []
+    g_spreads_by_isin: dict[str, list[tuple[date, float]]] = {}
+    if include_financing_cost:
+        funding_snapshot_id, treasury_funding_rates, g_spreads_by_isin = (
+            _load_rebalance_financing_history(database_path, list(bonds))
+        )
+    treasury_funding_dates = [observed_date for observed_date, _ in treasury_funding_rates]
+    g_spread_dates_by_isin = {
+        isin: [observed_date for observed_date, _ in rows]
+        for isin, rows in g_spreads_by_isin.items()
+    }
+
     query_start = start_date - timedelta(days=max(
         maximum_signal_age_days,
         maximum_price_age_days,
@@ -268,6 +357,8 @@ def evaluate_nelson_siegel_signal(
     }
     nav_proxy = 100.0
     total_return_nav_proxy = 100.0
+    long_only_gross_nav_proxy = 100.0
+    long_only_net_nav_proxy = 100.0
     partition_history: dict[str, list[tuple[date, float]]] = defaultdict(list)
     stale_signal_yield_bonds = 0
     stale_first_prints_excluded = 0
@@ -597,7 +688,8 @@ def evaluate_nelson_siegel_signal(
         # Next-period rebalanced portfolio series; positions are formed at T
         # and measured on the next observed TRACE yield date.
         date_position = date_index - 1
-        if date_position + 1 < len(ordered_signal_dates) and long_leg and short_leg:
+        if (start_date <= as_of <= end_date
+                and date_position + 1 < len(ordered_signal_dates) and long_leg and short_leg):
             next_signal_date = ordered_signal_dates[date_position + 1]
             # Accumulate raw observed daily moves for portfolio P&L. De-meaning
             # is reserved for signal correlation and horizon analysis.
@@ -649,7 +741,61 @@ def evaluate_nelson_siegel_signal(
                 long_contribution = sum(step_total_return_by_isin.get(row["isin"], 0.0) / len(long_leg) for row in long_leg)
                 short_contribution = sum(step_total_return_by_isin.get(row["isin"], 0.0) / len(short_leg) for row in short_leg)
                 total_return_contribution_pct = 100.0 * (long_contribution - short_contribution)
-                total_return_nav_proxy *= 1.0 + (long_contribution - short_contribution)
+                long_short_return = long_contribution - short_contribution
+                total_return_nav_proxy *= 1.0 + long_short_return
+                long_only_gross_nav_proxy *= 1.0 + long_contribution
+
+                financing_cost_by_isin: dict[str, float] = {}
+                if include_financing_cost:
+                    for position in long_leg:
+                        isin = position["isin"]
+                        spread_history = g_spreads_by_isin.get(isin, [])
+                        spread_dates = g_spread_dates_by_isin.get(isin, [])
+                        if not spread_history:
+                            continue
+                        current_date = as_of
+                        financing_log_cost = 0.0
+                        has_complete_cost = True
+                        while current_date < next_signal_date:
+                            interval_end = min(current_date + timedelta(days=1), next_signal_date)
+                            interval_days = (interval_end - current_date).days
+                            treasury_index = bisect_right(treasury_funding_dates, current_date) - 1
+                            spread_index = bisect_right(spread_dates, current_date) - 1
+                            if treasury_index < 0 or spread_index < 0:
+                                has_complete_cost = False
+                                break
+                            treasury_date, treasury_rate_pct = treasury_funding_rates[treasury_index]
+                            spread_date, spread_bps = spread_history[spread_index]
+                            if ((current_date - treasury_date).days > maximum_financing_rate_age_days
+                                    or (current_date - spread_date).days > maximum_financing_rate_age_days):
+                                has_complete_cost = False
+                                break
+                            funding_rate_pct = treasury_rate_pct + spread_bps / 100.0
+                            simple_financing_return = funding_rate_pct / 100.0 * interval_days / 365.0
+                            if simple_financing_return <= -1.0:
+                                has_complete_cost = False
+                                break
+                            financing_log_cost += math.log1p(simple_financing_return)
+                            current_date = interval_end
+                        if has_complete_cost:
+                            financing_cost_by_isin[isin] = math.expm1(financing_log_cost)
+
+                financing_coverage_pct = (
+                    100.0 * len(financing_cost_by_isin) / len(long_leg) if long_leg else 0.0
+                )
+                long_only_financing_cost = (
+                    sum(financing_cost_by_isin.values()) / len(long_leg)
+                    if len(financing_cost_by_isin) == len(long_leg) else None
+                )
+                long_only_net_return = (
+                    long_contribution - long_only_financing_cost
+                    if long_only_financing_cost is not None else None
+                )
+                if long_only_net_return is not None and long_only_net_return > -1.0:
+                    long_only_net_nav_proxy *= 1.0 + long_only_net_return
+                long_step_coverage = 100.0 * sum(
+                    row["isin"] in step_total_return_by_isin for row in long_leg
+                ) / len(long_leg)
                 rebalance_results.append({
                     "signal_date": as_of.isoformat(),
                     "holding_date": next_signal_date.isoformat(),
@@ -659,9 +805,24 @@ def evaluate_nelson_siegel_signal(
                     "side_adjusted_yield_return_proxy_bps": period_return_bps,
                     "yield_change_coverage_pct": coverage_pct,
                     "yield_only_nav_index": nav_proxy,
+                    "long_short_total_return_pct": 100.0 * long_short_return,
+                    "long_short_total_return_nav_index": total_return_nav_proxy,
                     "covered_total_return_contribution_pct": total_return_contribution_pct,
                     "total_return_coverage_pct": step_coverage,
                     "covered_total_return_nav_index": total_return_nav_proxy,
+                    "long_only_gross_return_pct": 100.0 * long_contribution,
+                    "long_only_gross_nav_index": long_only_gross_nav_proxy,
+                    "long_only_financing_cost_pct": (
+                        100.0 * long_only_financing_cost if long_only_financing_cost is not None else None
+                    ),
+                    "long_only_net_return_pct": (
+                        100.0 * long_only_net_return if long_only_net_return is not None else None
+                    ),
+                    "long_only_net_nav_index": (
+                        long_only_net_nav_proxy if long_only_net_return is not None else None
+                    ),
+                    "long_only_total_return_coverage_pct": long_step_coverage,
+                    "financing_coverage_pct": financing_coverage_pct,
                 })
         if on_progress is not None:
             on_progress(date_index, len(ordered_signal_dates))
@@ -719,6 +880,10 @@ def evaluate_nelson_siegel_signal(
     valid_return_coverages = [row["long_short_total_return_coverage_pct"] for row in daily_results
                               if row["long_short_total_return_coverage_pct"] is not None]
     valid_rebalance_returns = [row["side_adjusted_yield_return_proxy_bps"] for row in rebalance_results]
+    valid_long_only_net_indices = [
+        row["long_only_net_nav_index"] for row in rebalance_results
+        if row["long_only_net_nav_index"] is not None
+    ]
     metadata = {
         "signal_id": predictor_id,
         "signal_name": "Nelson-Siegel ticker residual"
@@ -763,7 +928,13 @@ def evaluate_nelson_siegel_signal(
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
         "strategy_return_definition": "equal-weighted bonds in the top signal quantile long and bottom quantile short; percentile signals select whole partition tails; fixed modified-duration yield-only return proxy uses raw observed yield changes without cross-sectional demeaning; missing changes contribute zero and coverage is reported",
         "total_return_definition": "at maximum horizon, equal-weighted long minus short fixed-rate bond total return; unpriced positions contribute zero at their target weight and coverage is reported",
-        "rebalanced_series_definition": "daily signal selection held to next TRACE signal date; show covered total-return contribution and duration-adjusted yield-change proxy using raw observed yield changes without cross-sectional demeaning; missing position contributions are zero and coverage is reported",
+        "rebalanced_series_definition": "daily signal selection held to next TRACE signal date; report raw duration-adjusted yield-change long-short proxy, covered total-return long-short contribution, long-only gross total return, and long-only total return net of 1-month Treasury plus bond G-spread financing; no cross-sectional demeaning is applied to portfolio returns; missing position and financing coverage are reported",
+        "rebalanced_financing_definition": (
+            "for each long-only position, accrue the latest 1-month Treasury par yield plus the latest bond G-spread known at each interval start using ACT/365 simple accrual; G-spread observations are from the latest immutable spread snapshot"
+            if include_financing_cost else "not applied"
+        ),
+        "rebalanced_financing_snapshot_id": funding_snapshot_id,
+        "rebalanced_volatility_definition": "annualized volatility from non-overlapping raw holding-period log returns, with holding periods weighted by calendar days; no cross-sectional demeaning",
     }
     summary = {
         **metadata,
@@ -786,9 +957,22 @@ def evaluate_nelson_siegel_signal(
         "total_return_positive_date_fraction": float(np.mean(np.asarray(valid_total_returns) > 0)) if valid_total_returns else None,
         "mean_long_short_total_return_coverage_pct": float(np.mean(valid_return_coverages)) if valid_return_coverages else None,
         "rebalanced_periods": len(rebalance_results),
+        "rebalanced_financing_cost_included": include_financing_cost,
         "mean_rebalanced_period_yield_return_proxy_bps": float(np.mean(valid_rebalance_returns)) if valid_rebalance_returns else None,
         "rebalanced_yield_only_nav_index": rebalance_results[-1]["yield_only_nav_index"] if rebalance_results else 100.0,
         "rebalanced_covered_total_return_nav_index": rebalance_results[-1]["covered_total_return_nav_index"] if rebalance_results else 100.0,
+        "rebalanced_long_only_gross_nav_index": rebalance_results[-1]["long_only_gross_nav_index"] if rebalance_results else 100.0,
+        "rebalanced_long_only_net_nav_index": valid_long_only_net_indices[-1] if valid_long_only_net_indices else None,
+        "rebalanced_financing_snapshot_id": funding_snapshot_id,
+        "rebalanced_long_short_annualized_volatility_pct": _annualized_period_volatility(
+            rebalance_results, "long_short_total_return_pct"
+        ),
+        "rebalanced_long_only_gross_annualized_volatility_pct": _annualized_period_volatility(
+            rebalance_results, "long_only_gross_return_pct"
+        ),
+        "rebalanced_long_only_net_annualized_volatility_pct": _annualized_period_volatility(
+            rebalance_results, "long_only_net_return_pct"
+        ),
     }
     for rows in (daily_results, bond_results, rebalance_results):
         for row in rows:

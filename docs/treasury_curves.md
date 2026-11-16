@@ -48,7 +48,9 @@ run. The G-spread window lets you set the minimum isolated yield move flagged
 as a reversal (default 50 bp); flagged observations remain in the audit data
 but are excluded from matched G-spreads. The snapshot manifest records the
 threshold, cleaning run IDs, excluded count, and cleaned Parquet hash. Bond
-performance charting uses the latest built snapshot by default: for
+The build window reports each historical year as it calculates and stores
+spreads, then reports the Parquet export stage. Bond performance charting uses
+the latest built snapshot by default: for
 each bond, its latest G-spread known at the start of each interval is added to
 the short-rate funding series. The G-spread's date and age are shown in the
 time-series table, and the result summary records the snapshot ID. Disable the

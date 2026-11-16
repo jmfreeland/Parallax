@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import re
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, Qt
@@ -94,15 +95,40 @@ class SpreadSnapshotWindow(QMainWindow):
             self.output.setTextCursor(cursor)
             self.output.insertPlainText(text)
             self.output.ensureCursorVisible()
+            year_plan = re.search(r"by year \((\d+) years\)", text)
+            if year_plan:
+                years = int(year_plan.group(1))
+                self.progress.setRange(0, years)
+                self.progress.setValue(0)
+                self.status.setText(f"Calculating spread history: 0/{years} years")
+            completed_year = re.search(
+                r"Completed year (\d+) \((\d+)/(\d+)\): ([\d,]+) rows, ([\d,]+) matched spreads, ([\d,]+) reversal flags excluded",
+                text,
+            )
+            if completed_year:
+                year, completed, total = (
+                    int(completed_year.group(i)) for i in (1, 2, 3)
+                )
+                self.progress.setRange(0, total)
+                self.progress.setValue(completed)
+                self.status.setText(
+                    f"Calculated through {year}: {completed}/{total} years; "
+                    f"{completed_year.group(4)} rows, {completed_year.group(5)} matched spreads."
+                )
+            if "Exporting spread rows to Parquet" in text:
+                self.progress.setRange(0, 0)
+                self.status.setText("Exporting the completed spread rows to Parquet...")
             status_by_message = (
                 ("Scanning raw field values", "Cleaning and scanning TRACE history..."),
                 ("Loaded ", "Loading cleaned observation rows..."),
-                ("Mapped ", "Mapping clean yields to Treasury curves..."),
-                ("Writing immutable snapshot", "Writing Parquet output and manifest..."),
+                ("Applying reversal checks", "Checking cleaned yield reversals..."),
+                ("Calculating and inserting spreads", "Calculating and storing spreads year by year..."),
             )
-            for marker, status in status_by_message:
-                if marker in text:
-                    self.status.setText(status)
+            if (not completed_year and not year_plan
+                    and "Exporting spread rows to Parquet" not in text):
+                for marker, status in status_by_message:
+                    if marker in text:
+                        self.status.setText(status)
 
     def _finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         self._read_output()

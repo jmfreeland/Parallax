@@ -38,6 +38,8 @@ PREPROCESSED_DIR = TRACE_DIR / "preprocessed"
 def _measure_sql(measure: str) -> tuple[str, str]:
     if measure == "Yield":
         return "clean_last_sale_yield", "Yield (%)"
+    if measure == "G-spread":
+        return "g_spread_bps", "G-spread (bp)"
     return "clean_price", "Price (per 100 par)"
 
 
@@ -291,6 +293,27 @@ def load_bond_data(
         if not meta:
             raise ValueError(f"No run metadata found for {isin}.")
 
+        spread_snapshot_id = None
+        if measure == "G-spread":
+            try:
+                snapshot = connection.execute(
+                    """SELECT snapshot_id FROM spread_snapshot_runs
+                       WHERE trace_run_id=? ORDER BY generated_at_utc DESC LIMIT 1""",
+                    [run_info["run_id"]],
+                ).fetchone()
+            except duckdb.CatalogException as error:
+                raise ValueError("No G-spread snapshot is available. Build a G-spread snapshot first.") from error
+            if not snapshot:
+                raise ValueError("No G-spread snapshot is available for this TRACE run.")
+            spread_snapshot_id = snapshot[0]
+            source_sql = "bond_spread_observations"
+            source_filter = "isin=? AND snapshot_id=? AND NOT yield_reversal_flagged"
+            source_params = [isin, spread_snapshot_id]
+        else:
+            source_sql = "read_parquet(?)"
+            source_filter = "isin=?"
+            source_params = [preprocessing["clean_parquet"], isin]
+
         summary = connection.execute(
             """SELECT count(*), min(trade_date), max(trade_date),
                       count(*) FILTER (WHERE price_clean_status='zero_is_missing'),
@@ -306,13 +329,13 @@ def load_bond_data(
         ).fetchone()
         daily = connection.execute(
             f"""SELECT trade_date, {value_sql} AS value
-                FROM read_parquet(?) WHERE isin = ? ORDER BY trade_date""",
-            [preprocessing["clean_parquet"], isin],
+                FROM {source_sql} WHERE {source_filter} ORDER BY trade_date""",
+            source_params,
         ).fetchall()
         partitions = connection.execute(
             f"""WITH clean AS (
                     SELECT trade_date, {value_sql} AS value
-                    FROM read_parquet(?) WHERE isin = ?
+                    FROM {source_sql} WHERE {source_filter}
                 ), valid AS (
                     SELECT trade_date, value FROM clean WHERE value IS NOT NULL
                 ), rolling AS (
@@ -343,7 +366,7 @@ def load_bond_data(
                     s.minimum, s.maximum, l.vol_63, l.vol_252, l.mom_63, l.mom_252
                 FROM summary s JOIN latest l USING (bucket)
                 WHERE l.row_num = 1 ORDER BY s.bucket""",
-            [preprocessing["clean_parquet"], isin],
+            source_params,
         ).fetchall()
         return {
             "isin": isin,
@@ -359,6 +382,7 @@ def load_bond_data(
             "null_price_count": int(summary[7] or 0),
             "null_yield_count": int(summary[8] or 0),
             "value_label": value_label,
+            "spread_snapshot_id": spread_snapshot_id,
             "daily": [(row[0], row[1]) for row in daily if row[1] is not None],
             "partitions": partitions,
         }
@@ -873,7 +897,7 @@ class TraceHistoryInspector(QMainWindow):
         controls.addWidget(self.group_value, 1)
         controls.addWidget(QLabel("Measure"))
         self.measure = QComboBox()
-        self.measure.addItems(["Yield", "Price"])
+        self.measure.addItems(["Yield", "Price", "G-spread"])
         self.measure.currentTextChanged.connect(self.refresh)
         controls.addWidget(self.measure)
         controls.addWidget(QLabel("Time interval"))
@@ -1000,6 +1024,11 @@ class TraceHistoryInspector(QMainWindow):
 
     def _view_changed(self, mode: str) -> None:
         individual = mode == "Individual bond"
+        spread_item = self.measure.model().item(2)
+        if spread_item is not None:
+            spread_item.setEnabled(individual)
+        if not individual and self.measure.currentText() == "G-spread":
+            self.measure.setCurrentText("Yield")
         for widget in (self.bond_label, self.bond):
             widget.setVisible(individual)
         for widget in (self.group_by_label, self.group_by, self.group_value_label, self.group_value):
@@ -1134,12 +1163,14 @@ class TraceHistoryInspector(QMainWindow):
                 f"sentinel yields {self.data['sentinel_yield_count']:,}; "
                 f"null yields {self.data['null_yield_count']:,}"
             )
-        else:
+        elif self.measure.currentText() == "Price":
             excl_label = (
                 f"zero prices {self.data['zero_price_count']:,}; "
                 f"sentinel prices {self.data['sentinel_price_count']:,}; "
                 f"null prices {self.data['null_price_count']:,}"
             )
+        else:
+            excl_label = "latest cleaned-TRACE G-spread snapshot; reversal-flagged observations excluded"
         valid = len(self.data["daily"])
         self.summary.setText(
             f"{self.data['issuer']} | {isin} | {self.measure.currentText()} | "
@@ -1147,7 +1178,9 @@ class TraceHistoryInspector(QMainWindow):
             f"{excl_label} | first {self.data['first_date']} | last {self.data['last_date']}"
         )
         self.statusBar().showMessage(
-            f"Loaded {valid:,} valid observations. Rolling volatility and momentum use prior observed trades."
+            f"Loaded {valid:,} valid observations"
+            + (f" from spread snapshot {self.data['spread_snapshot_id']}" if self.data.get("spread_snapshot_id") else "")
+            + ". Rolling volatility and momentum use prior observed trades."
         )
 
     def _fill_stats(self, rows: list[tuple[Any, ...]], group_mode: bool) -> None:

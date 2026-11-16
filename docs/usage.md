@@ -194,21 +194,22 @@ reports coverage and does not silently reweight missing positions. Total return
 uses the current synthetic coupon schedule and excludes costs, taxes, defaults,
 and coupon reinvestment.
 
-The **Rebalanced portfolio** tab plots two indices for holdings selected at
-each signal date and held through the next observed signal date: a covered
-total-return contribution index and a duration-adjusted yield-only proxy. The
-proxy accumulates the intervening daily changes (cross-sectionally de-meaned
-for Nelson-Siegel and raw for the percentile mode), then applies modified
-duration and the long/short side.
-Unpriced positions contribute zero to the covered total-return index and the
-table reports price coverage. TRACE history has no Treasury benchmark, so
-yield levels and changes are proxies, not benchmark-relative option-adjusted
-spreads. Signal dates use the supplied bond
-list rather than historical index membership. The TRACE store does not retain
-immutable observation vintages, so later corrections can affect this
-retrospective test. Event windows overlap, so horizon averages are descriptive
-and are not independent or annualized performance estimates. Export the date
-report JSON and bond-date observation CSV for further analysis.
+The **Rebalanced portfolio** tab compares holdings selected at each signal
+date and held through the next observed signal date. It plots the raw
+long-short total-return contribution, the long-only leg gross and net of
+financing, and the duration-adjusted yield-only long-short proxy. Portfolio
+returns are not cross-sectionally de-meaned. The financing proxy accrues the
+latest 1-month Treasury rate plus each bond's G-spread from the latest spread
+snapshot using ACT/365; a checkbox can disable this adjustment. Annualized
+volatility is calculated from the raw non-overlapping holding-period returns.
+Unpriced bond returns contribute zero and coverage is reported. TRACE history
+has no Treasury benchmark for yield changes, so those remain proxies. Signal
+dates use the supplied bond list rather than historical index membership. The
+TRACE store does not retain immutable observation vintages, so later
+corrections can affect this retrospective test. Event windows overlap, so
+horizon averages are descriptive and are not independent or annualized
+performance estimates. Export the date report JSON and bond-date observation
+CSV for further analysis.
 
 ## Portfolio horizon P&L
 

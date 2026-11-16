@@ -13,6 +13,7 @@ from PySide6.QtCore import QDate, QPointF, QRectF, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDoubleSpinBox,
@@ -296,7 +297,7 @@ class SignalReturnScatterChart(QWidget):
 
 
 class RebalancedPortfolioChart(QWidget):
-    """Plot the compounded daily-rebalanced yield-only return proxy."""
+    """Plot raw rebalanced portfolio returns and financing-adjusted long-only returns."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -317,9 +318,20 @@ class RebalancedPortfolioChart(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No adjacent signal dates had eligible long and short holdings.")
             painter.end()
             return
-        proxy_values = [float(row["yield_only_nav_index"]) for row in rows]
-        total_return_values = [float(row["covered_total_return_nav_index"]) for row in rows]
-        values = proxy_values + total_return_values
+        series = (
+            ("covered_total_return_nav_index", "Long-short total return", "#38bdf8"),
+            ("long_only_gross_nav_index", "Long-only gross", "#fbbf24"),
+            ("long_only_net_nav_index", "Long-only net of financing", "#fb7185"),
+            ("yield_only_nav_index", "Yield-only L/S proxy", "#34d399"),
+        )
+        values = [
+            float(row[key]) for row in rows for key, _, _ in series if row.get(key) is not None
+        ]
+        if not values:
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No rebalanced return observations are available.")
+            painter.end()
+            return
         minimum, maximum = min(values), max(values)
         pad = max(0.1, (maximum - minimum) * 0.12)
         minimum, maximum = minimum - pad, maximum + pad
@@ -329,7 +341,7 @@ class RebalancedPortfolioChart(QWidget):
         y_map = lambda value: bottom - (value - minimum) / (maximum - minimum) * (bottom - top)
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 24), Qt.AlignmentFlag.AlignLeft,
-                         "Rebalanced portfolio indices; missing bond returns contribute zero and coverage is reported")
+                         "Raw rebalanced indices; financing-adjusted long-only comparison; no de-meaning")
         for step in range(5):
             fraction = step / 4
             value = minimum + fraction * (maximum - minimum)
@@ -338,27 +350,33 @@ class RebalancedPortfolioChart(QWidget):
             painter.drawLine(QPointF(left, y), QPointF(right, y))
             painter.setPen(QColor("#94a3b8"))
             painter.drawText(QRectF(4, y - 9, 66, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{value:.2f}")
-        for series, color in ((total_return_values, "#38bdf8"), (proxy_values, "#34d399")):
+        for field, _label, color in series:
             path = QPainterPath()
-            for index, value in enumerate(series):
-                point = QPointF(x_map(index), y_map(value))
-                if index == 0:
+            drawing = False
+            for index, row in enumerate(rows):
+                value = row.get(field)
+                if value is None:
+                    drawing = False
+                    continue
+                point = QPointF(x_map(index), y_map(float(value)))
+                if not drawing:
                     path.moveTo(point)
                 else:
                     path.lineTo(point)
+                drawing = True
             painter.setPen(QPen(QColor(color), 2.5))
             painter.drawPath(path)
         painter.setPen(QColor("#94a3b8"))
         painter.drawText(QRectF(left, bottom + 7, right - left, 20), Qt.AlignmentFlag.AlignCenter,
                          f"{rows[0]['holding_date']}  to  {rows[-1]['holding_date']}  |  Initial index 100")
-        painter.setPen(QPen(QColor("#38bdf8"), 2.5))
-        painter.drawLine(QPointF(left + 8, self.height() - 13), QPointF(left + 30, self.height() - 13))
-        painter.setPen(QColor("#e2e8f0"))
-        painter.drawText(QRectF(left + 36, self.height() - 22, 210, 18), Qt.AlignmentFlag.AlignLeft, "Covered total-return contribution")
-        painter.setPen(QPen(QColor("#34d399"), 2.5))
-        painter.drawLine(QPointF(left + 270, self.height() - 13), QPointF(left + 292, self.height() - 13))
-        painter.setPen(QColor("#e2e8f0"))
-        painter.drawText(QRectF(left + 298, self.height() - 22, 190, 18), Qt.AlignmentFlag.AlignLeft, "Yield-only proxy")
+        legend_width = (right - left) / len(series)
+        for index, (_field, label, color) in enumerate(series):
+            legend_x = left + index * legend_width
+            painter.setPen(QPen(QColor(color), 2.5))
+            painter.drawLine(QPointF(legend_x, self.height() - 13), QPointF(legend_x + 18, self.height() - 13))
+            painter.setPen(QColor("#e2e8f0"))
+            painter.drawText(QRectF(legend_x + 24, self.height() - 22, legend_width - 28, 18),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
         painter.end()
 
 
@@ -589,13 +607,28 @@ class SignalEvaluationWindow(QMainWindow):
 
         portfolio_page = QWidget()
         portfolio_layout = QVBoxLayout(portfolio_page)
+        self.rebalance_financing = QCheckBox(
+            "Apply 1-month Treasury + bond G-spread financing to long-only returns"
+        )
+        self.rebalance_financing.setChecked(True)
+        self.rebalance_financing.setToolTip(
+            "Proxy for financing: ACT/365 accrual on the latest 1-month Treasury rate plus the bond's latest G-spread. "
+            "Uses the latest stored G-spread snapshot."
+        )
+        portfolio_layout.addWidget(self.rebalance_financing)
+        self.rebalance_summary = QLabel(
+            "Annualized volatility will be shown after evaluation. Funding uses the latest available G-spread snapshot."
+        )
+        self.rebalance_summary.setWordWrap(True)
+        portfolio_layout.addWidget(self.rebalance_summary)
         self.portfolio_chart = RebalancedPortfolioChart()
         portfolio_layout.addWidget(self.portfolio_chart, 2)
-        self.rebalance_table = QTableWidget(0, 9)
+        self.rebalance_table = QTableWidget(0, 13)
         self.rebalance_table.setHorizontalHeaderLabels([
             "Signal date", "Holding date", "Period days", "Long positions", "Short positions",
-            "Yield-only return proxy (bps)", "Yield-change coverage (%)",
-            "Covered total-return contribution (%)", "Total-return coverage (%)",
+            "L/S total return (%)", "Yield-only L/S proxy (bps)", "Long-only gross (%)",
+            "Financing cost (%)", "Long-only net (%)", "Financing coverage (%)",
+            "Long-leg return coverage (%)", "L/S return coverage (%)",
         ])
         self.rebalance_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.rebalance_table.horizontalHeader().setStretchLastSection(True)
@@ -749,6 +782,7 @@ class SignalEvaluationWindow(QMainWindow):
             "partition_field": self.partition_field.currentText() or "sector",
             "percentile_lookback_days": self.percentile_lookback.value(),
             "minimum_history_observations": self.minimum_history.value(),
+            "include_financing_cost": self.rebalance_financing.isChecked(),
         }
         self.run_button.setEnabled(False)
         self.export_button.setEnabled(False)
@@ -860,8 +894,10 @@ class SignalEvaluationWindow(QMainWindow):
             rebalance_rows,
             (
                 "signal_date", "holding_date", "holding_period_days", "long_positions", "short_positions",
-                "side_adjusted_yield_return_proxy_bps", "yield_change_coverage_pct",
-                "covered_total_return_contribution_pct", "total_return_coverage_pct",
+                "long_short_total_return_pct", "side_adjusted_yield_return_proxy_bps",
+                "long_only_gross_return_pct", "long_only_financing_cost_pct",
+                "long_only_net_return_pct", "financing_coverage_pct",
+                "long_only_total_return_coverage_pct", "total_return_coverage_pct",
             ),
         )
         if date_rows:
@@ -870,6 +906,31 @@ class SignalEvaluationWindow(QMainWindow):
         else:
             self.detail_table.setRowCount(0)
         summary = result["summary"]
+        def format_volatility(value: Any) -> str:
+            return f"{float(value):.2f}%" if value is not None else "n/a"
+        def format_index(value: Any) -> str:
+            return f"{float(value):.2f}" if value is not None else "n/a"
+
+        if summary["rebalanced_financing_cost_included"]:
+            self.rebalance_summary.setText(
+                f"Long-short annualized volatility: "
+                f"{format_volatility(summary['rebalanced_long_short_annualized_volatility_pct'])} | "
+                f"Long-only gross/net annualized volatility: "
+                f"{format_volatility(summary['rebalanced_long_only_gross_annualized_volatility_pct'])} / "
+                f"{format_volatility(summary['rebalanced_long_only_net_annualized_volatility_pct'])} | "
+                f"Long-only net ending index: "
+                f"{format_index(summary['rebalanced_long_only_net_nav_index'])} | "
+                f"Funding snapshot: {str(summary['rebalanced_financing_snapshot_id'])[:8]} | "
+                "1-month Treasury + bond G-spread; raw period returns, without de-meaning."
+            )
+        else:
+            self.rebalance_summary.setText(
+                f"Long-short annualized volatility: "
+                f"{format_volatility(summary['rebalanced_long_short_annualized_volatility_pct'])} | "
+                f"Long-only gross annualized volatility: "
+                f"{format_volatility(summary['rebalanced_long_only_gross_annualized_volatility_pct'])} | "
+                "Financing cost disabled; long-only net comparison is omitted."
+            )
         percentile_mode = summary["signal_id"] == PREDICTOR_PARTITION_PERCENTILE
 
         def display(value: Any, suffix: str = "") -> str:
@@ -908,13 +969,14 @@ class SignalEvaluationWindow(QMainWindow):
             f"on {summary['dates_with_total_return']} dates with priced positions (unpriced bonds contribute zero; mean leg coverage "
             f"{display(summary['mean_long_short_total_return_coverage_pct'], '%')}; positive on "
             f"{display(summary['total_return_positive_date_fraction'] * 100 if summary['total_return_positive_date_fraction'] is not None else None, '%')}). "
-            f"Rebalanced indices from 100: covered total-return contribution "
-            f"{display(summary['rebalanced_covered_total_return_nav_index'])}, yield-only proxy "
+            f"Rebalanced indices from 100: long-short total return "
+            f"{display(summary['rebalanced_covered_total_return_nav_index'])}, long-only net of financing "
+            f"{display(summary['rebalanced_long_only_net_nav_index'])}, yield-only proxy "
             f"{display(summary['rebalanced_yield_only_nav_index'])}, across {summary['rebalanced_periods']} periods. "
             f"{predictor_description}{outcome_description}{data_source_note}"
             "positive side-adjusted IC/performance is favorable. "
             "The horizon total return uses a synthetic coupon schedule, treats unpriced positions as zero contribution, and excludes costs/defaults; horizon windows overlap. "
-            "The rebalanced index is a duration-adjusted yield-only proxy. Past TRACE revisions and the current bond-list snapshot may affect results."
+            "Rebalanced portfolio returns use raw, non-demeaned holding-period returns. See the Rebalanced portfolio tab for financing coverage and annualized volatility. Past TRACE revisions and the current bond-list snapshot may affect results."
         )
         self.status.setText(
             f"Completed {summary['signal_dates']:,} signal dates; "
