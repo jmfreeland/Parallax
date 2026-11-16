@@ -25,16 +25,30 @@ def _latest_run_ids(database_path: Path) -> tuple[str, str]:
     connection = connect_database(database_path, initialize=True)
     try:
         trace = connection.execute(
-            """SELECT run_id FROM history_runs
+            """SELECT run_id, status FROM history_runs
                WHERE status LIKE 'complete%'
                ORDER BY coalesce(completed_at_utc, updated_at_utc) DESC LIMIT 1"""
         ).fetchone()
+        if not trace:
+            trace = connection.execute(
+                """SELECT run_id, status FROM history_runs
+                   WHERE status = 'partial'
+                     AND EXISTS (
+                         SELECT 1 FROM run_bonds
+                         WHERE run_bonds.run_id = history_runs.run_id
+                           AND run_bonds.status IN ('downloaded', 'review', 'needs_review')
+                     )
+                   ORDER BY coalesce(completed_at_utc, updated_at_utc) DESC LIMIT 1"""
+            ).fetchone()
         curve = connection.execute(
             """SELECT curve_run_id FROM treasury_curve_runs
                ORDER BY retrieved_at_utc DESC LIMIT 1"""
         ).fetchone()
         if not trace:
-            raise ValueError("No completed TRACE run is available.")
+            raise ValueError(
+                "No completed or usable partial TRACE run is available. "
+                "Download TRACE history first."
+            )
         if not curve:
             raise ValueError("No Treasury curve vintage is stored. Download the curve first.")
         return trace[0], curve[0]
@@ -74,7 +88,7 @@ def build_spread_snapshot(
     try:
         trace_meta = connection.execute(
             """SELECT coalesce(completed_at_utc, updated_at_utc), snapshot_sha256,
-                      start_date, end_date
+                      start_date, end_date, status
                FROM history_runs WHERE run_id=?""",
             [trace_run_id],
         ).fetchone()
@@ -86,6 +100,18 @@ def build_spread_snapshot(
         ).fetchone()
         if not trace_meta or not curve_meta:
             raise ValueError("The selected TRACE run or Treasury curve vintage does not exist.")
+        if trace_meta[4] == "partial":
+            failed, unfinished = connection.execute(
+                """SELECT count(*) FILTER (WHERE status = 'failed'),
+                          count(*) FILTER (WHERE status IN ('pending', 'downloading'))
+                   FROM run_bonds WHERE run_id=?""",
+                [trace_run_id],
+            ).fetchone()
+            print(
+                f"Using partial TRACE run {trace_run_id}: {failed} failed and "
+                f"{unfinished} unfinished bonds; available history will be included.",
+                flush=True,
+            )
         clean_path_sql = str(clean_path.resolve()).replace("'", "''")
         clean_stats = connection.execute(
             f"""SELECT min(trade_date), max(trade_date), count(*)
@@ -253,6 +279,7 @@ def build_spread_snapshot(
             "snapshot_id": snapshot_id,
             "generated_at_utc": generated_at,
             "trace_run_id": trace_run_id,
+            "trace_run_status": trace_meta[4],
             "trace_as_of_utc": str(trace_meta[0]),
             "trace_snapshot_sha256": trace_meta[1],
             "trace_window": {"start": str(trace_meta[2]), "end": str(trace_meta[3])},

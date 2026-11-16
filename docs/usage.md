@@ -38,6 +38,12 @@ Create or resume a run in **Download TRACE history**. The downloader derives a C
 
 Before treating a run as research-ready, check feed lag, zero/sentinel values, the review status, LQD population date versus TRACE retrieval date, and FINRA/OpenBB usage rights.
 
+**Update Treasury curve** fetches the U.S. Treasury XML feed in one request per
+calendar-year batch. The progress bar and status show the current year, batches
+completed, returned date counts, elapsed time, and an approximate remaining
+download time after the first batch. CSV, DuckDB, and manifest writes are shown
+as final progress steps.
+
 In **Download TRACE history**, use **Refetch + fill price/yield gaps** to
 re-request bonds with missing or invalid observations in the selected run's
 date window. Existing valid raw values are preserved. A fetched value replaces
@@ -141,29 +147,33 @@ includes tickers that could not be fitted and their minimum-data reason.
 The launcher **Signal inventory** tab lists implemented signals and their
 validation status. Choose **Evaluate credit predictors** to compare the
 Nelson-Siegel residual with a historical partition percentile over a selected
-start/end range. Select **Cleaned Parquet**, **Preprocessed Parquet**, or **Raw
+start/end range, and choose **Yield**, **G-spread**, or **Price** as the signal
+space. Signals and forward outcomes use the same selected space. G-spread mode
+uses and records the latest immutable spread snapshot. Price mode uses clean
+price log returns; fitting a price curve is exploratory because coupon and
+structure differences also affect price. Select **Cleaned Parquet**, **Preprocessed Parquet**, or **Raw
 DuckDB history** as the input source; cleaned data is the default and the
 latest cleaned dataset is selected automatically. The report records the
 selected source and path. The cleaner's carried marks and reversal flags are
 separate from observed values; the evaluator reads the observed columns and
-ignores those marks and retrospective flags. On every TRACE yield
-date in that range, the evaluator fits the ticker curves using observations
-available by that date and records each bond's yield residual. From each
-signal date, it measures post-signal changes and accumulates them by horizon.
+ignores those marks and retrospective flags. On every eligible observation
+date in the selected space, the evaluator fits the ticker curve in the selected
+space or computes a partition percentile. From each signal date, it measures
+post-signal changes and accumulates them by horizon.
 For Nelson-Siegel residuals, it subtracts the cross-sectional mean change on
-each trade date. If a signal uses a stale yield observed before T, its first
-later yield print is excluded from forward changes because that move spans
+each trade date. If a signal uses a stale observation from before T, its first
+later print is excluded from forward changes because that move spans
 time before the signal; changes resume after two post-signal prints. For
 Nelson-Siegel residuals, dates with fewer than five eligible bond changes are
 omitted. The signal-to-change correlations reverse
-the change sign so that positive correlation means the residual correctly
-indicated tightening. **Horizon performance** ranks the full daily signal
+the outcome sign so a positive result is favorable to a high cheapness score.
+**Horizon performance** ranks the full daily signal
 cross-section into ten equal-count groups, then plots each group's average
-cumulative side-adjusted yield change in basis points relative to that date's
+cumulative side-adjusted selected-space change in basis points relative to that date's
 population average from T+1 through T+end. It does not apply duration scaling
 or long/short tail cutoffs.
 The separate **Signal correlations** panel shows daily-averaged and pooled
-Pearson and Spearman IC. Signal staleness, maximum gap between yield changes,
+Pearson and Spearman IC. Signal staleness, maximum gap between selected-space changes,
 minimum curve size, price age, horizon, and long-short tail quantile are
 configurable.
 
@@ -171,20 +181,19 @@ Use **Signal vs. outcome** to inspect a bond-level cross-section. After an
 evaluation completes, change the signal date or forward horizon directly in
 that tab; the app redraws from the cached outcomes for every tested horizon and
 date, without rerunning the evaluation. Compare each signal value with its
-cumulative side-adjusted yield-change outperformance versus the eligible
+cumulative side-adjusted selected-space outperformance versus the eligible
 population to inspect outliers and the shape of the signal relationship.
 
 For the percentile predictor, choose any field in the bond-list CSV as the
 partition (for example sector, issuer ticker, bond ticker, or maturity year).
-Each partition's latest eligible median TRACE yield is ranked against strictly
-prior partition medians in a trailing window; minimum history and lookback are
-configurable. Higher percentiles select the high-yield partition tail for the
-long leg, and lower percentiles select the short leg; bonds within selected
-partitions are equally weighted. Its outcomes use raw, non-demeaned yield
-changes so market-wide regime moves are retained. The current TRACE store does
-not have benchmark-relative bond spreads, so yield is explicitly a spread proxy
-and can also reflect Treasury-rate and maturity-mix changes. The selected
-partition uses the current bond-list snapshot, not point-in-time membership.
+Each partition's latest eligible median in the selected space is ranked against
+strictly prior partition medians in a trailing window; minimum history and
+lookback are configurable. Scores are oriented so higher means cheaper; bonds
+within selected partitions are equally weighted. Percentile outcomes use raw,
+non-demeaned changes so market-wide moves are retained. Yield changes remain a
+Treasury-plus-credit proxy; G-spread mode uses the stored benchmark-relative
+series. The selected partition uses the current bond-list snapshot, not
+point-in-time membership.
 
 In Nelson-Siegel mode, each signal date's portfolio goes long the top residual quantile
 (cheap versus its ticker curve) and shorts the bottom quantile (rich). The
@@ -197,13 +206,15 @@ and coupon reinvestment.
 The **Rebalanced portfolio** tab compares holdings selected at each signal
 date and held through the next observed signal date. It plots the raw
 long-short total-return contribution, the long-only leg gross and net of
-financing, and the duration-adjusted yield-only long-short proxy. Portfolio
-returns are not cross-sectionally de-meaned. The financing proxy accrues the
+financing, and the selected-space change proxy. Yield and spread changes use
+modified duration; price changes use clean-price log returns. Portfolio returns
+are not cross-sectionally de-meaned. The financing proxy accrues the
 latest 1-month Treasury rate plus each bond's G-spread from the latest spread
 snapshot using ACT/365; a checkbox can disable this adjustment. Annualized
 volatility is calculated from the raw non-overlapping holding-period returns.
-Unpriced bond returns contribute zero and coverage is reported. TRACE history
-has no Treasury benchmark for yield changes, so those remain proxies. Signal
+Unpriced bond returns contribute zero and coverage is reported. Yield changes
+have no Treasury benchmark adjustment, so those remain proxies; the explicit
+G-spread series is benchmark-relative. Signal
 dates use the supplied bond list rather than historical index membership. The
 TRACE store does not retain immutable observation vintages, so later
 corrections can affect this retrospective test. Event windows overlap, so

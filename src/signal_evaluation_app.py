@@ -37,6 +37,9 @@ from PySide6.QtWidgets import (
 from .signal_evaluation import (
     PREDICTOR_NELSON_SIEGEL,
     PREDICTOR_PARTITION_PERCENTILE,
+    SIGNAL_SPACE_PRICE,
+    SIGNAL_SPACE_SPREAD,
+    SIGNAL_SPACE_YIELD,
     evaluate_nelson_siegel_signal,
 )
 from .trace_history import DATABASE_PATH, DEFAULT_SNAPSHOT, TRACE_DIR
@@ -92,7 +95,7 @@ class HorizonCurvesChart(QWidget):
 
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 24), Qt.AlignmentFlag.AlignLeft,
-                         "D1 = lowest signal, D10 = highest; cumulative yield outperformance vs. population")
+                         "D1 = lowest signal, D10 = highest; cumulative outperformance vs. population")
         for step in range(5):
             fraction = step / 4
             y_value = y_min + fraction * (y_max - y_min)
@@ -229,7 +232,7 @@ class CorrelationHorizonChart(QWidget):
 
 
 class SignalReturnScatterChart(QWidget):
-    """Plot one signal-date cross-section against its forward yield outcome."""
+    """Plot one signal-date cross-section against its forward outcome."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -257,7 +260,8 @@ class SignalReturnScatterChart(QWidget):
                     f"ISIN: {row.get('isin', '—')}\n"
                     f"Ticker / partition: {identity}\n"
                     f"Signal value: {float(row['signal_value_pct']):.4f}\n"
-                    f"Side-adjusted outcome: {float(row['side_adjusted_forward_yield_change_bps']):.2f} bp"
+                    f"Side-adjusted {row.get('signal_space', 'series')} outcome: "
+                    f"{float(row['side_adjusted_forward_outcome_bps']):.2f} bp"
                 )
                 QToolTip.showText(event.globalPosition().toPoint(), self.toolTip(), self)
                 return
@@ -276,7 +280,7 @@ class SignalReturnScatterChart(QWidget):
             return
 
         xs = [float(row["signal_value_pct"]) for row in self.rows]
-        ys = [float(row["side_adjusted_forward_yield_change_bps"]) for row in self.rows]
+        ys = [float(row["side_adjusted_forward_outcome_bps"]) for row in self.rows]
         left, right = 82.0, float(self.width() - 28)
         top, bottom = 38.0, float(self.height() - 64)
         x_min, x_max = min(xs), max(xs)
@@ -297,7 +301,7 @@ class SignalReturnScatterChart(QWidget):
 
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 22), Qt.AlignmentFlag.AlignLeft,
-                         f"{len(self.rows):,} bonds | side-adjusted yield-change outperformance vs population")
+                         f"{len(self.rows):,} bonds | side-adjusted {self.rows[0].get('signal_space', 'series')} outperformance vs population")
         for fraction in range(5):
             ratio = fraction / 4
             y_value = y_min + ratio * (y_max - y_min)
@@ -310,7 +314,7 @@ class SignalReturnScatterChart(QWidget):
         painter.setPen(QColor("#94a3b8"))
         painter.drawText(QRectF(4, top - 23, 72, 18), Qt.AlignmentFlag.AlignRight, "Outperf. (bp)")
         painter.drawText(QRectF(left, bottom + 22, right - left, 20), Qt.AlignmentFlag.AlignCenter,
-                         "Signal value (percentile 0–100 or yield residual, pp)")
+                         "Signal score (higher scores indicate cheaper bonds)")
         if y_min <= 0 <= y_max:
             painter.setPen(QPen(QColor("#64748b"), 1, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(left, y_map(0.0)), QPointF(right, y_map(0.0)))
@@ -488,6 +492,16 @@ class SignalEvaluationWindow(QMainWindow):
         self.predictor.addItem("Historical partition percentile", PREDICTOR_PARTITION_PERCENTILE)
         self.predictor.currentIndexChanged.connect(self._predictor_changed)
         predictor_row.addWidget(self.predictor)
+        predictor_row.addWidget(QLabel("Signal space"))
+        self.signal_space = QComboBox()
+        self.signal_space.addItem("Yield", SIGNAL_SPACE_YIELD)
+        self.signal_space.addItem("G-spread", SIGNAL_SPACE_SPREAD)
+        self.signal_space.addItem("Price", SIGNAL_SPACE_PRICE)
+        self.signal_space.setToolTip(
+            "Signals and forward outcomes use the same selected space. Price curves are exploratory: "
+            "bond prices also reflect coupon and structure differences."
+        )
+        predictor_row.addWidget(self.signal_space)
         predictor_row.addWidget(QLabel("Partition field"))
         self.partition_field = QComboBox()
         predictor_row.addWidget(self.partition_field)
@@ -532,7 +546,7 @@ class SignalEvaluationWindow(QMainWindow):
         self.signal_age.setRange(0, 365)
         self.signal_age.setValue(30)
         row_two.addWidget(self.signal_age)
-        row_two.addWidget(QLabel("Max gap between yield changes (days)"))
+        row_two.addWidget(QLabel("Max gap between series changes (days)"))
         self.change_gap = QSpinBox()
         self.change_gap.setRange(1, 90)
         self.change_gap.setValue(7)
@@ -575,9 +589,9 @@ class SignalEvaluationWindow(QMainWindow):
         dates_page = QWidget()
         dates_layout = QVBoxLayout(dates_page)
         self.summary = QLabel(
-            "Select a predictor, partition, and test range. Positive scores mean high yield versus the selected reference. "
-            "Forward yield changes use the predictor's matching outcome convention and are side-adjusted so positive is favorable. "
-            "TRACE yield changes are a spread proxy (no Treasury benchmark). Historical returns "
+            "Select a predictor, signal space, partition, and test range. Higher signal scores indicate cheaper bonds. "
+            "Forward changes use the selected space and are side-adjusted so positive is favorable. "
+            "Historical total returns "
             "and the rebalanced NAV proxy are shown separately. TRACE observations are not stored in immutable vintages, "
             "so later revisions to past observations may affect historical results."
         )
@@ -690,7 +704,7 @@ class SignalEvaluationWindow(QMainWindow):
         details_layout.addWidget(self.detail_status)
         self.detail_table = QTableWidget(0, 13)
         self.detail_table.setHorizontalHeaderLabels([
-            "Signal date", "Partition", "ISIN", "Signal value", "Signal yield date",
+            "Signal date", "Partition", "ISIN", "Signal score", "Signal observation date",
             "Raw cumulative change (bps)", "De-meaned cumulative change (bps)", "Side-adjusted change (bps)",
             "Strategy leg", "Bond total return (%)", "Return status", "Duration (years)", "Issuer",
         ])
@@ -829,6 +843,7 @@ class SignalEvaluationWindow(QMainWindow):
             "maximum_price_age_days": self.price_age.value(),
             "long_short_quantile": self.quantile.value(),
             "predictor_id": self.predictor.currentData(),
+            "signal_space": self.signal_space.currentData(),
             "partition_field": self.partition_field.currentText() or "sector",
             "percentile_lookback_days": self.percentile_lookback.value(),
             "minimum_history_observations": self.minimum_history.value(),
@@ -871,12 +886,12 @@ class SignalEvaluationWindow(QMainWindow):
                 scatter_details.append({
                     **item,
                     "horizon_days": horizon,
-                    "side_adjusted_forward_yield_change_bps": outcomes[horizon - 1],
+                    "side_adjusted_forward_outcome_bps": outcomes[horizon - 1],
                 })
         self.scatter_chart.set_rows(scatter_details)
         self.scatter_status.setText(
             f"{as_of or 'Select a signal date'} | T+{horizon} calendar days | "
-            f"{len(scatter_details):,} bonds with a forward TRACE yield observation"
+            f"{len(scatter_details):,} bonds with a forward {self.result['summary']['signal_space']} observation"
         )
 
     def _show_results(self, result: dict[str, Any]) -> None:
@@ -986,24 +1001,24 @@ class SignalEvaluationWindow(QMainWindow):
                 "Financing cost disabled; long-only net comparison is omitted."
             )
         percentile_mode = summary["signal_id"] == PREDICTOR_PARTITION_PERCENTILE
+        signal_space = summary["signal_space"]
 
         def display(value: Any, suffix: str = "") -> str:
             return "n/a" if value is None else f"{float(value):.3f}{suffix}"
 
         predictor_description = (
-            f"{summary['partition_field']} group median TRACE yield ranked against strictly prior "
-            f"{summary['percentile_lookback_days']}-day history; higher percentile means higher-yield regime. "
+            f"{summary['partition_field']} group median TRACE {signal_space} ranked against strictly prior "
+            f"{summary['percentile_lookback_days']}-day history; high scores indicate cheaper levels. "
             f"Requires {summary['minimum_history_observations']} prior group observations. "
-            "This is a yield-based spread proxy until government-relative spreads are available. "
             if percentile_mode else
-            "Positive Nelson-Siegel residual means high yield versus the fitted issuer curve. "
+            f"Positive Nelson-Siegel residual means cheap versus the fitted issuer {signal_space} curve. "
         )
         outcome_description = (
-            "Forward outcomes use raw, non-demeaned yield changes. "
-            if percentile_mode else "Forward outcomes use cross-sectionally de-meaned yield changes. "
+            f"Forward outcomes use raw, non-demeaned {signal_space} changes. "
+            if percentile_mode else f"Forward outcomes use cross-sectionally de-meaned {signal_space} changes. "
         )
         outcome_description += (
-            "For stale signal yields, the first later print is excluded because it spans pre-signal time; "
+            "For stale signal observations, the first later print is excluded because it spans pre-signal time; "
             "forward changes resume after two post-signal prints. "
         )
         data_source_note = (
@@ -1032,7 +1047,7 @@ class SignalEvaluationWindow(QMainWindow):
         self.status.setText(
             f"Completed {summary['signal_dates']:,} signal dates; "
             f"{summary['dates_with_correlation']:,} dates had enough pairs for correlation. "
-            f"Excluded {summary['stale_first_prints_excluded']:,} first post-signal prints from stale yield baselines. "
+            f"Excluded {summary['stale_first_prints_excluded']:,} first post-signal prints from stale signal baselines. "
             f"Source: {summary['data_source']}."
         )
         self.export_button.setEnabled(bool(detail_rows))
@@ -1071,22 +1086,24 @@ class SignalEvaluationWindow(QMainWindow):
         self.detail_table.setHorizontalHeaderItem(
             6,
             QTableWidgetItem(
-                "Cumulative yield change (bps)" if percentile_mode
-                else "De-meaned cumulative change (bps)"
+                f"De-meaned cumulative {self.result['summary']['signal_space']} change (bps)"
             ),
         )
         self.detail_table.setHorizontalHeaderItem(
             3,
-            QTableWidgetItem("Percentile (0-100)" if percentile_mode else "Yield residual (pp)"),
+            QTableWidgetItem(
+                "Cheapness percentile (0-100)" if percentile_mode
+                else f"{self.result['summary']['signal_space'].title()} residual"
+            ),
         )
         self.detail_status.setText(f"{as_of}: {len(details):,} bond-date observations; selected strategy legs are labelled Long/Short.")
         self._fill_table(
             self.detail_table,
             details,
             (
-                "as_of_date", "partition_value" if percentile_mode else "ticker", "isin", "signal_value_pct", "yield_date",
-                "raw_cumulative_yield_change_bps", "cumulative_demeaned_yield_change_bps",
-                "side_adjusted_yield_change_bps", "strategy_leg", "bond_total_return_pct",
+                "as_of_date", "partition_value" if percentile_mode else "ticker", "isin", "signal_value_pct", "signal_observation_date",
+                "raw_cumulative_signal_change_bps", "cumulative_signal_change_bps",
+                "side_adjusted_signal_change_bps", "strategy_leg", "bond_total_return_pct",
                 "bond_total_return_status", "modified_duration_years", "issuer_name",
             ),
         )

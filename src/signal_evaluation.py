@@ -23,6 +23,10 @@ ProgressCallback = Callable[[int, int], None]
 MIN_DAILY_CHANGE_CROSS_SECTION = 5
 PREDICTOR_NELSON_SIEGEL = "nelson_siegel_residual"
 PREDICTOR_PARTITION_PERCENTILE = "historical_partition_percentile"
+SIGNAL_SPACE_YIELD = "yield"
+SIGNAL_SPACE_SPREAD = "spread"
+SIGNAL_SPACE_PRICE = "price"
+SIGNAL_SPACES = {SIGNAL_SPACE_YIELD, SIGNAL_SPACE_SPREAD, SIGNAL_SPACE_PRICE}
 
 
 def _has_current_cleaning_version(path: Path) -> bool:
@@ -164,6 +168,7 @@ def evaluate_nelson_siegel_signal(
     data_source: str = "cleaned_parquet",
     data_path: Path | None = None,
     predictor_id: str = PREDICTOR_NELSON_SIEGEL,
+    signal_space: str = SIGNAL_SPACE_YIELD,
     partition_field: str = "sector",
     percentile_lookback_days: int = 1095,
     minimum_history_observations: int = 20,
@@ -173,13 +178,11 @@ def evaluate_nelson_siegel_signal(
 ) -> dict[str, Any]:
     """Evaluate a Nelson-Siegel residual or historical partition percentile.
 
-    For every horizon, accumulate consecutive post-T TRACE yield changes,
-    de-mean them across the eligible cross-section on each trade date, and
-    compare the signal with the sign-reversed cumulative changes. TRACE does
-    not include a Treasury benchmark here, so this is a spread-change proxy.
-    Partition percentile scores rank each partition's current median TRACE
-    yield against strictly prior values in a trailing lookback. As no Treasury
-    curve is joined here, that level is explicitly a spread proxy. The event-study
+    For every horizon, accumulate consecutive post-T changes in the selected
+    signal space and compare the score with side-adjusted cumulative changes.
+    Yield and G-spread changes are reversed; price log returns retain their sign.
+    Partition percentile scores rank each partition's current median level
+    against strictly prior values in a trailing lookback. The event-study
     and rebalanced series use raw, non-demeaned portfolio returns. Rebalanced
     results can subtract a 1-month Treasury plus bond G-spread financing proxy
     from the long-only leg; the maximum-horizon strategy also reports historical
@@ -191,6 +194,8 @@ def evaluate_nelson_siegel_signal(
         raise ValueError("horizon_days must be at least 2")
     if predictor_id not in {PREDICTOR_NELSON_SIEGEL, PREDICTOR_PARTITION_PERCENTILE}:
         raise ValueError(f"Unsupported predictor_id: {predictor_id}")
+    if signal_space not in SIGNAL_SPACES:
+        raise ValueError(f"Unsupported signal_space: {signal_space}")
     if minimum_bonds < (5 if predictor_id == PREDICTOR_NELSON_SIEGEL else 1):
         minimum_required = 5 if predictor_id == PREDICTOR_NELSON_SIEGEL else 1
         raise ValueError(f"minimum_bonds must be at least {minimum_required} for this predictor")
@@ -334,9 +339,51 @@ def evaluate_nelson_siegel_signal(
                 percentile_history_dates.add(trade_date)
         if clean_price is not None:
             price_observations[isin].append((trade_date, clean_price))
+    spread_snapshot_id: str | None = None
+    spreads_by_isin: dict[str, list[tuple[date, float]]] = defaultdict(list)
+    if signal_space == SIGNAL_SPACE_SPREAD:
+        spread_connection = duckdb.connect(str(database_path), read_only=True)
+        try:
+            snapshot = spread_connection.execute(
+                "SELECT snapshot_id FROM spread_snapshot_runs ORDER BY generated_at_utc DESC LIMIT 1"
+            ).fetchone()
+            if not snapshot:
+                raise ValueError("Spread-space signals require a G-spread snapshot. Build one first.")
+            spread_snapshot_id = str(snapshot[0])
+            spread_placeholders = ",".join("?" for _ in bonds)
+            spread_rows = spread_connection.execute(
+                f"""SELECT upper(isin), trade_date, g_spread_bps
+                   FROM bond_spread_observations
+                   WHERE snapshot_id=? AND upper(isin) IN ({spread_placeholders})
+                     AND trade_date BETWEEN ? AND ? AND g_spread_bps IS NOT NULL
+                   ORDER BY upper(isin), trade_date""",
+                [spread_snapshot_id, *bonds, query_start, query_end],
+            ).fetchall()
+        except duckdb.Error as error:
+            raise ValueError("Spread-space signals require an available G-spread snapshot.") from error
+        finally:
+            spread_connection.close()
+        for isin, observed_date, spread_bps in spread_rows:
+            spreads_by_isin[isin].append((observed_date, float(spread_bps)))
+        observations = {isin: spreads_by_isin.get(isin, []) for isin in bonds}
+        signal_dates = {
+            observed_date for history in observations.values()
+            for observed_date, _ in history if start_date <= observed_date <= end_date
+        }
+    elif signal_space == SIGNAL_SPACE_PRICE:
+        observations = price_observations
+        signal_dates = {
+            observed_date for history in observations.values()
+            for observed_date, _ in history if start_date <= observed_date <= end_date
+        }
     if not signal_dates:
-        raise ValueError("No valid TRACE yield observations fall within the selected test range")
+        raise ValueError(f"No valid TRACE {signal_space} observations fall within the selected test range")
     observation_dates = {isin: [row[0] for row in rows] for isin, rows in observations.items()}
+    if predictor_id == PREDICTOR_PARTITION_PERCENTILE:
+        percentile_history_dates = {
+            observed_date for history in observations.values()
+            for observed_date, _ in history if query_start <= observed_date < start_date
+        }
     ordered_signal_dates = sorted(signal_dates | percentile_history_dates)
     evaluation_signal_dates = sorted(signal_dates)
     daily_results: list[dict[str, Any]] = []
@@ -381,6 +428,8 @@ def evaluate_nelson_siegel_signal(
                 **metadata,
                 "yield_date": yield_date,
                 "observed_yield_pct": ytm,
+                "signal_observation_date": yield_date.isoformat(),
+                "observed_signal_level": ytm,
                 "maturity_years": maturity_years,
             }
             if metadata["ticker"]:
@@ -405,9 +454,20 @@ def evaluate_nelson_siegel_signal(
                     signals.append({
                         **row,
                         "as_of_date": as_of,
+                        "signal_space": signal_space,
+                        "signal_value": float(
+                            fitted_yield - row["observed_yield_pct"]
+                            if signal_space == SIGNAL_SPACE_PRICE
+                            else row["observed_yield_pct"] - fitted_yield
+                        ),
+                        "fitted_signal_level": float(fitted_yield),
                         "signal_id": PREDICTOR_NELSON_SIEGEL,
-                        "signal_name": "Nelson-Siegel ticker residual",
-                        "signal_value_pct": float(row["observed_yield_pct"] - fitted_yield),
+                        "signal_name": f"Nelson-Siegel {signal_space} residual",
+                        "signal_value_pct": float(
+                            fitted_yield - row["observed_yield_pct"]
+                            if signal_space == SIGNAL_SPACE_PRICE
+                            else row["observed_yield_pct"] - fitted_yield
+                        ),
                         "fitted_yield_pct": float(fitted_yield),
                         "curve_rmse_pct": curve_rmse,
                         "tau_selection_loo_rmse_pct": loo_rmse,
@@ -425,12 +485,18 @@ def evaluate_nelson_siegel_signal(
                     minimum_observations=minimum_history_observations,
                 )
                 if percentile is not None:
+                    if signal_space == SIGNAL_SPACE_PRICE:
+                        percentile = 100.0 - percentile
                     for row in rows:
                         signals.append({
                             **row,
                             "as_of_date": as_of,
+                            "signal_space": signal_space,
+                            "signal_value": percentile,
+                            "fitted_signal_level": None,
+                            "partition_median_signal_level": partition_median,
                             "signal_id": PREDICTOR_PARTITION_PERCENTILE,
-                            "signal_name": f"{partition_field} historical median-yield percentile",
+                            "signal_name": f"{partition_field} historical median-{signal_space} percentile",
                             "signal_value_pct": percentile,
                             "partition_field": partition_field,
                             "partition_median_yield_pct": partition_median,
@@ -465,7 +531,13 @@ def evaluate_nelson_siegel_signal(
                 trade_date, value = values[observation_index]
                 elapsed = (trade_date - previous_date).days
                 if has_post_signal_baseline and 0 < elapsed <= maximum_yield_change_gap_days:
-                    raw_changes_after_signal[trade_date][isin] = (value - previous_value) * 100.0
+                    if signal_space == SIGNAL_SPACE_YIELD:
+                        change = (value - previous_value) * 100.0
+                    elif signal_space == SIGNAL_SPACE_SPREAD:
+                        change = value - previous_value
+                    else:
+                        change = math.log(value / previous_value) * 10_000.0
+                    raw_changes_after_signal[trade_date][isin] = change
                 elif not has_post_signal_baseline:
                     stale_first_prints_excluded += 1
                 previous_value, previous_date = value, trade_date
@@ -534,7 +606,12 @@ def evaluate_nelson_siegel_signal(
                         cumulative_portfolio_raw[isin] += change
 
             pairs = [row for row in signals if row["isin"] in active_isins]
-            side_adjusted_targets = [-cumulative_demeaned[row["isin"]] for row in pairs]
+            side_adjusted_targets = [
+                cumulative_demeaned[row["isin"]]
+                if signal_space == SIGNAL_SPACE_PRICE
+                else -cumulative_demeaned[row["isin"]]
+                for row in pairs
+            ]
             signal_values = [row["signal_value_pct"] for row in pairs]
             pearson = _correlation(signal_values, side_adjusted_targets)
             spearman = _correlation(signal_values, side_adjusted_targets, spearman=True)
@@ -543,11 +620,15 @@ def evaluate_nelson_siegel_signal(
             pooled_targets.extend(side_adjusted_targets)
 
             long_leg_proxy = [
+                cumulative_portfolio_raw[row["isin"]]
+                if signal_space == SIGNAL_SPACE_PRICE else
                 -float(row["modified_duration_years"]) * cumulative_portfolio_raw[row["isin"]]
                 if row["modified_duration_years"] is not None else 0.0
                 for row in long_leg
             ]
             short_leg_proxy = [
+                cumulative_portfolio_raw[row["isin"]]
+                if signal_space == SIGNAL_SPACE_PRICE else
                 -float(row["modified_duration_years"]) * cumulative_portfolio_raw[row["isin"]]
                 if row["modified_duration_years"] is not None else 0.0
                 for row in short_leg
@@ -558,7 +639,11 @@ def evaluate_nelson_siegel_signal(
             )
             decile_outcomes: dict[int, list[float]] = {decile: [] for decile in range(10)}
             population_outcomes = {
-                row["isin"]: -cumulative_demeaned[row["isin"]]
+                row["isin"]: (
+                    cumulative_demeaned[row["isin"]]
+                    if signal_space == SIGNAL_SPACE_PRICE
+                    else -cumulative_demeaned[row["isin"]]
+                )
                 for row in pairs
             }
             population_average_outcome = (
@@ -577,8 +662,12 @@ def evaluate_nelson_siegel_signal(
                     decile_bond_counts_by_horizon[horizon][decile].append(len(outcomes))
             strategy_bonds = (*long_leg, *short_leg)
             change_coverage = (
-                100.0 * sum(row["isin"] in active_isins and row["modified_duration_years"] is not None
-                            for row in strategy_bonds) / len(strategy_bonds)
+                100.0 * sum(
+                    row["isin"] in active_isins and (
+                        signal_space == SIGNAL_SPACE_PRICE
+                        or row["modified_duration_years"] is not None
+                    ) for row in strategy_bonds
+                ) / len(strategy_bonds)
                 if strategy_bonds else None
             )
             event_row = {
@@ -642,12 +731,23 @@ def evaluate_nelson_siegel_signal(
         # Record every fitted signal at the maximum horizon, including missing
         # outcomes, so coverage remains inspectable in the export.
         for row in signals:
+            side_adjusted_cumulative = (
+                cumulative_demeaned[row["isin"]]
+                if signal_space == SIGNAL_SPACE_PRICE
+                else -cumulative_demeaned[row["isin"]]
+            ) if row["isin"] in active_isins else None
             row["cumulative_demeaned_yield_change_bps"] = (
                 cumulative_demeaned.get(row["isin"])
                 if predictor_id == PREDICTOR_NELSON_SIEGEL else None
             )
-            row["side_adjusted_yield_change_bps"] = (
-                -cumulative_demeaned[row["isin"]] if row["isin"] in active_isins else None
+            row["cumulative_signal_change_bps"] = (
+                cumulative_demeaned.get(row["isin"])
+                if predictor_id == PREDICTOR_NELSON_SIEGEL else None
+            )
+            row["side_adjusted_signal_change_bps"] = side_adjusted_cumulative
+            row["side_adjusted_yield_change_bps"] = side_adjusted_cumulative
+            row["raw_cumulative_signal_change_bps"] = (
+                cumulative_raw[row["isin"]] if row["isin"] in active_isins else None
             )
             row["raw_cumulative_yield_change_bps"] = (
                 cumulative_raw[row["isin"]] if row["isin"] in active_isins else None
@@ -663,9 +763,11 @@ def evaluate_nelson_siegel_signal(
             scatter_results.append({
                 "as_of_date": as_of.isoformat(),
                 "isin": row["isin"],
+                "signal_space": signal_space,
                 "partition_value": row["partition_value"],
                 "ticker": row["ticker"],
                 "signal_value_pct": row["signal_value_pct"],
+                "signal_value": row["signal_value"],
                 "side_adjusted_outcomes_by_horizon_bps": scatter_outcomes[row["isin"]],
             })
 
@@ -699,17 +801,24 @@ def evaluate_nelson_siegel_signal(
                     for isin, change in changes.items():
                         next_changes[isin] += change
             long_returns = [
+                next_changes.get(row["isin"], 0.0)
+                if signal_space == SIGNAL_SPACE_PRICE else
                 -float(row["modified_duration_years"]) * next_changes.get(row["isin"], 0.0)
                 if row["modified_duration_years"] is not None else 0.0 for row in long_leg
             ]
             short_returns = [
+                next_changes.get(row["isin"], 0.0)
+                if signal_space == SIGNAL_SPACE_PRICE else
                 -float(row["modified_duration_years"]) * next_changes.get(row["isin"], 0.0)
                 if row["modified_duration_years"] is not None else 0.0 for row in short_leg
             ]
             if long_leg and short_leg:
                 period_return_bps = float(np.mean(long_returns) - np.mean(short_returns))
                 coverage_count = sum(
-                    row["modified_duration_years"] is not None and row["isin"] in next_changes
+                    row["isin"] in next_changes and (
+                        signal_space == SIGNAL_SPACE_PRICE
+                        or row["modified_duration_years"] is not None
+                    )
                     for row in (*long_leg, *short_leg)
                 )
                 coverage_pct = 100.0 * coverage_count / (len(long_leg) + len(short_leg))
@@ -886,10 +995,13 @@ def evaluate_nelson_siegel_signal(
     ]
     metadata = {
         "signal_id": predictor_id,
-        "signal_name": "Nelson-Siegel ticker residual"
-        if predictor_id == PREDICTOR_NELSON_SIEGEL else "Historical partition median-yield percentile",
+        "signal_name": f"Nelson-Siegel ticker {signal_space} residual"
+        if predictor_id == PREDICTOR_NELSON_SIEGEL
+        else f"Historical partition median-{signal_space} percentile",
         "methodology": METHODOLOGY if predictor_id == PREDICTOR_NELSON_SIEGEL
-        else "Trailing empirical percentile of partition median TRACE yield",
+        else f"Trailing empirical percentile of partition median TRACE {signal_space}",
+        "signal_space": signal_space,
+        "spread_snapshot_id": spread_snapshot_id,
         "model_version": "nelson_siegel_loo_tau_v2" if predictor_id == PREDICTOR_NELSON_SIEGEL
         else "partition_yield_percentile_trailing_v1",
         "evaluation_version": "daily_demeaned_side_adjusted_v2"
@@ -908,27 +1020,46 @@ def evaluate_nelson_siegel_signal(
         "minimum_bonds_per_ticker": minimum_bonds if predictor_id == PREDICTOR_NELSON_SIEGEL else None,
         "minimum_bonds_per_partition": minimum_bonds if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
         "partition_field": partition_field if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
-        "signal_value_unit": "yield_percentage_points" if predictor_id == PREDICTOR_NELSON_SIEGEL
-        else "percentile_rank_0_to_100",
+        "signal_value_unit": (
+            {SIGNAL_SPACE_YIELD: "yield_percentage_points", SIGNAL_SPACE_SPREAD: "spread_basis_points",
+             SIGNAL_SPACE_PRICE: "clean_price_per_100"}[signal_space]
+            if predictor_id == PREDICTOR_NELSON_SIEGEL
+            else "cheapness_percentile_0_to_100"
+        ),
         "percentile_lookback_days": percentile_lookback_days if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
         "minimum_history_observations": minimum_history_observations if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
         "maximum_signal_age_days": maximum_signal_age_days,
         "maximum_yield_change_gap_days": maximum_yield_change_gap_days,
         "maximum_price_age_days": maximum_price_age_days,
         "long_short_quantile": long_short_quantile,
-        "daily_change_definition": "post-signal differences from each bond's latest available signal-date yield, expressed in bps; later increments use consecutive valid yields; gaps above maximum_yield_change_gap_days omitted",
+        "daily_change_definition": (
+            "post-signal clean-price log returns multiplied by 10,000; consecutive observations only; long gaps omitted"
+            if signal_space == SIGNAL_SPACE_PRICE else
+            f"post-signal {signal_space} changes expressed in basis points; consecutive observations only; long gaps omitted"
+        ),
         "daily_demeaning_definition": "not applied to the historical partition percentile; Nelson-Siegel residual outcomes subtract the per-date cross-sectional mean and omit dates with fewer than five changes",
-        "stale_signal_yield_outcome_policy": "when a bond's signal yield predates the signal date, omit its first post-signal yield change because that move spans time before the signal; include changes only after two post-signal yield observations are available",
+        "stale_signal_observation_policy": "when a bond's signal observation predates the signal date, omit its first later change because that move spans time before the signal; include changes only after two post-signal observations are available",
         "minimum_daily_change_cross_section": MIN_DAILY_CHANGE_CROSS_SECTION
         if predictor_id == PREDICTOR_NELSON_SIEGEL else None,
-        "side_adjustment_definition": "multiply the forward yield change by -1 so a positive value is favorable to a high-yield signal; residual outcomes are cross-sectionally de-meaned, percentile outcomes are not",
-        "horizon_decile_definition": "rank the full daily signal cross-section into ten equal-count deciles; within each signal date and forward horizon, calculate each decile's mean cumulative side-adjusted cross-sectionally de-meaned yield change in bps, subtract the available population average, then average daily decile outperformance across signal dates; no duration scaling or long-short tail cutoff is applied",
-        "spread_measurement": "TRACE yield-level/change proxy; no Treasury benchmark-relative spread available",
-        "percentile_definition": "mid-rank percentile of the partition median latest TRACE yield versus strictly prior partition medians in trailing history; partition signals apply to all constituent bonds and portfolio legs are bond equal-weighted"
+        "side_adjustment_definition": (
+            "price returns retain their sign; a positive score means a relatively low price (cheap)"
+            if signal_space == SIGNAL_SPACE_PRICE else
+            f"multiply forward {signal_space} changes by -1 so falling levels are favorable to a high-score cheapness signal"
+        ),
+        "horizon_decile_definition": f"rank the full daily signal cross-section into ten equal-count deciles; within each signal date and forward horizon, calculate each decile's mean cumulative side-adjusted {signal_space} change in bps, subtract the available population average, then average daily decile outperformance across signal dates; no duration scaling or long-short tail cutoff is applied",
+        "spread_measurement": (
+            f"{spread_snapshot_id} G-spread snapshot" if signal_space == SIGNAL_SPACE_SPREAD
+            else "not used"
+        ),
+        "percentile_definition": f"mid-rank percentile of the partition median TRACE {signal_space} versus strictly prior partition medians in trailing history; scores are oriented so higher means cheaper; partition signals apply to all constituent bonds and portfolio legs are bond equal-weighted"
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
-        "strategy_return_definition": "equal-weighted bonds in the top signal quantile long and bottom quantile short; percentile signals select whole partition tails; fixed modified-duration yield-only return proxy uses raw observed yield changes without cross-sectional demeaning; missing changes contribute zero and coverage is reported",
+        "strategy_return_definition": (
+            "equal-weighted clean-price log-return proxy in basis points"
+            if signal_space == SIGNAL_SPACE_PRICE else
+            f"equal-weighted modified-duration-adjusted {signal_space}-change proxy in basis points"
+        ) + "; top signal quantile is long, bottom is short; percentile signals select whole partition tails; missing changes contribute zero and coverage is reported",
         "total_return_definition": "at maximum horizon, equal-weighted long minus short fixed-rate bond total return; unpriced positions contribute zero at their target weight and coverage is reported",
-        "rebalanced_series_definition": "daily signal selection held to next TRACE signal date; report raw duration-adjusted yield-change long-short proxy, covered total-return long-short contribution, long-only gross total return, and long-only total return net of 1-month Treasury plus bond G-spread financing; no cross-sectional demeaning is applied to portfolio returns; missing position and financing coverage are reported",
+        "rebalanced_series_definition": f"daily signal selection held to next TRACE signal date; report the raw {signal_space}-change long-short proxy, covered total-return long-short contribution, long-only gross total return, and long-only total return net of 1-month Treasury plus bond G-spread financing; no cross-sectional demeaning is applied to portfolio returns; missing position and financing coverage are reported",
         "rebalanced_financing_definition": (
             "for each long-only position, accrue the latest 1-month Treasury par yield plus the latest bond G-spread known at each interval start using ACT/365 simple accrual; G-spread observations are from the latest immutable spread snapshot"
             if include_financing_cost else "not applied"
@@ -940,6 +1071,7 @@ def evaluate_nelson_siegel_signal(
         **metadata,
         "signal_dates": len(evaluation_signal_dates),
         "stale_signal_yield_bonds": stale_signal_yield_bonds,
+        "stale_signal_observations": stale_signal_yield_bonds,
         "stale_first_prints_excluded": stale_first_prints_excluded,
         "dates_with_correlation": len(valid_spearman),
         "dates_with_long_short": len(valid_long_short),

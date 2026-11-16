@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 import re
 import sys
+from typing import Callable
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -46,6 +47,8 @@ NODE_FIELDS = {
     "BC_20YEAR": 20.0,
     "BC_30YEAR": 30.0,
 }
+
+ProgressCallback = Callable[[int, int, str], None]
 
 
 def _local_name(tag: str) -> str:
@@ -81,23 +84,43 @@ def _parse_feed(payload: bytes) -> list[dict[str, object]]:
     return records
 
 
-def fetch_treasury_curve(start_date: date, end_date: date) -> list[dict[str, object]]:
-    """Fetch and normalize Treasury nominal par curve rows for an inclusive range."""
+def fetch_treasury_curve(
+    start_date: date,
+    end_date: date,
+    *,
+    on_progress: ProgressCallback | None = None,
+) -> list[dict[str, object]]:
+    """Fetch Treasury curve history in annual request batches for an inclusive range."""
     if start_date > end_date:
         raise ValueError("Start date must not be after end date.")
     rows: dict[date, dict[str, object]] = {}
     session = requests.Session()
-    for year in range(start_date.year, end_date.year + 1):
+    years = list(range(start_date.year, end_date.year + 1))
+    for batch_index, year in enumerate(years, start=1):
+        if on_progress is not None:
+            on_progress(
+                batch_index - 1,
+                len(years),
+                f"Requesting Treasury curve data for {year} (annual batch {batch_index}/{len(years)})",
+            )
         response = session.get(
             SOURCE_URL,
             params={"data": "daily_treasury_yield_curve", "field_tdr_date_value": year},
             timeout=45,
         )
         response.raise_for_status()
-        for row in _parse_feed(response.content):
+        batch_rows = _parse_feed(response.content)
+        for row in batch_rows:
             observed = row["date"]
             if start_date <= observed <= end_date:
                 rows[observed] = row
+        if on_progress is not None:
+            in_range = sum(start_date <= row["date"] <= end_date for row in batch_rows)
+            on_progress(
+                batch_index,
+                len(years),
+                f"Received {year} batch: {in_range:,} curve dates ({len(rows):,} unique dates total)",
+            )
     return [rows[day] for day in sorted(rows)]
 
 
@@ -295,17 +318,30 @@ def update_treasury_curve(
     end_date: date | None = None,
     database_path: Path = DATABASE_PATH,
     output_path: Path = TREASURY_DIR / "nominal_par_curve.csv",
+    on_progress: ProgressCallback | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Fetch, persist, and describe a new Treasury curve vintage."""
     if (start_date is None) != (end_date is None):
         raise ValueError("Supply both start_date and end_date, or neither.")
     start, end = (start_date, end_date) if start_date and end_date else _history_window(database_path)
-    rows = fetch_treasury_curve(start, end)
+    years = end.year - start.year + 1
+    total_steps = years + 3
+    if on_progress is not None:
+        on_progress(0, total_steps, f"Preparing annual Treasury batches for {start} to {end}")
+    def report_fetch_progress(completed: int, _total: int, message: str) -> None:
+        if on_progress is not None:
+            on_progress(completed, total_steps, message)
+
+    rows = fetch_treasury_curve(start, end, on_progress=report_fetch_progress)
     if not rows:
         raise ValueError("Treasury returned no curve observations for the requested window.")
     _write_csv(rows, output_path)
+    if on_progress is not None:
+        on_progress(years + 1, total_steps, f"Wrote {len(rows):,} curve dates to CSV")
     input_hash = hashlib.sha256(output_path.read_bytes()).hexdigest()
     curve_run_id = persist_curve_rows(rows, start, end, database_path, input_hash)
+    if on_progress is not None:
+        on_progress(years + 2, total_steps, f"Stored {len(rows):,} observations in DuckDB")
     metadata_connection = connect_database(database_path, initialize=False)
     try:
         retrieved_at = metadata_connection.execute(
@@ -330,6 +366,8 @@ def update_treasury_curve(
     output_path.with_suffix(".manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
+    if on_progress is not None:
+        on_progress(years + 3, total_steps, "Wrote vintage manifest; update complete")
     return rows, manifest
 
 
@@ -352,7 +390,15 @@ def main() -> None:
             input_hash = hashlib.sha256(args.import_csv.read_bytes()).hexdigest()
             output_path = args.import_csv
         else:
-            rows, manifest = update_treasury_curve(args.start, args.end, args.database, args.output)
+            rows, manifest = update_treasury_curve(
+                args.start,
+                args.end,
+                args.database,
+                args.output,
+                on_progress=lambda completed, total, message: print(
+                    f"[{completed}/{total}] {message}", flush=True
+                ),
+            )
             print(
                 f"Stored {manifest['observation_count']:,} Treasury curve dates "
                 f"({manifest['first_observation']} to {manifest['last_observation']}) "

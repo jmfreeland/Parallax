@@ -21,8 +21,11 @@ SIGNALS = (
         signal_id="nelson_siegel_residual",
         name="Nelson-Siegel ticker residual",
         family="Relative value",
-        construction="Observed bond yield minus fitted issuer-ticker Nelson-Siegel yield; positive is cheap vs curve.",
-        inputs="TRACE yields, maturity, reviewed equity issuer ticker",
+        construction=(
+            "Observed yield, G-spread, or clean price relative to a fitted issuer-ticker Nelson-Siegel curve; "
+            "score direction is normalized so positive means cheap versus the fitted curve."
+        ),
+        inputs="TRACE yield/price or G-spread snapshot, maturity, reviewed equity issuer ticker",
         status="Implemented",
         validation="Prototype; no out-of-sample validation yet",
     ),
@@ -31,11 +34,11 @@ SIGNALS = (
         name="Historical partition yield percentile",
         family="Credit regime",
         construction=(
-            "Partition median latest TRACE yield ranked against strictly prior values in a trailing window; "
-            "higher percentile indicates a high-yield regime."
+            "Partition median yield, G-spread, or clean price ranked against strictly prior values in a trailing window; "
+            "score direction is normalized so higher values indicate cheaper levels."
         ),
-        inputs="TRACE yields and a selected bond-list partition field",
+        inputs="TRACE yield/price or G-spread snapshot and a selected bond-list partition field",
         status="Implemented",
-        validation="Exploratory yield proxy; not benchmark-relative spread; no out-of-sample validation yet",
+        validation="Exploratory single-space signal; no out-of-sample validation yet",
     ),
 )

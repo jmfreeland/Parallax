@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 from datetime import date
+import time
 from typing import Any
 
 import duckdb
-from PySide6.QtCore import QPointF, QRectF, QThread, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from .trace_history import DATABASE_PATH, connect_database
 from .treasury_curves import NODE_FIELDS, update_treasury_curve
@@ -17,10 +28,22 @@ from .treasury_curves import NODE_FIELDS, update_treasury_curve
 class CurveUpdateWorker(QThread):
     succeeded = Signal(object, object)
     failed = Signal(str)
+    progress = Signal(int, int, str, float)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.started_at = 0.0
+
+    def _report_progress(self, completed: int, total: int, message: str) -> None:
+        self.progress.emit(completed, total, message, time.monotonic() - self.started_at)
 
     def run(self) -> None:
+        self.started_at = time.monotonic()
         try:
-            rows, manifest = update_treasury_curve(database_path=DATABASE_PATH)
+            rows, manifest = update_treasury_curve(
+                database_path=DATABASE_PATH,
+                on_progress=self._report_progress,
+            )
             self.succeeded.emit(rows, manifest)
         except Exception as error:
             self.failed.emit(str(error))
@@ -100,11 +123,37 @@ class TreasuryCurveWindow(QMainWindow):
         self.setWindowTitle("Treasury Curve Updater")
         self.resize(1080, 660)
         self.worker: CurveUpdateWorker | None = None
+        self._progress_message = ""
+        self._progress_completed = 0
+        self._progress_total = 1
+        self._progress_elapsed = 0.0
+        self._progress_received_at = 0.0
+        self.curves_by_date: dict[str, dict[str, object]] = {}
+        self.retrieved_at_by_date: dict[str, str] = {}
         central = QWidget()
         layout = QVBoxLayout(central)
         self.status = QLabel("Loading the latest stored Treasury curve...")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setToolTip(
+            "Each annual Treasury XML request is a batch; final steps write the CSV, DuckDB vintage and manifest."
+        )
+        layout.addWidget(self.progress)
+        self.progress_timer = QTimer(self)
+        self.progress_timer.setInterval(1000)
+        self.progress_timer.timeout.connect(self._refresh_progress_status)
+        date_row = QHBoxLayout()
+        date_row.addWidget(QLabel("Observation date"))
+        self.observation_date = QComboBox()
+        self.observation_date.currentIndexChanged.connect(self._show_selected_curve)
+        date_row.addWidget(self.observation_date)
+        date_row.addStretch(1)
+        layout.addLayout(date_row)
+        self.history_range = QLabel("Stored curve history: unavailable")
+        layout.addWidget(self.history_range)
         self.chart = TreasuryCurveChart()
         layout.addWidget(self.chart, 1)
         self.update_button = QPushButton("Update curve from U.S. Treasury")
@@ -114,61 +163,133 @@ class TreasuryCurveWindow(QMainWindow):
         self._load_latest_curve()
 
     def _load_latest_curve(self) -> None:
+        self.observation_date.blockSignals(True)
+        self.observation_date.clear()
+        self.observation_date.blockSignals(False)
+        self.curves_by_date = {}
+        self.retrieved_at_by_date = {}
         if not DATABASE_PATH.exists():
             self.chart.set_curve(None)
+            self.history_range.setText("Stored curve history: unavailable")
             self.status.setText("No local Treasury curve database exists yet.")
             return
         connection = connect_database(DATABASE_PATH, initialize=False)
         try:
-            latest = connection.execute(
-                """SELECT curve_run_id, retrieved_at_utc FROM treasury_curve_runs
-                   ORDER BY retrieved_at_utc DESC LIMIT 1"""
-            ).fetchone()
-            if not latest:
-                self.chart.set_curve(None)
-                self.status.setText("No Treasury curve has been stored yet.")
-                return
-            run_id, retrieved_at = latest
-            curve_row = connection.execute(
-                """SELECT observation_date, tenor_years, par_yield_pct
-                   FROM treasury_curve_observations WHERE curve_run_id=?
-                   ORDER BY observation_date DESC, tenor_years""",
-                [run_id],
+            curve_rows = connection.execute(
+                """WITH ranked_observations AS (
+                       SELECT o.observation_date, o.tenor_years, o.par_yield_pct,
+                              r.retrieved_at_utc,
+                              row_number() OVER (
+                                  PARTITION BY o.observation_date, o.tenor_years
+                                  ORDER BY r.retrieved_at_utc DESC, o.curve_run_id DESC
+                              ) AS revision_rank
+                       FROM treasury_curve_observations o
+                       JOIN treasury_curve_runs r USING (curve_run_id)
+                   )
+                   SELECT observation_date, tenor_years, par_yield_pct, retrieved_at_utc
+                   FROM ranked_observations WHERE revision_rank=1
+                   ORDER BY observation_date DESC, tenor_years"""
             ).fetchall()
         except duckdb.Error as error:
             self.chart.set_curve(None)
+            self.history_range.setText("Stored curve history: unavailable")
             self.status.setText(f"Could not read the stored Treasury curve: {error}")
             return
         finally:
             connection.close()
-        if not curve_row:
+        if not curve_rows:
             self.chart.set_curve(None)
+            self.history_range.setText("Stored curve history: unavailable")
             self.status.setText("The latest Treasury run contains no curve nodes.")
             return
-        latest_date = curve_row[0][0]
-        values = {float(tenor): rate for observed, tenor, rate in curve_row if observed == latest_date}
-        row: dict[str, object] = {"date": latest_date}
-        for tenor in NODE_FIELDS.values():
-            row[f"yield_{tenor:g}y_pct"] = values.get(tenor)
+        for observed_date, tenor, rate, retrieved_at in curve_rows:
+            date_key = observed_date.isoformat()
+            row = self.curves_by_date.setdefault(date_key, {"date": observed_date})
+            row[f"yield_{float(tenor):g}y_pct"] = rate
+            self.retrieved_at_by_date[date_key] = str(retrieved_at)
+        available_dates = sorted(self.curves_by_date, reverse=True)
+        self.history_range.setText(
+            f"Stored curve history: {available_dates[-1]} to {available_dates[0]} "
+            f"| {len(available_dates):,} observation dates"
+        )
+        self.observation_date.blockSignals(True)
+        for date_key in available_dates:
+            self.observation_date.addItem(date_key, date_key)
+        self.observation_date.setCurrentIndex(0)
+        self.observation_date.blockSignals(False)
+        self._show_selected_curve()
+
+    def _show_selected_curve(self, *_args: Any) -> None:
+        date_key = self.observation_date.currentData()
+        if not date_key or date_key not in self.curves_by_date:
+            self.chart.set_curve(None)
+            return
+        row = self.curves_by_date[date_key]
         self.chart.set_curve(row)
+        node_count = sum(row.get(f"yield_{tenor:g}y_pct") is not None for tenor in NODE_FIELDS.values())
+        latest_date = next(iter(self.curves_by_date))
+        label = "Most recent" if date_key == latest_date else "Selected"
         self.status.setText(
-            f"Latest stored vintage: {latest_date} | retrieved {retrieved_at} UTC | "
-            f"{len(values)} published tenor nodes | run {str(run_id)[:8]}"
+            f"{label} curve: {date_key} | latest stored revision retrieved "
+            f"{self.retrieved_at_by_date[date_key]} UTC | {node_count} published tenor nodes"
         )
 
     def _update_curve(self) -> None:
         if self.worker is not None and self.worker.isRunning():
             return
         self.update_button.setEnabled(False)
-        self.status.setText("Downloading Treasury observations and saving a new curve vintage...")
+        self.progress.setRange(0, 0)
+        self._progress_message = "Preparing the Treasury curve update"
+        self._progress_completed = 0
+        self._progress_total = 1
+        self._progress_elapsed = 0.0
+        self._progress_received_at = time.monotonic()
+        self.status.setText(self._progress_message)
+        self.progress_timer.start()
         self.worker = CurveUpdateWorker(self)
+        self.worker.progress.connect(self._update_progress)
         self.worker.succeeded.connect(self._update_succeeded)
         self.worker.failed.connect(self._update_failed)
         self.worker.finished.connect(lambda: self.update_button.setEnabled(True))
         self.worker.start()
 
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        minutes, remaining_seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m"
+        if minutes:
+            return f"{minutes}m {remaining_seconds:02d}s"
+        return f"{remaining_seconds}s"
+
+    def _update_progress(self, completed: int, total: int, message: str, elapsed: float) -> None:
+        self.progress.setRange(0, total)
+        self.progress.setValue(completed)
+        self._progress_message = message
+        self._progress_completed = completed
+        self._progress_total = total
+        self._progress_elapsed = elapsed
+        self._progress_received_at = time.monotonic()
+        self._refresh_progress_status()
+
+    def _refresh_progress_status(self) -> None:
+        elapsed = self._progress_elapsed + max(0.0, time.monotonic() - self._progress_received_at)
+        annual_batches = max(1, self._progress_total - 3)
+        estimate_text = f" | elapsed {self._format_elapsed(elapsed)}"
+        if 0 < self._progress_completed < annual_batches:
+            average_batch_seconds = elapsed / self._progress_completed
+            remaining_batches = annual_batches - self._progress_completed
+            eta = self._format_elapsed(average_batch_seconds * remaining_batches)
+            estimate_text += f" | about {eta} for remaining downloads"
+        self.status.setText(f"{self._progress_message}{estimate_text}")
+
     def _update_succeeded(self, rows: list[dict[str, object]], manifest: dict[str, object]) -> None:
+        self.progress_timer.stop()
         self._load_latest_curve()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
         self.status.setText(
             f"Updated successfully: {manifest['observation_count']} Treasury dates, "
             f"{manifest['first_observation']} to {manifest['last_observation']} | "
@@ -177,7 +298,15 @@ class TreasuryCurveWindow(QMainWindow):
         )
 
     def _update_failed(self, message: str) -> None:
-        self.status.setText(f"Treasury curve update failed: {message}")
+        self.progress_timer.stop()
+        annual_batches = max(1, self._progress_total - 3)
+        batches_done = min(self._progress_completed, annual_batches)
+        if self.progress.maximum() == 0:
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+        self.status.setText(
+            f"Treasury curve update failed after {batches_done}/{annual_batches} annual batches: {message}"
+        )
 
 
 def main() -> None:

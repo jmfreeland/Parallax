@@ -45,6 +45,20 @@ COL_ATTEMPTS = 8
 COL_ERROR = 9
 
 
+class TraceTableItem(QTableWidgetItem):
+    """Sort by typed values where available and text otherwise."""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = self.data(Qt.ItemDataRole.UserRole)
+        right = other.data(Qt.ItemDataRole.UserRole)
+        if left is not None and right is not None:
+            try:
+                return left < right
+            except TypeError:
+                pass
+        return self.text().casefold() < other.text().casefold()
+
+
 class DownloadWorker(QThread):
     job_changed = Signal(object)
     progress_changed = Signal(int, int)
@@ -101,7 +115,6 @@ class TraceHistoryWindow(QMainWindow):
         self.resize(1400, 780)
         self.run_id: str | None = None
         self.worker: DownloadWorker | None = None
-        self.row_by_isin: dict[str, int] = {}
         self._loading_table = False
         self._close_when_finished = False
 
@@ -194,7 +207,9 @@ class TraceHistoryWindow(QMainWindow):
             QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.EditKeyPressed
         )
         self.table.verticalHeader().setVisible(False)
-        self.table.cellChanged.connect(self._cell_changed)
+        self.table.itemChanged.connect(self._item_changed)
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(COL_ISIN, Qt.SortOrder.AscendingOrder)
         layout.addWidget(self.table, 1)
 
         self.setCentralWidget(central)
@@ -330,11 +345,13 @@ class TraceHistoryWindow(QMainWindow):
 
     def _update_job(self, job: dict[str, Any]) -> None:
         isin = str(job.get("isin", ""))
-        row = self.row_by_isin.get(isin)
+        row = self._row_for_isin(isin)
         if row is None:
             self._refresh_jobs()
             return
         self._loading_table = True
+        sorting_enabled = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
         values = {
             COL_CUSIP: str(job.get("cusip") or ""),
             COL_STATUS: str(job.get("status") or ""),
@@ -348,12 +365,24 @@ class TraceHistoryWindow(QMainWindow):
         for column, value in values.items():
             item = self.table.item(row, column)
             if item is None:
-                item = QTableWidgetItem()
+                item = TraceTableItem()
                 self.table.setItem(row, column, item)
             item.setText(value)
+            if column in {COL_COUNT, COL_ATTEMPTS}:
+                item.setData(Qt.ItemDataRole.UserRole, int(value or 0))
         self._style_status_cell(row)
+        self.table.setSortingEnabled(sorting_enabled)
         self._loading_table = False
-        self._apply_filter_to_row(row)
+        current_row = self._row_for_isin(isin)
+        if current_row is not None:
+            self._apply_filter_to_row(current_row)
+
+    def _row_for_isin(self, isin: str) -> int | None:
+        matches = self.table.findItems(isin, Qt.MatchFlag.MatchExactly)
+        for item in matches:
+            if self.table.column(item) == COL_ISIN:
+                return self.table.row(item)
+        return None
 
     def _batch_started(self, size: int) -> None:
         self.progress.setRange(0, 0)
@@ -426,8 +455,10 @@ class TraceHistoryWindow(QMainWindow):
             self.statusBar().showMessage(f"Could not read run state: {error}")
             return
         self._loading_table = True
-        self.row_by_isin = {}
+        sort_column = self.table.horizontalHeader().sortIndicatorSection()
+        sort_order = self.table.horizontalHeader().sortIndicatorOrder()
         self.table.setUpdatesEnabled(False)
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(jobs))
         for row, job in enumerate(jobs):
             if row % 100 == 0:
@@ -435,7 +466,6 @@ class TraceHistoryWindow(QMainWindow):
                     f"Loading bond list into viewer: {row:,} of {len(jobs):,} bonds"
                 )
                 QApplication.processEvents()
-            self.row_by_isin[str(job["isin"])] = row
             values = [
                 job.get("isin") or "",
                 job.get("issuer_name") or "",
@@ -449,9 +479,11 @@ class TraceHistoryWindow(QMainWindow):
                 job.get("last_error") or "",
             ]
             for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
+                item = TraceTableItem(str(value))
                 if column != COL_CUSIP:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if column in {COL_COUNT, COL_ATTEMPTS}:
+                    item.setData(Qt.ItemDataRole.UserRole, int(value or 0))
                 if column == COL_CUSIP:
                     item.setToolTip("Double-click to correct the CUSIP, then resume or retry this bond.")
                 if column == COL_ERROR and value:
@@ -460,6 +492,11 @@ class TraceHistoryWindow(QMainWindow):
             self._style_status_cell(row)
         self._loading_table = False
         self.table.setUpdatesEnabled(True)
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(
+            sort_column if sort_column >= 0 else COL_ISIN,
+            sort_order if sort_column >= 0 else Qt.SortOrder.AscendingOrder,
+        )
         self.table.viewport().update()
         self._apply_filter()
         self.source_label.setText(
@@ -501,11 +538,12 @@ class TraceHistoryWindow(QMainWindow):
             except Exception as error:
                 self.source_label.setText(str(error))
 
-    def _cell_changed(self, row: int, column: int) -> None:
-        if self._loading_table or column != COL_CUSIP or not self.run_id:
+    def _item_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading_table or self.table.column(item) != COL_CUSIP or not self.run_id:
             return
+        row = self.table.row(item)
         isin = self.table.item(row, COL_ISIN).text()
-        cusip = self.table.item(row, COL_CUSIP).text().strip()
+        cusip = item.text().strip()
         try:
             trace_history.update_cusip(self.run_id, isin, cusip)
         except Exception as error:

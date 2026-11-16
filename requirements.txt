@@ -5,4 +5,4 @@ openbb-finra>=2.0,<3
 duckdb>=1.4,<3
 polars>=1.0
 QuantLib>=1.35
-numpy>=1.26
+numpy>=2.5.5
