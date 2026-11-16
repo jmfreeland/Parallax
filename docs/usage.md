@@ -159,19 +159,20 @@ omitted. The signal-to-change correlations reverse
 the change sign so that positive correlation means the residual correctly
 indicated tightening. **Horizon performance** ranks the full daily signal
 cross-section into ten equal-count groups, then plots each group's average
-cumulative duration-adjusted return proxy relative to that date's population
-average from T+1 through T+end. It does not apply the long/short tail cutoffs.
+cumulative side-adjusted yield change in basis points relative to that date's
+population average from T+1 through T+end. It does not apply duration scaling
+or long/short tail cutoffs.
 The separate **Signal correlations** panel shows daily-averaged and pooled
 Pearson and Spearman IC. Signal staleness, maximum gap between yield changes,
 minimum curve size, price age, horizon, and long-short tail quantile are
 configurable.
 
-Use **Signal vs. return** to inspect a bond-level cross-section. After an
+Use **Signal vs. outcome** to inspect a bond-level cross-section. After an
 evaluation completes, change the signal date or forward horizon directly in
 that tab; the app redraws from the cached outcomes for every tested horizon and
 date, without rerunning the evaluation. Compare each signal value with its
-cumulative side-adjusted yield change to inspect outliers and the shape of the
-signal relationship.
+cumulative side-adjusted yield-change outperformance versus the eligible
+population to inspect outliers and the shape of the signal relationship.
 
 For the percentile predictor, choose any field in the bond-list CSV as the
 partition (for example sector, issuer ticker, bond ticker, or maturity year).

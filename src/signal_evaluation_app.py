@@ -67,20 +67,18 @@ class HorizonCurvesChart(QWidget):
         deciles = [row["decile_average_outperformance_bps"] for row in rows]
         left, right = 76.0, float(self.width() - 24)
         top, bottom = 38.0, float(self.height() - 76)
-        x_min, x_max = float(rows[0]["horizon_days"]), float(rows[-1]["horizon_days"])
-        if x_max <= x_min:
-            x_max = x_min + 1.0
+        x_max = max(1.0, float(rows[-1]["horizon_days"]))
         valid_values = [float(value) for series in deciles for value in series if value is not None]
         y_min = min(0.0, min(valid_values, default=0.0))
         y_max = max(0.0, max(valid_values, default=0.0))
         pad = max(1.0, (y_max - y_min) * 0.12)
         y_min, y_max = y_min - pad, y_max + pad
-        x_map = lambda day: left + (day - x_min) / (x_max - x_min) * (right - left)
+        x_map = lambda day: left + day / x_max * (right - left)
         y_map = lambda value: bottom - (value - y_min) / (y_max - y_min) * (bottom - top)
 
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 24), Qt.AlignmentFlag.AlignLeft,
-                         "D1 = lowest signal, D10 = highest; return proxy vs. population")
+                         "D1 = lowest signal, D10 = highest; cumulative yield outperformance vs. population")
         for step in range(5):
             fraction = step / 4
             y_value = y_min + fraction * (y_max - y_min)
@@ -90,8 +88,18 @@ class HorizonCurvesChart(QWidget):
             painter.setPen(QColor("#94a3b8"))
             painter.drawText(QRectF(4, y - 9, 66, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{y_value:.1f}")
         painter.setPen(QColor("#94a3b8"))
-        painter.drawText(QRectF(4, top - 24, 70, 18), Qt.AlignmentFlag.AlignRight, "Outperf. (bps)")
-        painter.drawText(QRectF(left, bottom + 6, right - left, 20), Qt.AlignmentFlag.AlignCenter, "Calendar days after signal (T+1 to T+horizon)")
+        painter.drawText(QRectF(4, top - 24, 70, 18), Qt.AlignmentFlag.AlignRight, "Outperf. (bp)")
+        tick_step = max(1, round(x_max / 4))
+        tick_days = sorted({0, 1, *range(tick_step, int(x_max), tick_step), int(x_max)})
+        for tick_day in tick_days:
+            x = x_map(float(tick_day))
+            painter.setPen(QPen(QColor("#1b293b"), 1))
+            painter.drawLine(QPointF(x, top), QPointF(x, bottom))
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(QRectF(x - 24, bottom + 2, 48, 16), Qt.AlignmentFlag.AlignCenter,
+                             f"T+{tick_day}")
+        painter.drawText(QRectF(left, bottom + 20, right - left, 18), Qt.AlignmentFlag.AlignCenter,
+                         "T+0 is the signal date; forward outcome observations begin at T+1")
         painter.setPen(QPen(QColor("#64748b"), 1, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(left, y_map(0.0)), QPointF(right, y_map(0.0)))
 
@@ -99,7 +107,8 @@ class HorizonCurvesChart(QWidget):
                   "#fb923c", "#f97316", "#f43f5e", "#e879f9", "#c084fc")
         def draw_series(values: list[Any], color: str) -> None:
             path = QPainterPath()
-            drawing = False
+            path.moveTo(QPointF(x_map(0.0), y_map(0.0)))
+            drawing = True
             for row, value in zip(rows, values):
                 if value is None:
                     drawing = False
@@ -250,7 +259,7 @@ class SignalReturnScatterChart(QWidget):
 
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(QRectF(left, 8, right - left, 22), Qt.AlignmentFlag.AlignLeft,
-                         f"{len(self.rows):,} bonds | side-adjusted cumulative yield change")
+                         f"{len(self.rows):,} bonds | side-adjusted yield-change outperformance vs population")
         for fraction in range(5):
             ratio = fraction / 4
             y_value = y_min + ratio * (y_max - y_min)
@@ -261,7 +270,7 @@ class SignalReturnScatterChart(QWidget):
             painter.drawText(QRectF(4, y - 9, 72, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                              f"{y_value:.1f}")
         painter.setPen(QColor("#94a3b8"))
-        painter.drawText(QRectF(4, top - 23, 72, 18), Qt.AlignmentFlag.AlignRight, "Outcome (bps)")
+        painter.drawText(QRectF(4, top - 23, 72, 18), Qt.AlignmentFlag.AlignRight, "Outperf. (bp)")
         painter.drawText(QRectF(left, bottom + 22, right - left, 20), Qt.AlignmentFlag.AlignCenter,
                          "Signal value (percentile 0–100 or yield residual, pp)")
         if y_min <= 0 <= y_max:
@@ -576,7 +585,7 @@ class SignalEvaluationWindow(QMainWindow):
         scatter_layout.addWidget(self.scatter_status)
         self.scatter_chart = SignalReturnScatterChart()
         scatter_layout.addWidget(self.scatter_chart, 1)
-        self.tabs.addTab(scatter_page, "Signal vs. return")
+        self.tabs.addTab(scatter_page, "Signal vs. outcome")
 
         portfolio_page = QWidget()
         portfolio_layout = QVBoxLayout(portfolio_page)
@@ -822,6 +831,18 @@ class SignalEvaluationWindow(QMainWindow):
             event_rows,
             ("horizon_days", *[f"decile_{decile}_outperformance_bps" for decile in range(1, 11)]),
         )
+        for row_index, row in enumerate(event_rows):
+            dates_by_decile = row["decile_dates_with_returns"]
+            bonds_by_decile = row["decile_mean_bond_counts"]
+            for decile in range(10):
+                cell = self.horizon_table.item(row_index, decile + 1)
+                if cell is not None:
+                    mean_bonds = bonds_by_decile[decile]
+                    bonds_text = f"{mean_bonds:.1f}" if mean_bonds is not None else "n/a"
+                    cell.setToolTip(
+                        f"Averaged across {dates_by_decile[decile]} signal dates; "
+                        f"mean observed bonds per date: {bonds_text}"
+                    )
         self.correlation_chart.set_rows(event_rows)
         self._fill_table(
             self.correlation_table,

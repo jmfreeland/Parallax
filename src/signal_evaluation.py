@@ -259,6 +259,10 @@ def evaluate_nelson_siegel_signal(
         horizon: {decile: [] for decile in range(10)}
         for horizon in range(1, horizon_days + 1)
     }
+    decile_bond_counts_by_horizon: dict[int, dict[int, list[int]]] = {
+        horizon: {decile: [] for decile in range(10)}
+        for horizon in range(1, horizon_days + 1)
+    }
     event_pairs_by_horizon: dict[int, tuple[list[float], list[float]]] = {
         horizon: ([], []) for horizon in range(1, horizon_days + 1)
     }
@@ -438,9 +442,6 @@ def evaluate_nelson_siegel_signal(
                         cumulative_raw[isin] += change
                         cumulative_portfolio_raw[isin] += change
 
-            for isin in active_isins:
-                scatter_outcomes[isin][horizon - 1] = -cumulative_demeaned[isin]
-
             pairs = [row for row in signals if row["isin"] in active_isins]
             side_adjusted_targets = [-cumulative_demeaned[row["isin"]] for row in pairs]
             signal_values = [row["signal_value_pct"] for row in pairs]
@@ -464,21 +465,25 @@ def evaluate_nelson_siegel_signal(
                 float(np.mean(long_leg_proxy) - np.mean(short_leg_proxy))
                 if long_leg and short_leg else None
             )
-            decile_bond_returns: dict[int, list[float]] = {decile: [] for decile in range(10)}
-            population_returns: list[float] = []
-            for row in pairs:
-                duration = row["modified_duration_years"]
-                if duration is None:
-                    continue
-                return_proxy = -float(duration) * cumulative_demeaned[row["isin"]]
-                population_returns.append(return_proxy)
-                decile_bond_returns[signal_deciles[row["isin"]]].append(return_proxy)
-            population_average_return = float(np.mean(population_returns)) if population_returns else None
-            for decile, returns in decile_bond_returns.items():
-                if returns and population_average_return is not None:
+            decile_outcomes: dict[int, list[float]] = {decile: [] for decile in range(10)}
+            population_outcomes = {
+                row["isin"]: -cumulative_demeaned[row["isin"]]
+                for row in pairs
+            }
+            population_average_outcome = (
+                float(np.mean(list(population_outcomes.values()))) if population_outcomes else None
+            )
+            if population_average_outcome is not None:
+                for row in pairs:
+                    outcome = population_outcomes[row["isin"]] - population_average_outcome
+                    scatter_outcomes[row["isin"]][horizon - 1] = outcome
+                    decile_outcomes[signal_deciles[row["isin"]]].append(outcome)
+            for decile, outcomes in decile_outcomes.items():
+                if outcomes and population_average_outcome is not None:
                     decile_returns_by_horizon[horizon][decile].append(
-                        float(np.mean(returns)) - population_average_return
+                        float(np.mean(outcomes))
                     )
+                    decile_bond_counts_by_horizon[horizon][decile].append(len(outcomes))
             strategy_bonds = (*long_leg, *short_leg)
             change_coverage = (
                 100.0 * sum(row["isin"] in active_isins and row["modified_duration_years"] is not None
@@ -679,6 +684,11 @@ def evaluate_nelson_siegel_signal(
             for decile in range(10)
         ]
         decile_date_counts = [len(decile_returns_by_horizon[horizon][decile]) for decile in range(10)]
+        decile_mean_bond_counts = [
+            float(np.mean(decile_bond_counts_by_horizon[horizon][decile]))
+            if decile_bond_counts_by_horizon[horizon][decile] else None
+            for decile in range(10)
+        ]
         event_curve_results.append({
             "horizon_days": horizon,
             "dates_with_correlation": len(valid_spearman),
@@ -692,6 +702,7 @@ def evaluate_nelson_siegel_signal(
             "mean_long_short_change_coverage_pct": float(np.mean(valid_coverage)) if valid_coverage else None,
             "decile_average_outperformance_bps": decile_means,
             "decile_dates_with_returns": decile_date_counts,
+            "decile_mean_bond_counts": decile_mean_bond_counts,
             **{f"decile_{decile + 1}_outperformance_bps": decile_means[decile]
                for decile in range(10)},
         })
@@ -746,7 +757,7 @@ def evaluate_nelson_siegel_signal(
         "minimum_daily_change_cross_section": MIN_DAILY_CHANGE_CROSS_SECTION
         if predictor_id == PREDICTOR_NELSON_SIEGEL else None,
         "side_adjustment_definition": "multiply the forward yield change by -1 so a positive value is favorable to a high-yield signal; residual outcomes are cross-sectionally de-meaned, percentile outcomes are not",
-        "horizon_decile_definition": "rank the full daily signal cross-section into ten equal-count deciles; within each signal date and forward horizon, calculate each decile's equal-weighted duration-adjusted return proxy from cross-sectionally de-meaned yield changes, subtract the available population average, then average daily decile outperformance across signal dates; no long-short tail cutoff is applied",
+        "horizon_decile_definition": "rank the full daily signal cross-section into ten equal-count deciles; within each signal date and forward horizon, calculate each decile's mean cumulative side-adjusted cross-sectionally de-meaned yield change in bps, subtract the available population average, then average daily decile outperformance across signal dates; no duration scaling or long-short tail cutoff is applied",
         "spread_measurement": "TRACE yield-level/change proxy; no Treasury benchmark-relative spread available",
         "percentile_definition": "mid-rank percentile of the partition median latest TRACE yield versus strictly prior partition medians in trailing history; partition signals apply to all constituent bonds and portfolio legs are bond equal-weighted"
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE else None,
