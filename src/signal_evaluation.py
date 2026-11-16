@@ -14,7 +14,10 @@ from typing import Any, Callable
 import duckdb
 import numpy as np
 
-from .bond_returns import calculate_historical_bond_total_return
+from .bond_returns import (
+    calculate_historical_bond_total_return,
+    calculate_modified_duration_from_yield,
+)
 from .nelson_siegel import METHODOLOGY, _basis, _fit_curve
 from .trace_cleaning import TRACE_POLICY_VERSION, TRACE_SERIES_CLEANING_VERSION, clean_trace_value
 
@@ -326,6 +329,7 @@ def evaluate_nelson_siegel_signal(
         connection.close()
 
     observations: dict[str, list[tuple[date, float]]] = {isin: [] for isin in bonds}
+    duration_yield_observations: dict[str, list[tuple[date, float]]] = {isin: [] for isin in bonds}
     price_observations: dict[str, list[tuple[date, float]]] = {isin: [] for isin in bonds}
     signal_dates: set[date] = set()
     percentile_history_dates: set[date] = set()
@@ -334,6 +338,7 @@ def evaluate_nelson_siegel_signal(
         clean_price = clean_trace_value("price", raw_price)
         if value is not None:
             observations[isin].append((trade_date, value))
+            duration_yield_observations[isin].append((trade_date, value))
             if start_date <= trade_date <= end_date:
                 signal_dates.add(trade_date)
             elif predictor_id in PARTITION_PREDICTORS and query_start <= trade_date < start_date:
@@ -353,10 +358,11 @@ def evaluate_nelson_siegel_signal(
             spread_snapshot_id = str(snapshot[0])
             spread_placeholders = ",".join("?" for _ in bonds)
             spread_rows = spread_connection.execute(
-                f"""SELECT upper(isin), trade_date, g_spread_bps
+                f"""SELECT upper(isin), trade_date, g_spread_bps, trace_yield_pct, yield_reversal_flagged
                    FROM bond_spread_observations
                    WHERE snapshot_id=? AND upper(isin) IN ({spread_placeholders})
                      AND trade_date BETWEEN ? AND ? AND g_spread_bps IS NOT NULL
+                     AND coalesce(yield_reversal_flagged, false) = false
                    ORDER BY upper(isin), trade_date""",
                 [spread_snapshot_id, *bonds, query_start, query_end],
             ).fetchall()
@@ -364,8 +370,12 @@ def evaluate_nelson_siegel_signal(
             raise ValueError("Spread-space signals require an available G-spread snapshot.") from error
         finally:
             spread_connection.close()
-        for isin, observed_date, spread_bps in spread_rows:
+        duration_yield_observations = {isin: [] for isin in bonds}
+        for isin, observed_date, spread_bps, trace_yield, _reversal_flagged in spread_rows:
             spreads_by_isin[isin].append((observed_date, float(spread_bps)))
+            clean_yield = clean_trace_value("last_sale_yield", trace_yield)
+            if clean_yield is not None:
+                duration_yield_observations[isin].append((observed_date, clean_yield))
         observations = {isin: spreads_by_isin.get(isin, []) for isin in bonds}
         signal_dates = {
             observed_date for history in observations.values()
@@ -433,6 +443,28 @@ def evaluate_nelson_siegel_signal(
                 "observed_signal_level": ytm,
                 "maturity_years": maturity_years,
             }
+            duration_history = duration_yield_observations[isin]
+            duration_dates = [item[0] for item in duration_history]
+            duration_index = bisect_right(duration_dates, as_of) - 1
+            point_in_time_duration = None
+            if (
+                signal_space in {SIGNAL_SPACE_YIELD, SIGNAL_SPACE_SPREAD}
+                and as_of >= start_date
+                and duration_index >= 0
+                and metadata["coupon_pct"] is not None
+            ):
+                duration_date, duration_yield = duration_history[duration_index]
+                if (as_of - duration_date).days <= maximum_signal_age_days:
+                    try:
+                        point_in_time_duration = calculate_modified_duration_from_yield(
+                            as_of_date=as_of,
+                            maturity_date=metadata["maturity_date"],
+                            coupon_pct=metadata["coupon_pct"],
+                            yield_pct=duration_yield,
+                        )
+                    except (ValueError, RuntimeError):
+                        point_in_time_duration = None
+            eligible["modified_duration_years"] = point_in_time_duration
             if metadata["ticker"]:
                 grouped.setdefault(metadata["ticker"], []).append(eligible)
             partitioned.setdefault(metadata["partition_value"], []).append(eligible)
@@ -1045,6 +1077,11 @@ def evaluate_nelson_siegel_signal(
             if signal_space == SIGNAL_SPACE_PRICE else
             f"post-signal {signal_space} changes expressed in basis points; consecutive observations only; long gaps omitted"
         ),
+        "duration_definition": (
+            "QuantLib modified duration calculated on each signal date from the bond's coupon, remaining maturity, and latest valid TRACE yield no older than the maximum signal age; bonds without a valid point-in-time yield or coupon are excluded from duration-adjusted proxy coverage"
+            if signal_space in {SIGNAL_SPACE_YIELD, SIGNAL_SPACE_SPREAD}
+            else "not used for price-space returns"
+        ),
         "daily_demeaning_definition": "not applied to historical partition signals; Nelson-Siegel residual outcomes subtract the per-date cross-sectional mean and omit dates with fewer than five changes",
         "stale_signal_observation_policy": "when a bond's signal observation predates the signal date, omit its first later change because that move spans time before the signal; include changes only after two post-signal observations are available",
         "minimum_daily_change_cross_section": MIN_DAILY_CHANGE_CROSS_SECTION
@@ -1066,7 +1103,7 @@ def evaluate_nelson_siegel_signal(
         "strategy_return_definition": (
             "equal-weighted clean-price log-return proxy in basis points"
             if signal_space == SIGNAL_SPACE_PRICE else
-            f"equal-weighted modified-duration-adjusted {signal_space}-change proxy in basis points"
+            f"equal-weighted {signal_space}-change proxy in basis points, scaled by point-in-time QuantLib modified duration from TRACE yield"
         ) + "; top signal quantile is long, bottom is short; partition signals select whole partition tails; missing changes contribute zero and coverage is reported",
         "total_return_definition": "at maximum horizon, equal-weighted long minus short fixed-rate bond total return; unpriced positions contribute zero at their target weight and coverage is reported",
         "rebalanced_series_definition": f"daily signal selection held to next TRACE signal date; report the raw {signal_space}-change long-short proxy, covered total-return long-short contribution, long-only gross total return, and long-only total return net of 1-month Treasury financing; no cross-sectional demeaning is applied to portfolio returns; missing position and Treasury-rate coverage are reported",
