@@ -1,0 +1,16 @@
+{
+  "source": "U.S. Treasury daily nominal par yield curve XML feed",
+  "source_url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml",
+  "requested_window": {
+    "start": "2021-11-11",
+    "end": "2026-11-16"
+  },
+  "observation_count": 1250,
+  "first_observation": "2021-11-12",
+  "last_observation": "2026-11-13",
+  "retrieved_at_utc": "2026-11-16T06:30:24.861570+00:00",
+  "yield_unit": "percent",
+  "curve_type": "nominal par yield (Treasury CMT nodes)",
+  "curve_run_id": "58d82956-c087-4419-9555-11b742716905",
+  "source_file_sha256": "4524c2ab79a76f714f65cce9738e5cc6e42d6a6188ba0833e0809519306c1c73"
+}

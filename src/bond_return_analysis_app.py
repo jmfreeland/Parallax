@@ -13,6 +13,7 @@ from PySide6.QtCore import QDate, QPointF, QRectF, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDoubleSpinBox,
@@ -149,6 +150,9 @@ class BondReturnAnalysisWindow(QMainWindow):
         self.rate_column = QComboBox()
         self.rate_column.setMinimumWidth(130)
         rate_source.addWidget(self.rate_column)
+        self.use_g_spread = QCheckBox("Add bond G-spread from latest snapshot")
+        self.use_g_spread.setChecked(True)
+        rate_source.addWidget(self.use_g_spread)
         layout.addLayout(rate_source)
 
         controls = QHBoxLayout()
@@ -189,7 +193,8 @@ class BondReturnAnalysisWindow(QMainWindow):
         layout.addLayout(controls)
 
         layout.addWidget(QLabel(
-            "Financing rate = latest short rate known at the start of each interval + spread. "
+            "Financing rate = latest short rate + optional bond G-spread + additional spread, "
+            "all known at the start of each interval. "
             "Excess log return = log(1 + bond total return) − log(1 + financing accrual), ACT/365."
         ))
         self.summary = QLabel("Select a bond, dates, a short-rate CSV and rate column, then run the analysis.")
@@ -200,10 +205,11 @@ class BondReturnAnalysisWindow(QMainWindow):
         layout.addWidget(self.status)
         self.chart = ReturnSeriesChart()
         layout.addWidget(self.chart, 2)
-        self.table = QTableWidget(0, 15)
+        self.table = QTableWidget(0, 18)
         self.table.setHorizontalHeaderLabels([
             "Date", "Price mark date", "Price age (days)", "Clean price", "Period days",
             "Bond return (%)", "Rate observation date", "Rate age (days)", "Base short rate (%)",
+            "G-spread observation date", "G-spread (bp)", "G-spread age (days)",
             "Financing rate (%)", "Financing log return", "Bond log return", "Excess log return",
             "Cumulative excess index", "Mark status",
         ])
@@ -294,6 +300,7 @@ class BondReturnAnalysisWindow(QMainWindow):
             "financing_rate_csv_path": Path(self.rate_file.text()).expanduser(),
             "financing_rate_column": self.rate_column.currentText(),
             "financing_spread_bps": self.spread.value(),
+            "use_g_spread_snapshot": self.use_g_spread.isChecked(),
             "maximum_price_age_days": self.price_age.value(),
             "maximum_financing_rate_age_days": self.rate_age.value(),
             "bond_list_path": Path(self.bond_list.text()).expanduser(),
@@ -327,13 +334,16 @@ class BondReturnAnalysisWindow(QMainWindow):
             f"Annualized excess {format_optional(summary['annualized_log_excess_return_pct'], '%')} | "
             f"Excess volatility {format_optional(summary['annualized_excess_volatility_pct'], '%')} | "
             f"Excess Sharpe {format_optional(summary['excess_sharpe_ratio'])} | "
-            f"Spread {summary['financing_spread_bps']:.1f} bp over {summary['financing_rate_column']}"
+            f"Spread {summary['financing_spread_bps']:.1f} bp over {summary['financing_rate_column']}" +
+            (f" + bond G-spread (snapshot {summary['g_spread_snapshot_id'][:8]})"
+             if summary.get("use_g_spread_snapshot") else "")
         )
         self.chart.set_rows(result["time_series"])
         fields = (
             "date", "price_observation_date", "price_age_days", "clean_price_per_100", "period_days",
             "bond_total_return_pct", "financing_rate_observation_date", "financing_rate_age_days",
-            "base_short_rate_pct", "financing_rate_pct", "financing_log_return", "bond_log_return",
+            "base_short_rate_pct", "g_spread_observation_date", "g_spread_bps", "g_spread_age_days",
+            "financing_rate_pct", "financing_log_return", "bond_log_return",
             "log_excess_return", "cumulative_excess_index", "mark_status",
         )
         rows = result["time_series"]

@@ -104,31 +104,51 @@ class LauncherWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addWidget(QLabel("LQD research tools"))
-
-        buttons = QGridLayout()
-        actions = (
-            ("Review issuer mappings", "src.mapping_app"),
-            ("Inspect latest holdings", "src.lqd_inspector"),
-            ("Refresh issuer candidates", "src.resolve_lqd_tickers"),
-            ("Build bond snapshot", "src.build_lqd_snapshot"),
-            ("Download TRACE history", "src.trace_history_app"),
-            ("Preprocess TRACE history", "src.trace_preprocessor"),
-            ("Clean preprocessed TRACE data", "src.trace_cleaner_app"),
-            ("Inspect TRACE history", "src.trace_history_inspector"),
-        )
         self.buttons: list[QPushButton] = []
-        for index, (label, module) in enumerate(actions):
-            button = QPushButton(label)
-            button.clicked.connect(lambda checked=False, name=module: self._launch(name))
-            self.buttons.append(button)
-            buttons.addWidget(button, index // 2, index % 2)
-        layout.addLayout(buttons)
 
         self.status = QLabel("Ready")
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status)
 
         self.tabs = QTabWidget()
+        security_page = QWidget()
+        security_layout = QVBoxLayout(security_page)
+        security_actions = QGridLayout()
+        security_master_tools = (
+            ("Review issuer mappings", "src.mapping_app"),
+            ("Inspect latest holdings", "src.lqd_inspector"),
+            ("Refresh issuer candidates", "src.resolve_lqd_tickers"),
+            ("Build bond snapshot", "src.build_lqd_snapshot"),
+        )
+        for index, (label, module) in enumerate(security_master_tools):
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, name=module: self._launch(name))
+            self.buttons.append(button)
+            security_actions.addWidget(button, index // 2, index % 2)
+        security_layout.addLayout(security_actions)
+        security_layout.addStretch(1)
+        self.tabs.addTab(security_page, "Security Master")
+
+        data_page = QWidget()
+        data_layout = QVBoxLayout(data_page)
+        data_actions = QGridLayout()
+        data_tools = (
+            ("Download TRACE history", "src.trace_history_app"),
+            ("Update Treasury curve", "src.treasury_curves_app"),
+            ("Preprocess TRACE history", "src.trace_preprocessor"),
+            ("Clean preprocessed TRACE data", "src.trace_cleaner_app"),
+            ("Build G-spread snapshot", "src.spread_snapshot_app"),
+            ("Inspect TRACE history", "src.trace_history_inspector"),
+        )
+        for index, (label, module) in enumerate(data_tools):
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, name=module: self._launch(name))
+            self.buttons.append(button)
+            data_actions.addWidget(button, index // 2, index % 2)
+        data_layout.addLayout(data_actions)
+        data_layout.addStretch(1)
+        self.tabs.addTab(data_page, "Data")
+
         portfolio_page = QWidget()
         portfolio_layout = QVBoxLayout(portfolio_page)
         portfolio_actions = QGridLayout()

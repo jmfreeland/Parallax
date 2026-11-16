@@ -126,8 +126,14 @@ class TraceHistoryWindow(QMainWindow):
         self.new_run_button.clicked.connect(self._new_run)
         self.resume_button = QPushButton("Start / resume")
         self.resume_button.clicked.connect(self._resume_run)
+        self.update_button = QPushButton("Update TRACE to current")
+        self.update_button.setToolTip(
+            "Fetch from the newest stored trade date with a 10-day overlap for recent corrections."
+        )
+        self.update_button.clicked.connect(self._update_to_current)
         controls.addWidget(self.new_run_button)
         controls.addWidget(self.resume_button)
+        controls.addWidget(self.update_button)
         layout.addLayout(controls)
 
         action_row = QHBoxLayout()
@@ -207,6 +213,28 @@ class TraceHistoryWindow(QMainWindow):
 
     def _resume_run(self) -> None:
         self._prepare_and_start(resume=True)
+
+    def _update_to_current(self) -> None:
+        if self._worker_running():
+            return
+        self.statusBar().showMessage("Preparing an incremental TRACE update…")
+        self._set_controls_enabled(False)
+        QApplication.processEvents()
+        try:
+            trace_history.initialize_provider()
+            self.run_id, start_date, end_date = trace_history.prepare_incremental_run()
+            self.start_date.setDate(QDate(start_date.year, start_date.month, start_date.day))
+            self.end_date.setDate(QDate(end_date.year, end_date.month, end_date.day))
+        except Exception as error:
+            logger.exception("Could not prepare an incremental TRACE update")
+            self._set_controls_enabled(True)
+            QMessageBox.critical(self, "Could not prepare update", str(error))
+            return
+        self._refresh_jobs()
+        self.statusBar().showMessage(
+            f"Updating TRACE from {start_date} through {end_date} in run {self.run_id}"
+        )
+        self._start_worker("download")
 
     def _prepare_and_start(self, resume: bool) -> None:
         if self._worker_running():
@@ -294,6 +322,7 @@ class TraceHistoryWindow(QMainWindow):
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.new_run_button.setEnabled(enabled)
         self.resume_button.setEnabled(enabled)
+        self.update_button.setEnabled(enabled)
         self.refresh_button.setEnabled(enabled)
         self.retry_button.setEnabled(enabled and bool(self.run_id))
         self.augment_button.setEnabled(enabled and bool(self.run_id))

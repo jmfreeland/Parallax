@@ -108,9 +108,9 @@ before choosing a backfill size.
 - Preserve the provider's returned trade date, price, and yield as reported.
   Keep price and yield units explicit. Never convert an absent observation into
   a flat price or forward-fill it.
-- Treat repeated requests as revisions of the same source observations. Keep
-  retrieval time and refresh a bounded recent window after the initial load so
-  provider corrections can be captured idempotently.
+- Treat repeated requests as new observation vintages. Keep retrieval time and
+  refresh a bounded recent window after the initial load so provider
+  corrections are retained without replacing prior values.
 - Keep raw provider output only if the agreement permits it. Otherwise retain
   normalized fields and request metadata sufficient to reproduce the query.
 
@@ -121,12 +121,12 @@ before choosing a backfill size.
 2. Resolve identifiers, then backfill the provider's available history in
    measured batches. Begin with a small batch-size limit established in Phase
    1; increase only after checking response completeness and throttling.
-3. Store a normalized observation keyed by `(isin, trade_date, source)` with
-   CUSIP, FINRA symbol/security ID, product type, price, yield, retrieval time,
-   and source/version metadata. Keep run state and resumable per-bond jobs in
-   DuckDB. Export completed runs as Parquet for durable analytical files and
-   use Polars for per-bond quality checks. CSV is an optional interchange
-   export, not the run store. Keep the provider adapter independent of storage.
+3. Store a normalized observation vintage keyed by retrieval, ISIN, and trade
+   date, with CUSIP, FINRA symbol/security ID, product type, price, yield,
+   retrieval time, and normalized-record hash. Keep run state and resumable
+   per-bond jobs in DuckDB. Completed runs select the latest observations
+   known at their completion cutoff and export to a unique Parquet snapshot.
+   CSV is an optional interchange export, not the run store.
 4. Make writes resumable and idempotent. Persist completed batches and failures
    so an interrupted backfill resumes without losing successful work.
 5. Keep downloaded observations out of source control unless FINRA's terms
@@ -138,9 +138,10 @@ before choosing a backfill size.
 - Read a supplied fund list and preserve its source date and provenance. Start
   with the existing LQD workflow, but keep that input adapter replaceable so a
   better managed fund source can take over.
-- Resolve newly supplied bonds and fetch their available history. Refresh a
-  recent lookback window for known bonds to pick up corrections; do not
-  redownload the entire history every day.
+- Resolve newly supplied bonds and fetch their available history. The manual
+  incremental action starts at the latest stored trade date with a ten-day
+  overlap, retaining corrections as a new vintage instead of redownloading the
+  entire history.
 - Record run start/end time, holdings source date, universe size, resolved and
   unresolved identifiers, rows inserted/updated, empty histories, errors, and
   provider warnings.

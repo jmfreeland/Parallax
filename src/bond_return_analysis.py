@@ -89,6 +89,34 @@ def _load_financing_history(
     return history
 
 
+def _load_g_spread_history(
+    database_path: Path, isin: str
+) -> tuple[str, list[tuple[date, float]]]:
+    """Load the latest immutable G-spread snapshot for one bond."""
+    connection = duckdb.connect(str(database_path), read_only=True)
+    try:
+        latest = connection.execute(
+            "SELECT snapshot_id FROM spread_snapshot_runs ORDER BY generated_at_utc DESC LIMIT 1"
+        ).fetchone()
+        if not latest:
+            raise ValueError("No G-spread snapshot is available. Build one from the launcher first.")
+        snapshot_id = str(latest[0])
+        rows = connection.execute(
+            """SELECT trade_date, g_spread_bps FROM bond_spread_observations
+               WHERE snapshot_id=? AND upper(isin)=? AND g_spread_bps IS NOT NULL
+               ORDER BY trade_date""",
+            [snapshot_id, isin],
+        ).fetchall()
+    except duckdb.Error as error:
+        raise ValueError("No G-spread snapshot is available. Build one from the launcher first.") from error
+    finally:
+        connection.close()
+    history = [(observed_date, float(spread)) for observed_date, spread in rows]
+    if not history:
+        raise ValueError(f"The latest G-spread snapshot has no valid observations for {isin}.")
+    return snapshot_id, history
+
+
 def _business_dates(start_date: date, end_date: date) -> list[date]:
     dates: list[date] = []
     current = start_date + timedelta(days=1)
@@ -107,6 +135,7 @@ def analyze_bond_return_series(
     financing_rate_csv_path: Path,
     financing_rate_column: str,
     financing_spread_bps: float = 0.0,
+    use_g_spread_snapshot: bool = True,
     maximum_price_age_days: int = 30,
     maximum_financing_rate_age_days: int = 7,
     bond_list_path: Path = DEFAULT_SNAPSHOT,
@@ -140,6 +169,12 @@ def analyze_bond_return_series(
         raise ValueError("The bond matures on or before the selected start date")
     rates = _load_financing_history(Path(financing_rate_csv_path), financing_rate_column)
     rate_dates = [observed_date for observed_date, _ in rates]
+    g_spread_snapshot_id: str | None = None
+    g_spreads: list[tuple[date, float]] = []
+    g_spread_dates: list[date] = []
+    if use_g_spread_snapshot:
+        g_spread_snapshot_id, g_spreads = _load_g_spread_history(Path(database_path), normalized_isin)
+        g_spread_dates = [observed_date for observed_date, _ in g_spreads]
     query_end = min(end_date, maturity_date)
     connection = duckdb.connect(str(database_path), read_only=True)
     try:
@@ -173,6 +208,7 @@ def analyze_bond_return_series(
         "bond_total_return_pct": 0.0,
         "financing_rate_pct": None,
         "financing_spread_bps": financing_spread_bps,
+        "g_spread_bps": None,
         "financing_log_return": 0.0,
         "bond_log_return": 0.0,
         "log_excess_return": 0.0,
@@ -201,7 +237,18 @@ def analyze_bond_return_series(
                 f"Financing rate is {rate_age_days} days old at {previous_date}; "
                 f"limit is {maximum_financing_rate_age_days}"
             )
-        financing_rate_pct = base_rate_pct + financing_spread_bps / 100.0
+        g_spread_index = bisect_right(g_spread_dates, previous_date) - 1 if g_spreads else -1
+        g_spread_bps = g_spreads[g_spread_index][1] if g_spread_index >= 0 else 0.0
+        g_spread_date = g_spreads[g_spread_index][0] if g_spread_index >= 0 else None
+        if use_g_spread_snapshot and g_spread_date is None:
+            raise ValueError(f"No G-spread observation on or before {previous_date} for {normalized_isin}")
+        g_spread_age_days = (previous_date - g_spread_date).days if g_spread_date else None
+        if g_spread_age_days is not None and g_spread_age_days > maximum_financing_rate_age_days:
+            raise ValueError(
+                f"G-spread is {g_spread_age_days} days old at {previous_date}; "
+                f"limit is {maximum_financing_rate_age_days}"
+            )
+        financing_rate_pct = base_rate_pct + (financing_spread_bps + g_spread_bps) / 100.0
         financing_simple_return = (financing_rate_pct / 100.0) * period_days / 365.0
         if financing_simple_return <= -1.0:
             raise ValueError("Financing accrual implies a loss of 100% or more")
@@ -241,6 +288,9 @@ def analyze_bond_return_series(
             "base_short_rate_pct": base_rate_pct,
             "financing_rate_observation_date": rate_date.isoformat(),
             "financing_rate_age_days": rate_age_days,
+            "g_spread_bps": g_spread_bps if use_g_spread_snapshot else None,
+            "g_spread_observation_date": g_spread_date.isoformat() if g_spread_date else None,
+            "g_spread_age_days": g_spread_age_days,
             "financing_spread_bps": financing_spread_bps,
             "financing_log_return": financing_log_return,
             "bond_log_return": bond_log_return,
@@ -282,7 +332,13 @@ def analyze_bond_return_series(
         "bond_list_path": str(Path(bond_list_path).resolve()),
         "trace_database_path": str(Path(database_path).resolve()),
         "financing_spread_bps": financing_spread_bps,
-        "financing_definition": "latest short-rate observation known at interval start plus annualized spread; ACT/365 simple accrual; log excess = log bond gross return minus log financing gross return",
+        "use_g_spread_snapshot": use_g_spread_snapshot,
+        "g_spread_snapshot_id": g_spread_snapshot_id,
+        "financing_definition": (
+            "latest short-rate observation known at interval start plus configured spread"
+            + (" and latest bond G-spread from the selected snapshot" if use_g_spread_snapshot else "")
+            + "; ACT/365 simple accrual; log excess = log bond gross return minus log financing gross return"
+        ),
         "price_marking_definition": "business-day marks use the latest valid TRACE clean price on or before the mark date; clean price carries forward and age is reported; accrued interest and synthetic coupon schedule are included",
         "mark_count": max(0, len(rows) - 1),
         "cumulative_bond_return_pct": 100.0 * math.expm1(cumulative_bond_log),

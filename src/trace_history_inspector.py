@@ -624,11 +624,6 @@ class HistoryChart(QWidget):
                 lower = smooth_boundary(
                     [(x, y_pos(float(p25))) for x, p25, _p75 in reversed(band_points)]
                 )
-                band = QPainterPath(upper)
-                band.connectPath(lower)
-                band.closeSubpath()
-                painter.fillPath(band, QColor(36, 91, 117, 105))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.setPen(QPen(QColor("#53b7d8"), 1.8))
                 painter.drawPath(upper)
                 painter.drawPath(lower)

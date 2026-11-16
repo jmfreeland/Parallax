@@ -14,7 +14,7 @@ import duckdb
 
 from .data_preprocessing import reason_sql
 from .trace_cleaning import TRACE_FIELD_POLICIES, TRACE_POLICY_VERSION, trace_value_sql
-from .trace_history import DATABASE_PATH, TRACE_DIR
+from .trace_history import DATABASE_PATH, TRACE_DIR, connect_database
 
 
 def _sql_literal(value: str) -> str:
@@ -56,18 +56,22 @@ def run_preprocessor(
     started_at = datetime.now(timezone.utc)
     if not database_path.exists():
         raise FileNotFoundError(f"TRACE history database not found: {database_path}")
+    migration = connect_database(database_path, initialize=True)
+    migration.close()
     connection = duckdb.connect(str(database_path), read_only=True)
     try:
         if run_id is None:
             run = connection.execute(
                 """SELECT run_id, status, start_date, end_date, total_bonds,
-                          snapshot_path, snapshot_as_of_date, population_hash
+                          snapshot_path, snapshot_as_of_date, population_hash,
+                          coalesce(completed_at_utc, updated_at_utc), snapshot_sha256
                    FROM history_runs ORDER BY created_at_utc DESC LIMIT 1"""
             ).fetchone()
         else:
             run = connection.execute(
                 """SELECT run_id, status, start_date, end_date, total_bonds,
-                          snapshot_path, snapshot_as_of_date, population_hash
+                          snapshot_path, snapshot_as_of_date, population_hash,
+                          coalesce(completed_at_utc, updated_at_utc), snapshot_sha256
                    FROM history_runs WHERE run_id=?""",
                 [run_id],
             ).fetchone()
@@ -76,6 +80,7 @@ def run_preprocessor(
         (
             run_id, run_status, start_date, end_date, total_bonds,
             snapshot_path, snapshot_as_of_date, population_hash,
+            observation_as_of_utc, snapshot_sha256,
         ) = run
         print(f"TRACE preprocessor {TRACE_POLICY_VERSION}", flush=True)
         print(f"Source run: {run_id} ({run_status})", flush=True)
@@ -96,19 +101,31 @@ def run_preprocessor(
         print("Scanning raw field values...", flush=True)
         diagnostics = connection.execute(
             f"""SELECT count(*) AS input_rows, count(DISTINCT o.isin) AS securities_with_observations,
+                       min(o.trade_date) AS first_observation_date,
+                       max(o.trade_date) AS last_observation_date,
                        count(*) FILTER (WHERE ({price_reason}) <> 'valid'
                                            OR ({yield_reason}) <> 'valid') AS rows_with_exclusions,
                        {_field_diagnostics('price')},
                        {_field_diagnostics('last_sale_yield')}
-                FROM observations o
+                FROM (
+                    SELECT v.*,
+                           row_number() OVER (
+                               PARTITION BY v.isin, v.trade_date
+                               ORDER BY v.retrieved_at_utc DESC, v.retrieval_id DESC
+                           ) AS vintage_rank
+                    FROM trace_observation_versions v
+                    WHERE v.retrieved_at_utc <= ?
+                ) o
                 JOIN run_bonds rb ON rb.isin=o.isin AND rb.run_id={run_sql}
-                WHERE o.trade_date BETWEEN ? AND ?""",
-            [start_date, end_date],
+                WHERE o.vintage_rank=1""",
+            [observation_as_of_utc],
         ).fetchone()
         names = [item[0] for item in connection.description]
         counts = dict(zip(names, diagnostics))
         input_rows = int(counts.pop("input_rows", 0))
         securities_with_observations = int(counts.pop("securities_with_observations", 0))
+        first_observation_date = counts.pop("first_observation_date", None)
+        last_observation_date = counts.pop("last_observation_date", None)
         excluded_rows = int(counts.pop("rows_with_exclusions", 0))
         print(f"Rows scanned: {input_rows:,}", flush=True)
         print(f"Rows with one or more field exclusions: {excluded_rows:,}", flush=True)
@@ -129,7 +146,8 @@ def run_preprocessor(
         connection.execute(
             f"""COPY (
                     SELECT o.isin, rb.issuer_name,
-                           s.sector, s.maturity_year, s.equity_ticker, s.bond_ticker,
+                           s.sector, s.maturity_date, s.maturity_year,
+                           s.equity_ticker, s.bond_ticker,
                            o.trade_date, o.cusip, o.symbol,
                            o.finra_security_id, o.product_type,
                            o.price AS price_raw, {clean_price} AS clean_price,
@@ -137,16 +155,26 @@ def run_preprocessor(
                            o.last_sale_yield AS last_sale_yield_raw,
                            {clean_yield} AS clean_last_sale_yield,
                            ({yield_status}) AS yield_clean_status,
-                           o.retrieved_at_utc, o.last_run_id AS observation_last_run_id,
+                           o.retrieved_at_utc,
+                           o.retrieval_run_id AS observation_last_run_id,
+                           o.retrieval_id, o.record_hash,
                            rb.run_id AS population_run_id
-                    FROM observations o
+                    FROM (
+                        SELECT v.*,
+                               row_number() OVER (
+                                   PARTITION BY v.isin, v.trade_date
+                                   ORDER BY v.retrieved_at_utc DESC, v.retrieval_id DESC
+                               ) AS vintage_rank
+                        FROM trace_observation_versions v
+                        WHERE v.retrieved_at_utc <= {_sql_literal(str(observation_as_of_utc))}
+                    ) o
                     JOIN run_bonds rb ON rb.isin=o.isin AND rb.run_id={run_sql}
                     LEFT JOIN read_csv_auto({snapshot_sql}, header=true, all_varchar=true) s
                            ON s.isin=o.isin
-                    WHERE o.trade_date BETWEEN ? AND ?
+                    WHERE o.vintage_rank=1
                     ORDER BY o.isin, o.trade_date
                 ) TO {parquet_sql} (FORMAT PARQUET, COMPRESSION ZSTD)""",
-            [start_date, end_date],
+            [],
         )
         completed_at = datetime.now(timezone.utc)
 
@@ -169,12 +197,19 @@ def run_preprocessor(
             "source": "FINRA TRACE via OpenBB normalized observations",
             "source_run_id": str(run_id),
             "source_run_status": run_status,
-            "window": {"start": str(start_date), "end": str(end_date)},
+            "request_window": {"start": str(start_date), "end": str(end_date)},
+            "observation_window": {
+                "start": str(first_observation_date) if first_observation_date else None,
+                "end": str(last_observation_date) if last_observation_date else None,
+            },
             "population_count": int(total_bonds),
             "securities_with_observations": securities_with_observations,
             "population_snapshot_path": snapshot_path,
             "population_snapshot_as_of_date": snapshot_as_of_date,
             "population_hash": population_hash,
+            "population_snapshot_sha256": snapshot_sha256,
+            "observations_as_of_utc": observation_as_of_utc,
+            "source_observation_table": "trace_observation_versions",
             "input_rows": input_rows,
             "clean_parquet_rows": input_rows,
             "rows_with_one_or_more_field_exclusions": excluded_rows,

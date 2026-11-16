@@ -7,9 +7,10 @@ import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import shutil
 import threading
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -95,12 +96,14 @@ def _initialize_database(connection: duckdb.DuckDBPyConnection) -> None:
             updated_at_utc VARCHAR NOT NULL,
             status VARCHAR NOT NULL,
             snapshot_path VARCHAR NOT NULL,
+            snapshot_sha256 VARCHAR,
             snapshot_as_of_date VARCHAR NOT NULL,
             population_hash VARCHAR NOT NULL,
             start_date DATE NOT NULL,
             end_date DATE NOT NULL,
             total_bonds INTEGER NOT NULL,
-            parquet_path VARCHAR
+            parquet_path VARCHAR,
+            completed_at_utc VARCHAR
         )
         """
     )
@@ -125,6 +128,8 @@ def _initialize_database(connection: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    _ensure_column(connection, "history_runs", "snapshot_sha256", "VARCHAR")
+    _ensure_column(connection, "history_runs", "completed_at_utc", "VARCHAR")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS observations (
@@ -177,10 +182,75 @@ def _initialize_database(connection: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trace_observation_versions (
+            retrieval_id VARCHAR NOT NULL,
+            isin VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            cusip VARCHAR NOT NULL,
+            symbol VARCHAR,
+            finra_security_id VARCHAR,
+            product_type VARCHAR,
+            price DOUBLE,
+            last_sale_yield DOUBLE,
+            retrieved_at_utc VARCHAR NOT NULL,
+            retrieval_run_id VARCHAR NOT NULL,
+            record_hash VARCHAR NOT NULL,
+            PRIMARY KEY (retrieval_id, isin, trade_date)
+        )
+        """
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS schema_migrations (
+               migration_id VARCHAR PRIMARY KEY,
+               applied_at_utc VARCHAR NOT NULL
+           )"""
+    )
+    migrated = connection.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id='legacy_observations_v1'"
+    ).fetchone()
+    if not migrated:
+        # Preserve the current legacy state as one initial vintage before new
+        # collection runs start writing append-only observations.
+        connection.execute(
+            """
+            INSERT INTO trace_observation_versions
+            SELECT 'legacy-' || o.last_run_id || '-' || o.isin || '-' || CAST(o.trade_date AS VARCHAR),
+                   o.isin, o.trade_date, o.cusip, o.symbol, o.finra_security_id,
+                   o.product_type, o.price, o.last_sale_yield, o.retrieved_at_utc,
+                   o.last_run_id, sha256(concat_ws('|', o.isin, CAST(o.trade_date AS VARCHAR),
+                        o.cusip, coalesce(o.symbol, ''), coalesce(o.finra_security_id, ''),
+                        coalesce(o.product_type, ''), coalesce(CAST(o.price AS VARCHAR), ''),
+                        coalesce(CAST(o.last_sale_yield AS VARCHAR), '')))
+            FROM observations o
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES ('legacy_observations_v1', ?)", [_now()]
+        )
+
+
+def _ensure_column(
+    connection: duckdb.DuckDBPyConnection, table: str, column: str, data_type: str
+) -> None:
+    columns = {row[1] for row in connection.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {data_type}")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _archive_snapshot(snapshot_path: Path) -> tuple[Path, str]:
+    payload = snapshot_path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    archive = TRACE_DIR / "snapshots" / f"{digest}.csv"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if not archive.exists():
+        archive.write_bytes(payload)
+    return archive.resolve(), digest
 
 
 def _cusip_from_isin(isin: str) -> str:
@@ -226,6 +296,7 @@ def prepare_run(
     if start_date > end_date:
         raise ValueError("Start date must not be after end date.")
     bonds, snapshot_date, population_hash = _read_population(snapshot_path)
+    archived_snapshot, snapshot_sha256 = _archive_snapshot(snapshot_path)
     logger.info(
         "Prepare run: snapshot=%s bonds=%d range=%s..%s resume=%s population=%s",
         snapshot_path, len(bonds), start_date, end_date, resume, population_hash[:12],
@@ -236,11 +307,12 @@ def prepare_run(
             existing = connection.execute(
                 """
                 SELECT run_id FROM history_runs
-                WHERE population_hash = ? AND start_date = ? AND end_date = ?
+                WHERE population_hash = ? AND snapshot_sha256 = ?
+                    AND start_date = ? AND end_date = ?
                     AND status IN ('pending', 'running', 'partial', 'failed')
                 ORDER BY created_at_utc DESC LIMIT 1
                 """,
-                [population_hash, start_date, end_date],
+                [population_hash, snapshot_sha256, start_date, end_date],
             ).fetchone()
             if existing:
                 run_id = existing[0]
@@ -252,7 +324,7 @@ def prepare_run(
                     [_now(), run_id],
                 )
                 connection.execute(
-                    "UPDATE history_runs SET status = 'pending', updated_at_utc = ? WHERE run_id = ?",
+                    "UPDATE history_runs SET status = 'pending', updated_at_utc = ?, completed_at_utc = NULL WHERE run_id = ?",
                     [_now(), run_id],
                 )
                 return run_id, True
@@ -261,13 +333,18 @@ def prepare_run(
         created = _now()
         connection.execute(
             """
-            INSERT INTO history_runs VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, NULL)
+            INSERT INTO history_runs (
+                run_id, created_at_utc, updated_at_utc, status, snapshot_path,
+                snapshot_sha256, snapshot_as_of_date, population_hash,
+                start_date, end_date, total_bonds, parquet_path, completed_at_utc
+            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
             """,
             [
                 run_id,
                 created,
                 created,
-                str(snapshot_path.resolve()),
+                str(archived_snapshot),
+                snapshot_sha256,
                 snapshot_date,
                 population_hash,
                 start_date,
@@ -307,15 +384,57 @@ def prepare_run(
         connection.close()
 
 
+def incremental_date_window(
+    database_path: Path = DATABASE_PATH,
+    end_date: date | None = None,
+    overlap_days: int = 10,
+    initial_years: int = 5,
+) -> tuple[date, date]:
+    """Return a current update window with a recent correction overlap."""
+    end_date = end_date or date.today()
+    if overlap_days < 0 or initial_years <= 0:
+        raise ValueError("overlap_days must be nonnegative and initial_years positive.")
+    connection = connect_database(database_path)
+    try:
+        latest = connection.execute(
+            "SELECT max(trade_date) FROM trace_observation_versions"
+        ).fetchone()[0]
+        start_date = (
+            latest - timedelta(days=overlap_days)
+            if latest
+            else end_date - timedelta(days=365 * initial_years)
+        )
+        return start_date, end_date
+    finally:
+        connection.close()
+
+
+def prepare_incremental_run(
+    snapshot_path: Path = DEFAULT_SNAPSHOT,
+    database_path: Path = DATABASE_PATH,
+    end_date: date | None = None,
+    overlap_days: int = 10,
+) -> tuple[str, date, date]:
+    """Create a new TRACE update run from the latest date plus overlap to today."""
+    start_date, end_date = incremental_date_window(
+        database_path=database_path, end_date=end_date, overlap_days=overlap_days
+    )
+    run_id, _ = prepare_run(
+        snapshot_path, start_date, end_date, resume=False, database_path=database_path
+    )
+    return run_id, start_date, end_date
+
+
 def latest_run(database_path: Path = DATABASE_PATH) -> dict[str, Any] | None:
     if not database_path.exists():
         return None
-    connection = connect_database(database_path, initialize=False)
+    connection = connect_database(database_path, initialize=True)
     try:
         row = connection.execute(
             """
             SELECT run_id, status, snapshot_as_of_date, start_date, end_date,
-                   total_bonds, parquet_path, created_at_utc
+                   total_bonds, parquet_path, created_at_utc, completed_at_utc,
+                   snapshot_sha256
             FROM history_runs ORDER BY created_at_utc DESC LIMIT 1
             """
         ).fetchone()
@@ -824,30 +943,39 @@ def _store_job_result(
         status = "review"
 
     observation_rows = []
+    retrieval_id = str(uuid.uuid4())
     for record in unique_records:
         trade_date = record.get("date")
         if hasattr(trade_date, "isoformat"):
             trade_date = trade_date.isoformat()
         price = _optional_float(record.get("price"))
         sale_yield = _optional_float(record.get("last_sale_yield"))
-        observation_rows.append(
-            (
-                job["isin"],
-                trade_date,
-                str(record.get("cusip") or job["cusip"]).strip().upper(),
-                record.get("symbol") or job.get("symbol"),
-                str(record.get("finra_security_id") or job.get("finra_security_id") or ""),
-                str(record.get("product_type") or ""),
-                price,
-                sale_yield,
-                now,
-                run_id,
-            )
+        normalized = (
+            job["isin"],
+            trade_date,
+            str(record.get("cusip") or job["cusip"]).strip().upper(),
+            record.get("symbol") or job.get("symbol"),
+            str(record.get("finra_security_id") or job.get("finra_security_id") or ""),
+            str(record.get("product_type") or ""),
+            price,
+            sale_yield,
         )
+        record_hash = hashlib.sha256(
+            json.dumps(normalized, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        observation_rows.append((retrieval_id, *normalized, now, run_id, record_hash))
     if observation_rows:
         connection.executemany(
-            "INSERT OR REPLACE INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO trace_observation_versions VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             observation_rows,
+        )
+        # Retain the old latest-value table for existing readers during the
+        # migration. Reproducible pipelines read the append-only table.
+        connection.executemany(
+            """INSERT OR REPLACE INTO observations VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(*row[1:9], row[9], run_id) for row in observation_rows],
         )
 
     dates = [
@@ -1092,9 +1220,10 @@ def download_run(
             [run_id],
         ).fetchone()[0]
         status = "partial" if pending or stop_requested() else ("complete_with_review" if review else "complete")
+        completed_at = _now()
         connection.execute(
-            "UPDATE history_runs SET status = ?, updated_at_utc = ? WHERE run_id = ?",
-            [status, _now(), run_id],
+            "UPDATE history_runs SET status = ?, updated_at_utc = ?, completed_at_utc = ? WHERE run_id = ?",
+            [status, completed_at, completed_at, run_id],
         )
         connection.commit()
         logger.info("Run %s ended with status=%s", run_id, status)
@@ -1199,9 +1328,10 @@ def fix_bond(
             "FROM run_bonds WHERE run_id = ?", [run_id]
         ).fetchone()
         status = "partial" if counts[0] else ("complete_with_review" if counts[1] else "complete")
+        completed_at = _now()
         connection.execute(
-            "UPDATE history_runs SET status = ?, updated_at_utc = ? WHERE run_id = ?",
-            [status, _now(), run_id]
+            "UPDATE history_runs SET status = ?, updated_at_utc = ?, completed_at_utc = ? WHERE run_id = ?",
+            [status, completed_at, completed_at, run_id]
         )
         connection.commit()
         if status.startswith("complete"):
@@ -1213,19 +1343,41 @@ def fix_bond(
 def _export_parquet(
     connection: duckdb.DuckDBPyConnection, run_id: str, database_path: Path
 ) -> Path:
-    export_dir = database_path.parent / "parquet" / f"run_id={run_id}"
+    run = connection.execute(
+        """SELECT start_date, end_date, coalesce(completed_at_utc, updated_at_utc)
+           FROM history_runs WHERE run_id = ?""", [run_id]
+    ).fetchone()
+    if not run:
+        raise ValueError(f"Unknown history run: {run_id}")
+    start_date, end_date, as_of = run
+    as_of_key = str(as_of).replace("-", "").replace(":", "").replace("+00:00", "Z")
+    export_dir = (
+        database_path.parent / "parquet" / f"run_id={run_id}" / f"snapshot_asof={as_of_key}"
+    )
     export_dir.mkdir(parents=True, exist_ok=True)
     destination = export_dir.as_posix().replace("'", "''")
+    run_literal = run_id.replace("'", "''")
+    as_of_literal = str(as_of).replace("'", "''")
     connection.execute(
         f"""
         COPY (
-            SELECT o.isin, rb.issuer_name, o.trade_date, o.cusip, o.symbol,
-                   o.finra_security_id, o.product_type, o.price,
-                   o.last_sale_yield, o.retrieved_at_utc, o.last_run_id,
-                   year(o.trade_date) AS trade_year
-            FROM observations o
-            JOIN run_bonds rb ON rb.isin = o.isin AND rb.run_id = '{run_id}'
-            ORDER BY o.isin, o.trade_date
+            WITH eligible AS (
+                SELECT v.*, row_number() OVER (
+                    PARTITION BY v.isin, v.trade_date
+                    ORDER BY v.retrieved_at_utc DESC, v.retrieval_id DESC
+                ) AS version_rank
+                FROM trace_observation_versions v
+                WHERE v.retrieved_at_utc <= '{as_of_literal}'
+            )
+            SELECT v.isin, rb.issuer_name, v.trade_date, v.cusip, v.symbol,
+                   v.finra_security_id, v.product_type, v.price,
+                   v.last_sale_yield, v.retrieved_at_utc,
+                   v.retrieval_run_id AS last_run_id, v.retrieval_id,
+                   v.record_hash, year(v.trade_date) AS trade_year
+            FROM eligible v
+            JOIN run_bonds rb ON rb.isin = v.isin AND rb.run_id = '{run_literal}'
+            WHERE v.version_rank = 1
+            ORDER BY v.isin, v.trade_date
         ) TO '{destination}'
         (FORMAT PARQUET, PARTITION_BY (trade_year), OVERWRITE_OR_IGNORE TRUE)
         """
@@ -1240,16 +1392,35 @@ def _export_parquet(
 def export_csv(run_id: str, output_path: Path, database_path: Path = DATABASE_PATH) -> Path:
     connection = connect_database(database_path, initialize=False)
     try:
+        run = connection.execute(
+            """SELECT start_date, end_date, coalesce(completed_at_utc, updated_at_utc)
+               FROM history_runs WHERE run_id=?""", [run_id]
+        ).fetchone()
+        if not run:
+            raise ValueError(f"Unknown history run: {run_id}")
+        start_date, end_date, as_of = run
         destination = output_path.resolve().as_posix().replace("'", "''")
+        as_of_literal = str(as_of).replace("'", "''")
         connection.execute(
             f"""
             COPY (
-                SELECT o.trade_date AS date, o.isin, rb.issuer_name, o.cusip,
-                       o.symbol, o.finra_security_id, o.product_type, o.price,
-                       o.last_sale_yield, o.retrieved_at_utc
-                FROM observations o
-                JOIN run_bonds rb ON rb.isin = o.isin AND rb.run_id = '{run_id}'
-                ORDER BY o.isin, o.trade_date
+                WITH eligible AS (
+                    SELECT v.*, row_number() OVER (
+                        PARTITION BY v.isin, v.trade_date
+                        ORDER BY v.retrieved_at_utc DESC, v.retrieval_id DESC
+                    ) AS version_rank
+                    FROM trace_observation_versions v
+                    WHERE v.retrieved_at_utc <= '{as_of_literal}'
+                      AND v.trade_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+                )
+                SELECT v.trade_date AS date, v.isin, rb.issuer_name, v.cusip,
+                       v.symbol, v.finra_security_id, v.product_type, v.price,
+                       v.last_sale_yield, v.retrieved_at_utc,
+                       v.retrieval_run_id, v.retrieval_id, v.record_hash
+                FROM eligible v
+                JOIN run_bonds rb ON rb.isin = v.isin AND rb.run_id = '{run_id}'
+                WHERE v.version_rank=1
+                ORDER BY v.isin, v.trade_date
             ) TO '{destination}' (HEADER, DELIMITER ',')
             """
         )
@@ -1264,10 +1435,23 @@ def read_observations_for_run(run_id: str, database_path: Path = DATABASE_PATH) 
         return int(
             connection.execute(
                 """
-                SELECT count(*) FROM observations o
+                WITH run_info AS (
+                    SELECT start_date, end_date,
+                           coalesce(completed_at_utc, updated_at_utc) AS as_of
+                    FROM history_runs WHERE run_id=?
+                ), eligible AS (
+                    SELECT v.*, row_number() OVER (
+                        PARTITION BY v.isin, v.trade_date
+                        ORDER BY v.retrieved_at_utc DESC, v.retrieval_id DESC
+                    ) AS version_rank
+                    FROM trace_observation_versions v, run_info r
+                    WHERE v.retrieved_at_utc <= r.as_of
+                )
+                SELECT count(*) FROM eligible o
                 JOIN run_bonds rb ON rb.isin = o.isin AND rb.run_id = ?
+                WHERE o.version_rank=1
                 """,
-                [run_id],
+                [run_id, run_id],
             ).fetchone()[0]
         )
     finally:
