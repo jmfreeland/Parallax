@@ -208,6 +208,10 @@ class LauncherWindow(QMainWindow):
         evaluate_signal.clicked.connect(lambda: self._launch("src.signal_evaluation_app"))
         self.buttons.append(evaluate_signal)
         signal_layout.addWidget(evaluate_signal, 0, Qt.AlignmentFlag.AlignLeft)
+        edit_strategy = QPushButton("Edit credit strategy")
+        edit_strategy.clicked.connect(lambda: self._launch("src.strategy_editor_app"))
+        self.buttons.append(edit_strategy)
+        signal_layout.addWidget(edit_strategy, 0, Qt.AlignmentFlag.AlignLeft)
         self.tabs.addTab(signal_page, "Signal inventory")
 
         self.diagnostics = QTextEdit()

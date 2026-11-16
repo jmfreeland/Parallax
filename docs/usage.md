@@ -181,6 +181,23 @@ Pearson and Spearman IC. Signal staleness, maximum gap between selected-space ch
 minimum curve size, price age, horizon, and long-short tail quantile are
 configurable.
 
+Use **Edit credit strategy** on the launcher's **Signal inventory** tab to
+create, validate, open, and save reusable strategy JSON in a node canvas. Each
+signal is a branch into the shared combination node, with its transforms shown
+in order; final transforms sit after combination. Nodes can be dragged to
+arrange the canvas, and selecting a node opens its settings. A strategy contains
+uniquely named signal components, each with a predictor, signal space, grouping
+field, weight, parameters, and an ordered transformer list. Supported
+combinations are weighted mean, equal mean, weighted sum, and rank mean.
+Supported cross-sectional transforms are winsorization, z-score normalization,
+percentile rank, and min-max scaling. Component transforms run on each signal's
+daily bond cross-section before combination; strategy transforms run on the
+combined daily score. Missing component scores are omitted and mean weights are
+renormalized over the available components. The editor starts with examples
+for ticker/spread, rating/yield, ticker/price, and ISIN-level spread/yield
+z-scores. These definitions can be edited and saved independently of a test
+run.
+
 Use **Signal vs. outcome** to inspect a bond-level cross-section. After an
 evaluation completes, change the signal date or forward horizon directly in
 that tab; the app redraws from the cached outcomes for every tested horizon and
