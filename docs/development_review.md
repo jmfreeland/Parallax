@@ -1,42 +1,50 @@
-# Development review — 9 November 2026
+# Development review — 16 November 2026
 
-Current code supports a LQD-seeded TRACE data pilot and visual inspection. It does not implement fundamental value, latent fair value, forecast returns, portfolio construction, or a validated trading signal.
+Parallax now has versioned TRACE data, G-spread snapshots, exploratory portfolios, and walk-forward signal research. Those additions improve lineage, but default input selection still prevents a result being reproducible unless every input is pinned.
 
 ## Correctness and research risk
 
-| Priority | Finding | Evidence and consequence | Correction |
+| Priority | Finding | Evidence and consequence | Recommended correction |
 |---|---|---|---|
-| P0 | Historical-run reproducibility depended on overwrite semantics. | The legacy `observations` table still holds the latest value, but new TRACE writes also append to `trace_observation_versions`. Exports and preprocessing select versions at a run cutoff. | Implemented for new retrievals. Historical data predating migration has only its latest surviving value and cannot be reconstructed into earlier vintages. |
-| P1 | Group “momentum” and “volatility” are level statistics, not return signals. | `load_group_data` computes `mean - lag(mean, 63/252)` and `stddev_samp(mean)` over price/yield levels. Price differences mix duration; yield changes have the opposite economic sign to price return. | Rename the display fields to level change/dispersion. Construct clean returns, duration/convexity-adjusted yield changes, and standardized residuals for signals. |
-| P1 | Rolling windows change economic horizon with UI interval. | The same 63/252 `ROWS` are applied to daily, monthly, quarterly, and yearly views. | Calculate research signals at daily frequency, aggregate afterward, and display the effective horizon. |
-| P1 | Snapshot attributes were not frozen at row level. | Older runs may point to a rebuilt source file. | New runs archive the exact CSV bytes under a SHA-256 path and preprocessing reads that archived copy. Legacy runs cannot recover a lost prior file. |
-| P2 | Zero yield is globally treated as missing. | This is an untested product convention in the current cleaning policy. | Make rules product-specific and test policy boundaries. |
-| P2 | Coverage can count a bond from first raw, not first valid, observation. | `first_seen` is calculated before `value IS NOT NULL`. | Define coverage against frozen membership and valid observations, then label it. |
+| P0 | Signal evaluation defaults to mutable “latest” artifacts. | Cleaned Parquet is selected by modification time; G-spread and financing inputs select their latest snapshots. Inputs may therefore represent different TRACE or curve vintages and re-runs can differ. | Require a ResearchRun manifest: dataset hash, TRACE run, clean ID, G-spread snapshot, curve vintage, bond-list hash, policies, parameters, and output hashes. Keep “latest” explicitly exploration-only. |
+| P0 | Some return/raw-history paths still read \`observations\`, the latest-value compatibility table. | New TRACE values append to \`trace_observation_versions\`, but raw-DuckDB evaluation and total-return routines query \`observations\`. Later vendor corrections can change retrospective results. | Route all analytical reads through a pinned as-of/run version view; mark pre-migration records as latest-value-only. |
+| P1 | Viewer “momentum” and “volatility” are still level statistics. | 63/252-row calculations use group price/yield levels, and their calendar horizon changes with UI interval. | Rename to level change/dispersion; calculate daily return and risk measures in research, then aggregate. |
+| P1 | Signal outcomes intentionally use different estimands. | Nelson–Siegel outcomes are cross-sectionally demeaned; percentile outcomes are raw. Yield/spread changes reverse sign; price uses log returns. | Preserve the distinctions but include them in titles/exports; prohibit pooled comparison across estimands without a common target. |
+| P1 | Total return has synthetic coupon dates. | Schedules are rolled back from maturity because actual coupon dates are absent. | Add authoritative schedules or label results approximate; validate against known-bond fixtures. |
+| P1 | Current bond-list attributes stand in for historical membership/classification. | Ticker, partition, duration, coupon, and maturity come from a selected current CSV. | Add instrument-master and as-of universe/attribute vintages; label historical tests accordingly. |
+| P2 | G-spread is a maturity-interpolated par-yield proxy. | It linearly interpolates Treasury par nodes, not a discount/zero curve. | Validate node/between-node/missing-endpoint cases and sensitivity to curve representation. |
+| P2 | Zero yield is globally missing. | This is a policy assumption, not a product-specific convention. | Make cleaning product-aware and unit-test boundary values. |
+| P2 | Coverage is reported but not gated. | Price, financing, and total-return coverage can differ materially. | Require numerator/denominator in all headlines and a configurable research coverage gate. |
 
-## Architecture
+## Architecture priorities
 
-1. Introduce typed schemas for instruments, observations, run manifests, and reports.
-2. Split `trace_history.py` into provider client, run repository, quality assessment, and orchestration.
-3. Keep Qt in `ui/`; provide CLI pipeline entry points for headless runs and tests.
-4. Write a manifest for every snapshot, run export, and clean Parquet: schema, source IDs, hashes, range, policy, upstream datasets.
-5. Replace the empty `TODO.MD` with a small prioritized roadmap or GitHub issues.
+1. Create one immutable \`ResearchRun\` resolver used by every evaluator, portfolio report, and export.
+2. Separate repositories (TRACE versions, curves, spreads, manifests) from pure calculations and Qt UI clients.
+3. Consolidate repeated latest-snapshot lookup into explicit \`exploratory_latest\` and \`pinned\` modes.
+4. Promote typed models for attributes, observations, quality flags, signals, returns, and portfolio legs.
+5. Continue the package extraction described in [architecture.md](architecture.md), with unit and integration tests.
 
-## Performance
+## Performance opportunities
 
 | Area | Improvement |
 |---|---|
-| FINRA collection | Adaptive batches, bounded retries/backoff, rate-limit budget, and separately cached identifier resolution. |
-| DuckDB writes | Stage each provider batch in Arrow/Polars and merge once per batch instead of per-bond commits. |
-| Parquet/inspector | Use a clean analytical view and cache group-period aggregates by dataset manifest, measure, dimension, and interval. |
-| Snapshot/mapping | Replace row-wise `DataFrame.apply` identity-key construction with vectorized columns once schema is stable. |
+| G-spread build | Year-by-year DuckDB SQL is a good improvement. Benchmark lateral Treasury-node lookup; a pre-expanded daily curve or interval join may scale better. |
+| Signal evaluation | Cache pinned datasets, date cross-sections, curve fits, and forward outcomes by manifest + parameter hash; reuse overlapping windows. |
+| Total return | Batch boundary-price lookup and cash-flow calculation by instrument/date grid instead of repeated per-window database work. |
+| UI | Virtualize/paginate large tables and stream exports. |
+| Collection | Use adaptive batches, bounded backoff, rate-limit budget, and cached identifier resolution. |
 
 ## Minimum validation suite
 
-- A vendor correction cannot alter a prior run export.
-- Multiple ISIN/date vintages are retained.
-- Python and SQL cleaning classifications agree on boundary values.
-- Aggregation gives equal bond weight and documented eligibility.
-- Yield-direction and duration-adjusted return signs are correct.
-- A frozen snapshot gives the same classifications after a newer snapshot is built.
+- A vendor correction cannot alter an export or performance report pinned to an older run.
+- Mixed TRACE/clean/spread/curve lineage is rejected unless an override is recorded.
+- G-spread interpolation matches hand-checked node, between-node, and missing-endpoint cases.
+- Yield/spread sign, price log return, duration approximation, and cash flows agree with fixtures.
+- Exports identify raw versus demeaned outcomes.
+- Tail membership, equal weights, missing-price policy, financing coverage, and maturity handling are deterministic.
+- Changing UI interval never changes a research signal’s economic horizon.
+- Pre-migration observations are clearly marked as not vintage-reproducible.
 
-Next research milestones: validate maturity-matched spreads and their missing-date behavior, then add instrument-master and universe-membership vintages. A full historical restatement of pre-migration TRACE vintages is not possible from the overwritten legacy table.
+## Recommended sequence
+
+Ship pinned ResearchRun manifests and versioned analytical reads first. Next add authoritative historical attributes and validate Treasury interpolation and total-return fixtures. Only then use walk-forward results for model selection, transaction-cost modelling, or portfolio construction.
