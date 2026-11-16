@@ -6,7 +6,7 @@ import csv
 from collections import defaultdict
 import json
 import math
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -144,13 +144,18 @@ def _historical_percentile(
 ) -> tuple[float | None, int]:
     """Rank a partition level against its strictly prior trailing history."""
     cutoff = as_of_date - timedelta(days=lookback_days)
-    prior = [level for observed_date, level in history if cutoff <= observed_date < as_of_date]
-    if len(prior) < minimum_observations:
-        return None, len(prior)
-    below = sum(level < value for level in prior)
-    equal = sum(level == value for level in prior)
-    percentile = 100.0 * (below + 0.5 * equal) / len(prior)
-    return percentile, len(prior)
+    first = bisect_left(history, (cutoff, float("-inf")))
+    stop = bisect_left(history, (as_of_date, float("-inf")))
+    prior = np.fromiter(
+        (level for _observed_date, level in history[first:stop]), dtype=float, count=stop - first
+    )
+    history_count = int(prior.size)
+    if history_count < minimum_observations:
+        return None, history_count
+    below = int(np.count_nonzero(prior < value))
+    equal = int(np.count_nonzero(prior == value))
+    percentile = 100.0 * (below + 0.5 * equal) / history_count
+    return percentile, history_count
 
 
 def evaluate_nelson_siegel_signal(
@@ -477,13 +482,16 @@ def evaluate_nelson_siegel_signal(
                 if len(rows) < minimum_bonds:
                     continue
                 partition_median = float(np.median([row["observed_yield_pct"] for row in rows]))
-                percentile, history_count = _historical_percentile(
-                    partition_history[partition_value],
-                    partition_median,
-                    as_of_date=as_of,
-                    lookback_days=percentile_lookback_days,
-                    minimum_observations=minimum_history_observations,
-                )
+                percentile: float | None = None
+                history_count = 0
+                if as_of >= start_date:
+                    percentile, history_count = _historical_percentile(
+                        partition_history[partition_value],
+                        partition_median,
+                        as_of_date=as_of,
+                        lookback_days=percentile_lookback_days,
+                        minimum_observations=minimum_history_observations,
+                    )
                 if percentile is not None:
                     if signal_space == SIGNAL_SPACE_PRICE:
                         percentile = 100.0 - percentile

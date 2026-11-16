@@ -19,6 +19,7 @@ from .trace_preprocessor import run_preprocessor
 
 POLICY_VERSION = "g-spread-linear-par-yield-v2"
 OUTPUT_DIR = TRACE_DIR / "spread_snapshots"
+MIN_CURVE_NODES_PER_DATE = 10
 
 
 def _latest_run_ids(database_path: Path) -> tuple[str, str]:
@@ -41,8 +42,16 @@ def _latest_run_ids(database_path: Path) -> tuple[str, str]:
                    ORDER BY coalesce(completed_at_utc, updated_at_utc) DESC LIMIT 1"""
             ).fetchone()
         curve = connection.execute(
-            """SELECT curve_run_id FROM treasury_curve_runs
-               ORDER BY retrieved_at_utc DESC LIMIT 1"""
+            """SELECT r.curve_run_id
+               FROM treasury_curve_runs r
+               LEFT JOIN (
+                   SELECT curve_run_id, count(DISTINCT observation_date) AS date_count
+                   FROM treasury_curve_observations
+                   GROUP BY curve_run_id
+               ) o USING (curve_run_id)
+               ORDER BY coalesce(o.date_count, 0) DESC,
+                        r.last_observation DESC, r.retrieved_at_utc DESC
+               LIMIT 1"""
         ).fetchone()
         if not trace:
             raise ValueError(
@@ -66,6 +75,7 @@ def build_spread_snapshot(
     """Persist spread rows and a manifest bound to exact TRACE and curve vintages."""
     if yield_spike_threshold_bps <= 0:
         raise ValueError("Yield reversal threshold must be positive.")
+    use_all_curve_vintages = curve_run_id is None
     if trace_run_id is None or curve_run_id is None:
         latest_trace, latest_curve = _latest_run_ids(database_path)
         trace_run_id = trace_run_id or latest_trace
@@ -93,9 +103,12 @@ def build_spread_snapshot(
             [trace_run_id],
         ).fetchone()
         curve_meta = connection.execute(
-            """SELECT retrieved_at_utc, source_file_sha256, first_observation,
-                      last_observation
-               FROM treasury_curve_runs WHERE curve_run_id=?""",
+            """SELECT r.retrieved_at_utc, r.source_file_sha256,
+                      min(o.observation_date), max(o.observation_date)
+               FROM treasury_curve_runs r
+               LEFT JOIN treasury_curve_observations o USING (curve_run_id)
+               WHERE r.curve_run_id=?
+               GROUP BY r.curve_run_id, r.retrieved_at_utc, r.source_file_sha256""",
             [curve_run_id],
         ).fetchone()
         if not trace_meta or not curve_meta:
@@ -121,6 +134,19 @@ def build_spread_snapshot(
             raise ValueError("The cleaned TRACE dataset contains no observations.")
         first_clean_date, last_clean_date, row_count = clean_stats
         print(f"Loaded {row_count:,} cleaned TRACE observations.", flush=True)
+        if use_all_curve_vintages:
+            print(
+                "Using all stored Treasury vintages; for each observation date, "
+                f"choosing the latest vintage with at least {MIN_CURVE_NODES_PER_DATE} "
+                "non-null tenor nodes.",
+                flush=True,
+            )
+        else:
+            print(
+                f"Using selected Treasury vintage {curve_run_id} covering "
+                f"{curve_meta[2]} through {curve_meta[3]}.",
+                flush=True,
+            )
         snapshot_id = str(uuid.uuid4())
         generated_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         output_dir = output_root / f"snapshot_id={snapshot_id}"
@@ -172,13 +198,37 @@ def build_spread_snapshot(
         )
         snapshot_id_sql = snapshot_id.replace("'", "''")
         curve_run_id_sql = str(curve_run_id).replace("'", "''")
+        curve_vintage_filter = (
+            "" if use_all_curve_vintages
+            else f"AND o.curve_run_id = '{curve_run_id_sql}'"
+        )
         connection.execute("BEGIN TRANSACTION")
         years = list(range(first_clean_date.year, last_clean_date.year + 1))
         print(f"Calculating and inserting spreads by year ({len(years)} years)...", flush=True)
         for year_index, year in enumerate(years, start=1):
             year_start = f"{year}-01-01"
             year_end = f"{year + 1}-01-01"
-            mapping_query = f"""WITH trace AS (
+            mapping_query = f"""WITH curve_vintage_candidates AS (
+                    SELECT o.observation_date, o.curve_run_id,
+                           max(r.retrieved_at_utc) AS retrieved_at_utc,
+                           count(DISTINCT o.tenor_years) AS node_count
+                    FROM treasury_curve_observations o
+                    JOIN treasury_curve_runs r USING (curve_run_id)
+                    WHERE o.par_yield_pct IS NOT NULL
+                      AND o.observation_date >= DATE '{year_start}'
+                      AND o.observation_date < DATE '{year_end}'
+                      {curve_vintage_filter}
+                    GROUP BY o.observation_date, o.curve_run_id
+                ), curve_vintage_by_date AS (
+                    SELECT observation_date, curve_run_id
+                    FROM (
+                        SELECT *, row_number() OVER (
+                            PARTITION BY observation_date ORDER BY retrieved_at_utc DESC
+                        ) AS vintage_rank
+                        FROM curve_vintage_candidates
+                        WHERE node_count >= {MIN_CURVE_NODES_PER_DATE}
+                    ) WHERE vintage_rank=1
+                ), trace AS (
                     SELECT isin, trade_date,
                            try_cast(maturity_date AS DATE) AS maturity_date,
                            (date_diff('day', trade_date, try_cast(maturity_date AS DATE)) / 365.25)::DOUBLE AS maturity_years,
@@ -191,28 +241,31 @@ def build_spread_snapshot(
                     WHERE trade_date >= DATE '{year_start}' AND trade_date < DATE '{year_end}'
                 ), nodes AS (
                     SELECT trace.*,
+                           vintage.curve_run_id AS curve_run_id,
                            lower_node.tenor_years AS lower_tenor,
                            lower_node.par_yield_pct AS lower_yield,
                            upper_node.tenor_years AS upper_tenor,
                            upper_node.par_yield_pct AS upper_yield
                     FROM trace
+                    LEFT JOIN curve_vintage_by_date vintage
+                      ON vintage.observation_date = trace.trade_date
                     LEFT JOIN LATERAL (
                         SELECT tenor_years, par_yield_pct
-                        FROM treasury_curve_observations
-                        WHERE curve_run_id = '{curve_run_id_sql}'
-                          AND observation_date = trace.trade_date
-                          AND par_yield_pct IS NOT NULL
-                          AND tenor_years <= trace.maturity_years
-                        ORDER BY tenor_years DESC LIMIT 1
+                        FROM treasury_curve_observations curve_node
+                        WHERE curve_node.curve_run_id = vintage.curve_run_id
+                          AND curve_node.observation_date = trace.trade_date
+                          AND curve_node.par_yield_pct IS NOT NULL
+                          AND curve_node.tenor_years <= trace.maturity_years
+                        ORDER BY curve_node.tenor_years DESC LIMIT 1
                     ) lower_node ON TRUE
                     LEFT JOIN LATERAL (
                         SELECT tenor_years, par_yield_pct
-                        FROM treasury_curve_observations
-                        WHERE curve_run_id = '{curve_run_id_sql}'
-                          AND observation_date = trace.trade_date
-                          AND par_yield_pct IS NOT NULL
-                          AND tenor_years >= trace.maturity_years
-                        ORDER BY tenor_years LIMIT 1
+                        FROM treasury_curve_observations curve_node
+                        WHERE curve_node.curve_run_id = vintage.curve_run_id
+                          AND curve_node.observation_date = trace.trade_date
+                          AND curve_node.par_yield_pct IS NOT NULL
+                          AND curve_node.tenor_years >= trace.maturity_years
+                        ORDER BY curve_node.tenor_years LIMIT 1
                     ) upper_node ON TRUE
                 ), interpolated AS (
                     SELECT *,
@@ -236,14 +289,14 @@ def build_spread_snapshot(
                        trace_yield_pct, treasury_par_yield_pct,
                        g_spread_bps,
                        trace_observation_run_id, trace_retrieval_id, trace_record_hash,
-                       '{curve_run_id_sql}' AS curve_run_id,
+                       coalesce(curve_run_id, '{curve_run_id_sql}') AS curve_run_id,
                        sha256(concat_ws('|', '{snapshot_id_sql}', isin,
                            cast(trade_date AS VARCHAR), coalesce(cast(maturity_date AS VARCHAR), ''),
                            coalesce(cast(trace_yield_pct AS VARCHAR), ''),
                            coalesce(cast(treasury_par_yield_pct AS VARCHAR), ''),
                            coalesce(cast(g_spread_bps AS VARCHAR), ''),
                            coalesce(trace_retrieval_id, ''), cast(yield_reversal_flagged AS VARCHAR),
-                           '{curve_run_id_sql}', '{POLICY_VERSION}')) AS record_hash,
+                           coalesce(curve_run_id, '{curve_run_id_sql}'), '{POLICY_VERSION}')) AS record_hash,
                        coalesce(yield_reversal_flagged, FALSE) AS yield_reversal_flagged
                 FROM calculated"""
             connection.execute(
@@ -274,6 +327,37 @@ def build_spread_snapshot(
             [snapshot_id],
         ).fetchone()
         row_count, matched, flagged_count = (int(value or 0) for value in counts)
+        curve_vintage_rows = connection.execute(
+            """SELECT r.curve_run_id, r.retrieved_at_utc, r.source_file_sha256,
+                      min(o.observation_date), max(o.observation_date),
+                      count(DISTINCT o.observation_date)
+               FROM treasury_curve_runs r
+               JOIN treasury_curve_observations o USING (curve_run_id)
+               WHERE r.curve_run_id IN (
+                   SELECT DISTINCT curve_run_id FROM bond_spread_observations
+                   WHERE snapshot_id=? AND treasury_par_yield_pct IS NOT NULL
+               )
+               GROUP BY r.curve_run_id, r.retrieved_at_utc, r.source_file_sha256
+               ORDER BY min(o.observation_date)""",
+            [snapshot_id],
+        ).fetchall()
+        curve_vintages = [
+            {
+                "curve_run_id": row[0],
+                "retrieved_at_utc": row[1],
+                "source_file_sha256": row[2],
+                "first_observation": str(row[3]),
+                "last_observation": str(row[4]),
+                "observation_date_count": int(row[5]),
+            }
+            for row in curve_vintage_rows
+        ]
+        print(
+            f"Applied {len(curve_vintages)} Treasury curve vintages across "
+            f"{curve_vintages[0]['first_observation'] if curve_vintages else 'no dates'} "
+            f"to {curve_vintages[-1]['last_observation'] if curve_vintages else 'no dates'}.",
+            flush=True,
+        )
         parquet_sql = str(parquet_path.resolve()).replace("'", "''")
         manifest = {
             "snapshot_id": snapshot_id,
@@ -293,10 +377,18 @@ def build_spread_snapshot(
             "clean_parquet_path": str(clean_path.resolve()),
             "clean_parquet_sha256": clean_hash,
             "curve_run_id": curve_run_id,
+            "representative_curve_run_id": curve_run_id,
+            "curve_vintages": curve_vintages,
+            "curve_vintage_selection": (
+                "latest retrieved curve vintage per date with at least 10 non-null par-yield tenors"
+                if use_all_curve_vintages else "explicitly selected curve vintage"
+            ),
+            "curve_minimum_valid_tenor_nodes": MIN_CURVE_NODES_PER_DATE,
             "curve_retrieved_at_utc": curve_meta[0],
             "curve_source_file_sha256": curve_meta[1],
             "curve_observation_window": {
-                "start": str(curve_meta[2]), "end": str(curve_meta[3])
+                "start": min((row["first_observation"] for row in curve_vintages), default=None),
+                "end": max((row["last_observation"] for row in curve_vintages), default=None),
             },
             "interpolation_policy": POLICY_VERSION,
             "spread_definition": "(clean TRACE last-sale yield - interpolated Treasury par yield) * 100",

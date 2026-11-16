@@ -451,6 +451,7 @@ class SignalEvaluationWindow(QMainWindow):
         self.worker: EvaluationWorker | None = None
         self.result: dict[str, Any] | None = None
         self.scatter_rows_by_date: dict[str, list[dict[str, Any]]] = {}
+        self._last_percentile_mode = False
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -537,6 +538,9 @@ class SignalEvaluationWindow(QMainWindow):
         self.minimum_bonds = QSpinBox()
         self.minimum_bonds.setRange(1, 100)
         self.minimum_bonds.setValue(5)
+        self.minimum_bonds.setToolTip(
+            "Minimum bonds in each selected group. Use 1 for bond-level (ISIN) partitions."
+        )
         row_one.addWidget(self.minimum_bonds)
         layout.addLayout(row_one)
 
@@ -806,6 +810,11 @@ class SignalEvaluationWindow(QMainWindow):
         self.minimum_history.setEnabled(percentile_mode)
         minimum_bonds = 1 if percentile_mode else 5
         self.minimum_bonds.setMinimum(minimum_bonds)
+        if percentile_mode and not self._last_percentile_mode and self.minimum_bonds.value() == 5:
+            self.minimum_bonds.setValue(1)
+        elif not percentile_mode and self._last_percentile_mode and self.minimum_bonds.value() == 1:
+            self.minimum_bonds.setValue(5)
+        self._last_percentile_mode = percentile_mode
         if self.minimum_bonds.value() < minimum_bonds:
             self.minimum_bonds.setValue(minimum_bonds)
 
@@ -1044,12 +1053,20 @@ class SignalEvaluationWindow(QMainWindow):
             "The horizon total return uses a synthetic coupon schedule, treats unpriced positions as zero contribution, and excludes costs/defaults; horizon windows overlap. "
             "Rebalanced portfolio returns use raw, non-demeaned holding-period returns. See the Rebalanced portfolio tab for financing coverage and annualized volatility. Past TRACE revisions and the current bond-list snapshot may affect results."
         )
-        self.status.setText(
+        signal_count = summary["bond_date_observations"]
+        status_text = (
             f"Completed {summary['signal_dates']:,} signal dates; "
+            f"generated {signal_count:,} bond-date signal scores; "
             f"{summary['dates_with_correlation']:,} dates had enough pairs for correlation. "
             f"Excluded {summary['stale_first_prints_excluded']:,} first post-signal prints from stale signal baselines. "
             f"Source: {summary['data_source']}."
         )
+        if signal_count == 0 and summary["signal_id"] == PREDICTOR_PARTITION_PERCENTILE:
+            status_text += (
+                " No scores were produced: verify the minimum group size, history lookback, "
+                "minimum prior observations, and selected date range."
+            )
+        self.status.setText(status_text)
         self.export_button.setEnabled(bool(detail_rows))
         self.export_report_button.setEnabled(bool(date_rows))
 
