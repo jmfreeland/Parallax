@@ -50,7 +50,10 @@ def _digest(payload: Any) -> str:
 
 def _signal_calculation_signature(signal: Any) -> str:
     definition = asdict(signal)
-    if signal.predictor_id in {"historical_partition_percentile", "historical_partition_zscore"}:
+    if signal.predictor_id == "nelson_siegel_residual":
+        # Curve grouping now follows the manually mapped bond curve ticker.
+        definition["calculation_version"] = 3
+    elif signal.predictor_id in {"historical_partition_percentile", "historical_partition_zscore"}:
         # The ISIN partition minimum-bond handling changed from five to one.
         definition["calculation_version"] = 2
     return _digest(definition)
@@ -109,6 +112,10 @@ def run_strategy_signals(
         })
         if signal.predictor_id == "nelson_siegel_residual":
             parameters["minimum_bonds"] = max(5, int(parameters.get("minimum_bonds", 5)))
+            if signal.parameters.get("curve_outlier_filter_enabled", False):
+                parameters["curve_outlier_filter_mad"] = float(
+                    signal.parameters.get("curve_outlier_filter_mad", 4.5)
+                )
         else:
             parameters["minimum_bonds"] = int(signal.parameters.get(
                 "minimum_bonds",

@@ -25,7 +25,7 @@ SIGNALS = (
             "Observed yield, G-spread, or clean price relative to a fitted issuer-ticker Nelson-Siegel curve; "
             "score direction is normalized so positive means cheap versus the fitted curve."
         ),
-        inputs="TRACE yield/price or G-spread snapshot, maturity, reviewed equity issuer ticker",
+        inputs="TRACE yield/price or G-spread snapshot, maturity, manually mapped bond curve ticker",
         status="Implemented",
         validation="Prototype; no out-of-sample validation yet",
     ),

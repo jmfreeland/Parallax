@@ -257,10 +257,10 @@ class LauncherWindow(QMainWindow):
         self.strategy_page = strategy_page
         strategy_layout = QVBoxLayout(strategy_page)
         strategy_layout.addWidget(QLabel(
-            "Select a saved strategy to edit its graph, calculate cached signal inputs, or run the current combination."
+            "Select a saved signal model to edit its graph, calculate cached inputs, run its combined score, or inspect dated outputs."
         ))
         strategy_list_tools = QHBoxLayout()
-        strategy_list_tools.addWidget(QLabel("Saved strategies"))
+        strategy_list_tools.addWidget(QLabel("Saved signal models"))
         strategy_list_tools.addStretch(1)
         refresh_strategies = QPushButton("Refresh list")
         refresh_strategies.clicked.connect(self._refresh_strategies)
@@ -277,19 +277,22 @@ class LauncherWindow(QMainWindow):
         self.edit_selected_strategy = QPushButton("Edit")
         self.calculate_selected_strategy = QPushButton("Calculate inputs")
         self.run_selected_strategy = QPushButton("Run")
+        self.inspect_selected_strategy = QPushButton("Inspect")
         self.clear_strategy_cache = QPushButton("Clear cache")
-        self.create_strategy = QPushButton("New strategy")
+        self.create_strategy = QPushButton("New signal model")
         self.edit_selected_strategy.clicked.connect(lambda: self._launch_selected_strategy("edit"))
         self.calculate_selected_strategy.clicked.connect(lambda: self._launch_selected_strategy("calculate"))
         self.run_selected_strategy.clicked.connect(self._run_selected_strategy)
+        self.inspect_selected_strategy.clicked.connect(lambda: self._launch_selected_strategy("inspect"))
         self.clear_strategy_cache.clicked.connect(self._clear_selected_strategy_cache)
         self.create_strategy.clicked.connect(lambda: self._launch("src.strategy_editor_app"))
         for button in (self.edit_selected_strategy, self.calculate_selected_strategy,
-                       self.run_selected_strategy, self.clear_strategy_cache, self.create_strategy):
+                       self.run_selected_strategy, self.inspect_selected_strategy,
+                       self.clear_strategy_cache, self.create_strategy):
             self.buttons.append(button)
             strategy_actions.addWidget(button)
         strategy_layout.addLayout(strategy_actions)
-        self.tabs.addTab(strategy_page, "Strategies")
+        self.tabs.addTab(strategy_page, "Signal models")
         self._refresh_strategies()
 
         self.diagnostics = QTextEdit()
@@ -569,6 +572,7 @@ class LauncherWindow(QMainWindow):
         for button in (getattr(self, "edit_selected_strategy", None),
                        getattr(self, "calculate_selected_strategy", None),
                        getattr(self, "run_selected_strategy", None),
+                       getattr(self, "inspect_selected_strategy", None),
                        getattr(self, "clear_strategy_cache", None)):
             if button is not None:
                 button.setEnabled(selected)
@@ -593,9 +597,9 @@ class LauncherWindow(QMainWindow):
         if hasattr(self, "strategy_runner") and self.strategy_runner.isRunning():
             return
         self.strategy_run_progress.setRange(0, 0)
-        self.strategy_run_progress.setFormat("Running strategy…")
+        self.strategy_run_progress.setFormat("Running signal model…")
         self.strategy_run_progress.setVisible(True)
-        self.status.setText(f"Calculating strategy: {Path(path).name}")
+        self.status.setText(f"Running signal model: {Path(path).name}")
         self.strategy_runner = SavedStrategyRunner(Path(path), self)
         self.strategy_runner.progress.connect(self._strategy_run_progress)
         self.strategy_runner.completed.connect(self._strategy_run_complete)
@@ -615,9 +619,9 @@ class LauncherWindow(QMainWindow):
             button.setEnabled(True)
         self._refresh_strategies()
         self._strategy_selection_changed()
-        self.status.setText(f"Strategy run complete: {result['strategy_name']} ({result['row_count']:,} bond-date rows)")
+        self.status.setText(f"Signal model run complete: {result['strategy_name']} ({result['row_count']:,} bond-date rows)")
         QMessageBox.information(
-            self, "Strategy run complete",
+            self, "Signal model run complete",
             f"Combined {result['row_count']:,} dated bond scores.\nSaved to {result['result_path']}",
         )
 
@@ -626,9 +630,9 @@ class LauncherWindow(QMainWindow):
         for button in self.buttons:
             button.setEnabled(True)
         self._strategy_selection_changed()
-        self.status.setText("Strategy run failed")
+        self.status.setText("Signal model run failed")
         QMessageBox.warning(
-            self, "Could not run strategy",
+            self, "Could not run signal model",
             f"{message}\n\nIf inputs are missing or stale, choose Calculate inputs first.",
         )
 

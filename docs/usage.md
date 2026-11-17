@@ -114,7 +114,7 @@ price history but no valid yield observation available by the selected date.
 ### Nelson-Siegel ticker curves
 
 In **Portfolio tooling**, choose **Explore Nelson-Siegel curves**. For each
-mapped equity issuer ticker, the tool takes each unmatured bond's latest valid
+mapped bond curve ticker, the tool takes each unmatured bond's latest valid
 TRACE yield on or before the selected date and fits a four-parameter
 Nelson-Siegel curve to yield versus remaining maturity. The three loadings are
 least-squares estimates. The decay parameter is selected by leave-one-bond-out
@@ -127,10 +127,15 @@ The output reports fitted yield and observed-minus-fitted yield residual in
 percentage points. A positive residual is labelled cheap versus that ticker's
 curve; a negative residual is labelled rich. This is a cross-sectional
 relative-value signal candidate, not a validated future-return forecast. The
-fit uses equity issuer ticker because rating data are not yet available; it
+fit uses the manually mapped bond curve ticker because rating data are not yet available; it
 does not control for rating, seniority, coupon, optionality, liquidity, or
 TRACE observation age. Export results to CSV to preserve the date-specific
 fits and diagnostics.
+
+In the issuer mapping table, edit **Bond curve ticker** as the primary grouping
+key. **Equity ticker** remains separate and is used to link bonds to issuer
+equity data. Save the map, rebuild the bond snapshot, and refresh the TRACE
+preprocessed dataset before recalculating signal inputs.
 
 After fitting, use the **Curve explorer** tab to choose a fitted ticker. The
 upper chart overlays observed bond yields with the fitted curve; the lower chart
@@ -145,9 +150,7 @@ includes tickers that could not be fitted and their minimum-data reason.
 ## Signal inventory and evaluation
 
 The launcher **Signals** tab lists implemented signal components and their
-validation status. Use the **Strategies** tab to evaluate individual signal
-components or open **Define strategy graph** to create and save a reusable
-combination. Choose **Evaluate signal components** to compare the
+validation status. Choose **Evaluate signal components** on that tab to compare the
 Nelson-Siegel residual with historical partition percentile and z-score signals over a selected
 start/end range, and choose **Yield**, **G-spread**, or **Price** as the signal
 space. Signals and forward outcomes use the same selected space. G-spread mode
@@ -183,21 +186,21 @@ Pearson and Spearman IC. Signal staleness, maximum gap between selected-space ch
 minimum curve size, price age, horizon, and long-short tail quantile are
 configurable.
 
-Use **Define strategy graph** on the launcher's **Strategies** tab to
-create, validate, open, and save reusable strategy JSON in a node canvas.
-Strategies default to the repository's `data/strategies/` folder. Each
+Use **New signal model** or **Edit** on the launcher's **Signal models** tab to
+create, validate, open, and save reusable signal model JSON in a node canvas.
+Signal model files currently live in the repository's `data/strategies/` folder. Each
 signal is a branch into the shared combination node, with its transforms shown
 in order; final transforms sit after combination. Nodes can be dragged to
 arrange the canvas, and the canvas supports wheel zoom, drag-to-pan, and a
 **Fit graph** control. Selecting a node opens its settings. Cards summarize
 the predictor, signal space, group, weight, transform parameters, or combination
 rule; node cards also include a short explanation of their operation, and arrows
-show the score flow. **Global strategy settings** contain the strategy name;
+show the score flow. **Global signal model settings** contain the model name;
 **Selected node settings** show only the controls for the clicked block, with the
 combination method on the combiner node and transformer type/parameters on each
 transformer node. Signal grouping uses a dropdown populated from the selected
 reference bond-list CSV, so fields absent from that universe are flagged rather
-than silently accepted. A strategy contains uniquely named signal
+than silently accepted. A signal model contains uniquely named signal
 components, independent transformer nodes connected between signal branches
 and the combiner, and a combiner node with its own method. Supported
 combinations are weighted mean, equal mean, weighted sum, and rank mean.
@@ -210,18 +213,34 @@ and combiner. Add signal blocks, insert transformer blocks on a branch, and
 select the combiner node to set how branches are aggregated. Definitions can
 be saved independently of a test run.
 
-The launcher's **Strategies** tab lists saved strategy files and shows whether
+Nelson–Siegel signal nodes include an optional robust curve input filter. It
+flags cross-sectional bonds whose initial curve residual is more than a
+configurable multiple of the median absolute deviation from the residual median,
+then refits the curve without those bonds and omits their scores for that date.
+The default is off; enable it on the selected signal node and recalculate inputs
+to apply it. Its setting and threshold are saved with that signal.
+
+The launcher's **Signal models** tab lists saved model files and shows whether
 their component inputs are ready, absent, or stale. **Edit** opens the selected
-strategy in the graph editor, **Calculate inputs** opens its date/source setup,
+model in the graph editor, **Calculate inputs** opens its date/source setup,
 **Run** recombines cached inputs directly from the launcher and shows progress,
-and **Clear cache** removes its signal-input cache and latest combined result.
+**Inspect** opens the date-selectable heatmap directly, and **Clear cache**
+removes the model's signal-input cache and latest combined result. A full
+investment strategy can later combine a signal model with portfolio construction
+and rebalancing rules.
+
+In the signal model inspector, double-click a bond row to open its bond inspector
+at the selected signal date. It plots issuer-level G-spread and yield curves,
+highlights the selected bond, and reports its residual to each fitted curve. The
+history panels show G-spread, clean price, and yield with trailing three-year
+z-scores when enough prior observations are available.
 
 Use **Calculate inputs** to evaluate and cache the individual bond/date scores
 for the selected date range and TRACE source. The cache is stored under
 `data/strategies/runs/`. Recalculating with the same
 date range and data source reuses unchanged signal components; newly added or
 edited signal components are calculated, while a changed date range or source
-refreshes all inputs. **Run strategy** applies the current graph to those
+refreshes all inputs. **Run** applies the current graph to those
 cached inputs and saves the combined dated bond scores alongside the cache.
 Changing only a combiner or transformer does not require recalculating signal
 inputs. **Export latest scores** writes a CSV for the latest date present in
@@ -232,10 +251,10 @@ The CSV includes both raw component scores and transformed graph-node inputs
 so the path into the final score can be inspected. This is a ranked signal
 output; it does not assign position sizes.
 
-**Inspect strategy** opens a date-selectable heatmap table. It shows bond
+**Inspect** opens a date-selectable heatmap table. It shows bond
 metadata, each raw signal, each non-signal value entering a combiner, and the
-final strategy score. The final score is the leftmost column, followed by its
-inputs and upstream values. Cells are colored from low (red) to high (green)
+final signal model score. Static bond metadata stays at the left, followed by
+the final score and its inputs and upstream values. Cells are colored from low (red) to high (green)
 within each date and column. Click any header or use the **Sort by** and
 **Order** controls to find the largest and smallest scores.
 

@@ -1,4 +1,4 @@
-"""Visual node editor for reusable multi-signal strategy JSON files."""
+"""Visual node editor for reusable multi-signal model JSON files."""
 
 from __future__ import annotations
 
@@ -14,21 +14,25 @@ from typing import Any
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, QThread, Signal, QDate
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem, QGraphicsScene,
     QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QSplitter, QStackedWidget,
     QSpinBox, QDoubleSpinBox, QListWidget, QListWidgetItem, QAbstractItemView,
     QVBoxLayout, QWidget, QDialog, QDateEdit, QDialogButtonBox, QProgressDialog,
     QTableWidget, QTableWidgetItem,
+    QToolTip,
 )
 
 from .strategy import (
     CombinerNode, Strategy, SignalComponent, TransformerNode,
 )
 from .trace_history import DEFAULT_SNAPSHOT, DATABASE_PATH
-from .strategy_run import run_strategy_signals, recombine_cached_signals
+from .strategy_run import (
+    run_strategy_signals, recombine_cached_signals, stable_strategy_id, strategy_cache_path,
+)
 from .signal_evaluation import _has_current_cleaning_version
+from .bond_inspector import analyze_bond_inspector
 
 
 PREDICTORS = {
@@ -66,7 +70,7 @@ class StrategyRunWorker(QThread):
 class StrategyInputsDialog(QDialog):
     def __init__(self, parent: QWidget, bond_list: str) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Calculate strategy inputs")
+        self.setWindowTitle("Calculate signal model inputs")
         layout = QFormLayout(self)
         self.start_date = QDateEdit(calendarPopup=True)
         self.start_date.setDisplayFormat("yyyy-MM-dd")
@@ -179,16 +183,19 @@ def _transform_description(transform: dict[str, Any]) -> str:
 
 class HeatmapItem(QTableWidgetItem):
     def __lt__(self, other: QTableWidgetItem) -> bool:
+        if not isinstance(other, QTableWidgetItem):
+            return self.text().casefold() < str(other).casefold()
         left = self.data(Qt.ItemDataRole.UserRole)
         right = other.data(Qt.ItemDataRole.UserRole)
         if isinstance(left, (float, int)) and isinstance(right, (float, int)):
             return left < right
-        return super().__lt__(other)
+        return self.text().casefold() < other.text().casefold()
 
 
 class StrategyInspectorDialog(QDialog):
     METADATA_ALIASES = {
-        "Ticker": ("equity_ticker", "ticker", "issuer_ticker", "bloomberg_ticker"),
+        "Bond ticker": ("bond_ticker",),
+        "Equity ticker": ("equity_ticker", "ticker", "issuer_ticker", "bloomberg_ticker"),
         "Coupon": ("coupon", "coupon_pct", "coupon_rate", "coupon_rate_pct", "coupon_percent"),
         "Maturity": ("maturity_date", "maturity"),
         "Sector": ("sector", "industry_sector", "gics_sector", "industry"),
@@ -197,9 +204,10 @@ class StrategyInspectorDialog(QDialog):
     }
 
     def __init__(self, strategy: Strategy, rows: list[dict[str, Any]],
-                 bond_details: dict[str, dict[str, str]], parent: QWidget | None = None) -> None:
+                 bond_details: dict[str, dict[str, str]], parent: QWidget | None = None,
+                 evaluation_parameters: dict[str, Any] | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Strategy inspector · {strategy.name}")
+        self.setWindowTitle(f"Signal model inspector · {strategy.name}")
         self.resize(1450, 820)
         self.strategy = strategy
         self.rows_by_date: dict[str, list[dict[str, Any]]] = {}
@@ -238,8 +246,10 @@ class StrategyInspectorDialog(QDialog):
         self.table.horizontalHeader().setSectionsClickable(True)
         self.table.horizontalHeader().setSortIndicatorShown(True)
         self.table.horizontalHeader().sortIndicatorChanged.connect(self._sync_sort_controls)
+        self.table.itemDoubleClicked.connect(self._inspect_bond)
         layout.addWidget(self.table, 1)
         self.bond_details = bond_details
+        self.evaluation_parameters = evaluation_parameters or {}
 
         node_names = {f"signal:{signal.signal_id}": signal.signal_id for signal in strategy.signals}
         node_names.update({node.node_id: node.name for node in strategy.transformer_nodes})
@@ -258,7 +268,7 @@ class StrategyInspectorDialog(QDialog):
 
         output_name = node_names.get(strategy.output_node_id, strategy.output_node_id)
         score_columns: list[tuple[str, str]] = [
-            (f"Strategy score · {output_name}", score_key(strategy.output_node_id))
+            (f"Final model score · {output_name}", score_key(strategy.output_node_id))
         ]
         seen_score_keys = {score_columns[0][1]}
         pending = [(parent_id, output_name) for parent_id in node_parents.get(strategy.output_node_id, [])]
@@ -300,7 +310,7 @@ class StrategyInspectorDialog(QDialog):
 
     def _show_date(self, as_of_date: str) -> None:
         rows = self.rows_by_date.get(as_of_date, [])
-        columns = [*self.score_columns, *self.metadata_columns]
+        columns = [*self.metadata_columns, *self.score_columns]
         self.table.setSortingEnabled(False)
         self.table.clear()
         self.table.setColumnCount(len(columns))
@@ -309,7 +319,7 @@ class StrategyInspectorDialog(QDialog):
         self.sort_by.clear()
         for column, (label, _key) in enumerate(columns):
             self.sort_by.addItem(label, column)
-        self.sort_by.setCurrentIndex(0)
+        self.sort_by.setCurrentIndex(len(self.metadata_columns))
         self.sort_by.blockSignals(False)
         self.table.setRowCount(len(rows))
         score_values: dict[str, list[float]] = {}
@@ -356,6 +366,245 @@ class StrategyInspectorDialog(QDialog):
             self.sort_order.findData(order.value)
         )
         self.sort_order.blockSignals(False)
+
+    def _inspect_bond(self, item: QTableWidgetItem) -> None:
+        isin_item = self.table.item(item.row(), 0)
+        isin = isin_item.text().strip() if isin_item else ""
+        parameters = self.evaluation_parameters
+        if not isin or not parameters.get("bond_list_path"):
+            QMessageBox.information(self, "Bond inspector unavailable",
+                                    "This signal cache does not contain a bond-list path.")
+            return
+        self._bond_progress = QProgressDialog("Loading bond history and fitting curves…", "", 0, 0, self)
+        self._bond_progress.setWindowTitle("Bond inspector")
+        self._bond_progress.setCancelButton(None)
+        self._bond_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._bond_progress.setMinimumDuration(0)
+        self._bond_progress.show()
+        self._bond_worker = BondInspectorWorker(
+            isin, self.date_choice.currentText(), parameters
+        )
+        self._bond_worker.succeeded.connect(self._show_bond_inspector)
+        self._bond_worker.failed.connect(self._bond_inspector_failed)
+        self._bond_worker.start()
+
+    def _show_bond_inspector(self, result: dict[str, Any]) -> None:
+        self._bond_progress.close()
+        dialog = BondInspectorDialog(result, self)
+        dialog.exec()
+
+    def _bond_inspector_failed(self, message: str) -> None:
+        self._bond_progress.close()
+        QMessageBox.warning(self, "Could not inspect bond", message)
+
+
+class BondInspectorWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, isin: str, as_of_date: str, parameters: dict[str, Any]) -> None:
+        super().__init__()
+        self.isin = isin
+        self.as_of_date = as_of_date
+        self.parameters = parameters
+
+    def run(self) -> None:
+        try:
+            result = analyze_bond_inspector(
+                isin=self.isin,
+                as_of_date=self.as_of_date,
+                bond_list_path=Path(self.parameters["bond_list_path"]),
+                data_source=str(self.parameters.get("data_source", "raw_duckdb")),
+                data_path=self.parameters.get("data_path"),
+                database_path=Path(self.parameters.get("database_path", DATABASE_PATH)),
+            )
+            self.succeeded.emit(result)
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
+class BondPlot(QWidget):
+    """Compact dark plot for a fitted cross-section or bond history."""
+
+    def __init__(self, title: str, points: list[dict[str, Any]], *,
+                 x_key: str, y_key: str, zscore: bool = False,
+                 selected_isin: str = "", fitted_key: str | None = None,
+                 x_start_label: str = "", x_end_label: str = "") -> None:
+        super().__init__()
+        self.title = title
+        self.points = points
+        self.x_key = x_key
+        self.y_key = y_key
+        self.zscore = zscore
+        self.selected_isin = selected_isin
+        self.fitted_key = fitted_key
+        self.x_start_label = x_start_label
+        self.x_end_label = x_end_label
+        self._residual_segments: list[tuple[QPointF, QPointF, str]] = []
+        self.setMouseTracking(True)
+        self.setMinimumHeight(190)
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#111827"))
+        painter.setPen(QColor("#e5e7eb"))
+        painter.drawText(14, 22, self.title)
+        left, top, right, bottom = 58, 38, self.width() - 24, self.height() - 30
+        painter.setPen(QPen(QColor("#475569"), 1))
+        painter.drawLine(left, top, left, bottom)
+        painter.drawLine(left, bottom, right, bottom)
+        valid = [p for p in self.points if p.get(self.x_key) is not None and p.get(self.y_key) is not None]
+        valid.sort(key=lambda point: float(point[self.x_key]))
+        if not valid:
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(left + 12, top + 28, "No observations available")
+            return
+        xs = [float(p[self.x_key]) for p in valid]
+        ys = [float(p[self.y_key]) for p in valid]
+        if self.fitted_key:
+            ys.extend(float(p[self.fitted_key]) for p in valid if p.get(self.fitted_key) is not None)
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        if xmax == xmin:
+            xmax = xmin + 1
+        if ymax == ymin:
+            ymax = ymin + 1
+        def xy(point: dict[str, Any]) -> QPointF:
+            x = left + (float(point[self.x_key]) - xmin) / (xmax - xmin) * (right - left)
+            y = bottom - (float(point[self.y_key]) - ymin) / (ymax - ymin) * (bottom - top)
+            return QPointF(x, y)
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(4, top + 5, f"{ymax:.2f}")
+        painter.drawText(4, bottom, f"{ymin:.2f}")
+        painter.setPen(QColor("#94a3b8"))
+        painter.drawText(left, self.height() - 5, self.x_start_label)
+        painter.drawText(max(left, right - 90), self.height() - 5, self.x_end_label)
+        if self.zscore:
+            painter.setPen(QColor("#fbbf24"))
+            painter.drawText(right - 145, top + 1, "Observed value · blue   Z-score · amber")
+            painter.drawText(right + 2, top + 5, "+3")
+            painter.drawText(right + 2, (top + bottom) // 2, "0")
+            painter.drawText(right + 2, bottom, "−3")
+        self._residual_segments = []
+        if self.fitted_key:
+            fitted = [p for p in valid if p.get(self.fitted_key) is not None]
+            fit_path = QPainterPath()
+            for index, point in enumerate(fitted):
+                position = QPointF(
+                    left + (float(point[self.x_key]) - xmin) / (xmax - xmin) * (right - left),
+                    bottom - (float(point[self.fitted_key]) - ymin) / (ymax - ymin) * (bottom - top),
+                )
+                fit_path.moveTo(position) if index == 0 else fit_path.lineTo(position)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#a3e635"), 2, Qt.PenStyle.DashLine))
+            painter.drawPath(fit_path)
+            for target in fitted:
+                observed_point = xy(target)
+                fitted_point = QPointF(
+                    left + (float(target[self.x_key]) - xmin) / (xmax - xmin) * (right - left),
+                    bottom - (float(target[self.fitted_key]) - ymin) / (ymax - ymin) * (bottom - top),
+                )
+                residual = float(target[self.y_key]) - float(target[self.fitted_key])
+                unit = "bp" if "spread" in self.title.casefold() else "%"
+                observed_date = target.get("observation_date", "date unavailable")
+                tooltip = (
+                    f"{target.get('isin', '')} · {observed_date}\n"
+                    f"Observed: {float(target[self.y_key]):.3f} {unit}\n"
+                    f"Fitted: {float(target[self.fitted_key]):.3f} {unit}\n"
+                    f"Residual (observed − fitted): {residual:+.3f} {unit}"
+                )
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor("#64748b"), 1.2))
+                painter.drawLine(observed_point, fitted_point)
+                self._residual_segments.append((observed_point, fitted_point, tooltip))
+        else:
+            self._residual_segments = []
+        painter.setBrush(QColor("#38bdf8"))
+        for point in valid:
+            position = xy(point)
+            painter.drawEllipse(position, 2.5, 2.5)
+        if self.zscore:
+            zvalid = [p for p in valid if p.get("zscore") is not None]
+            if zvalid:
+                zpath = QPainterPath()
+                for index, point in enumerate(zvalid):
+                    z = max(-3.0, min(3.0, float(point["zscore"])))
+                    position = QPointF(left + (float(point[self.x_key]) - xmin) / (xmax - xmin) * (right - left),
+                                       bottom - (z + 3) / 6 * (bottom - top))
+                    zpath.moveTo(position) if index == 0 else zpath.lineTo(position)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor("#fbbf24"), 1.5, Qt.PenStyle.DashLine))
+                painter.drawPath(zpath)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        mouse = event.position()
+        for first, second, tooltip in self._residual_segments:
+            if (abs(mouse.x() - first.x()) <= 5
+                    and min(first.y(), second.y()) - 5 <= mouse.y() <= max(first.y(), second.y()) + 5):
+                QToolTip.showText(self.mapToGlobal(event.position().toPoint()), tooltip, self)
+                return
+        QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+
+class BondInspectorDialog(QDialog):
+    def __init__(self, result: dict[str, Any], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Bond inspector · {result['isin']}")
+        self.resize(1180, 900)
+        layout = QVBoxLayout(self)
+        coupon = result.get("coupon_pct")
+        coupon_text = f"{coupon:g}%" if isinstance(coupon, (int, float)) else "—"
+        layout.addWidget(QLabel(
+            f"Bond curve ticker {result.get('ticker') or 'unmapped'} · "
+            f"Equity ticker {result.get('equity_ticker') or 'unmapped'} · {result.get('issuer') or ''} · "
+            f"Coupon {coupon_text} · Maturity {result['maturity_date']} · "
+            f"As of {result['as_of_date']}"
+        ))
+        curve_row = QHBoxLayout()
+        for key, label in (("spread_curve", "G-spread curve"), ("yield_curve", "Yield curve")):
+            curve = result[key]
+            residual = curve.get("residual")
+            unit = "bp" if key == "spread_curve" else "%"
+            subtitle = f" · residual {residual:+.2f} {unit}" if residual is not None else f" · {curve.get('message', 'No residual')}"
+            curve_row.addWidget(BondPlot(
+                label + subtitle, curve.get("points", []),
+                x_key="maturity_years", y_key="value", selected_isin=result["isin"],
+                fitted_key="fitted",
+            ))
+        layout.addLayout(curve_row)
+        history = result.get("history", {})
+        for key, label in (("spread", "G-spread · bp"), ("price", "Clean price"), ("yield", "Yield · %")):
+            points = history.get(key, [])
+            converted = []
+            for index, point in enumerate(points):
+                try:
+                    x = date.fromisoformat(point["date"]).toordinal()
+                except (TypeError, ValueError):
+                    continue
+                converted.append({**point, "ordinal": x, "index": index})
+            start_label = points[0]["date"] if points else ""
+            end_label = points[-1]["date"] if points else ""
+            layout.addWidget(BondPlot(label + " · observed level and trailing 3y z-score",
+                                      converted, x_key="index", y_key="value", zscore=True,
+                                      x_start_label=start_label, x_end_label=end_label), 1)
+
+
+def show_saved_strategy_inspector(strategy: Strategy, cache_path: Path) -> None:
+    rows = recombine_cached_signals(strategy, cache_path)
+    cache = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+    bond_list_path = cache.get("evaluation_parameters", {}).get("bond_list_path")
+    details: dict[str, dict[str, str]] = {}
+    if bond_list_path and Path(bond_list_path).is_file():
+        with Path(bond_list_path).open("r", encoding="utf-8-sig", newline="") as handle:
+            for bond in csv.DictReader(handle):
+                if bond.get("isin"):
+                    details[str(bond["isin"])] = bond
+    parameters = cache.get("evaluation_parameters", {})
+    inspector = StrategyInspectorDialog(strategy, rows, details,
+                                        evaluation_parameters=parameters)
+    inspector.exec()
 
 
 class NodeItem(QGraphicsRectItem):
@@ -519,11 +768,11 @@ class NodeGraphView(QGraphicsView):
 class StrategyEditorWindow(QMainWindow):
     def __init__(self, startup_strategy: Path | None = None, startup_action: str = "edit") -> None:
         super().__init__()
-        self.setWindowTitle("Credit Strategy Node Editor")
+        self.setWindowTitle("Credit Signal Model Editor")
         self.resize(1360, 850)
         STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
         self.strategy = Strategy(
-            name="Untitled strategy", signals=[], combiners=[CombinerNode()],
+            name="Untitled signal model", signals=[], combiners=[CombinerNode()],
             strategy_id=uuid.uuid4().hex,
         )
         self.node_positions: dict[str, QPointF] = {}
@@ -550,8 +799,8 @@ class StrategyEditorWindow(QMainWindow):
 
         run_toolbar = QHBoxLayout()
         for label, handler in (("Calculate inputs…", self._calculate_inputs),
-                               ("Run strategy", self._run_strategy),
-                               ("Inspect strategy", self._inspect_strategy),
+                               ("Run model", self._run_strategy),
+                               ("Inspect model", self._inspect_strategy),
                                ("Export latest scores…", self._export_latest_scores)):
             button = QPushButton(label)
             button.clicked.connect(handler)
@@ -566,7 +815,7 @@ class StrategyEditorWindow(QMainWindow):
             run_toolbar.addWidget(button)
             if label == "Calculate inputs…":
                 self.run_inputs_button = button
-            elif label == "Run strategy":
+            elif label == "Run model":
                 self.run_strategy_button = button
         run_toolbar.addStretch(1)
         zoom_out = QPushButton("−")
@@ -604,11 +853,11 @@ class StrategyEditorWindow(QMainWindow):
         panel = QWidget()
         panel_layout = QVBoxLayout(panel)
         panel_layout.addWidget(block_legend)
-        global_box = QGroupBox("Global strategy settings")
+        global_box = QGroupBox("Global signal model settings")
         global_form = QFormLayout(global_box)
         self.strategy_name = QLineEdit(self.strategy.name)
         self.strategy_name.editingFinished.connect(self._update_strategy_name)
-        global_form.addRow("Strategy name", self.strategy_name)
+        global_form.addRow("Signal model name", self.strategy_name)
         self.bond_list_path = QLineEdit(str(DEFAULT_SNAPSHOT))
         self.bond_list_path.setToolTip("CSV schema used to validate signal grouping fields.")
         bond_list_row = QHBoxLayout()
@@ -619,8 +868,8 @@ class StrategyEditorWindow(QMainWindow):
         global_form.addRow("Reference bond list", bond_list_row)
         self.output_node = QComboBox()
         self.output_node.currentIndexChanged.connect(self._update_output_node)
-        global_form.addRow("Strategy output", self.output_node)
-        global_form.addRow(QLabel("These settings describe the saved strategy as a whole."))
+        global_form.addRow("Model output", self.output_node)
+        global_form.addRow(QLabel("These settings describe the saved signal model as a whole."))
         panel_layout.addWidget(global_box)
 
         node_box = QGroupBox("Selected node settings")
@@ -655,6 +904,17 @@ class StrategyEditorWindow(QMainWindow):
         self.minimum_history = QSpinBox()
         self.minimum_history.setRange(5, 500)
         self.minimum_history.setValue(20)
+        self.curve_filter_enabled = QCheckBox("Exclude curve outliers before scoring")
+        self.curve_filter_threshold = QDoubleSpinBox()
+        self.curve_filter_threshold.setRange(1.0, 10.0)
+        self.curve_filter_threshold.setDecimals(1)
+        self.curve_filter_threshold.setSingleStep(0.5)
+        self.curve_filter_threshold.setValue(4.5)
+        self.curve_filter_threshold.setToolTip(
+            "Reject bonds whose initial Nelson–Siegel residual is more than this many robust MADs from the median. "
+            "Filtered bonds are omitted from the curve fit and from this signal's output."
+        )
+        self.curve_filter_enabled.toggled.connect(self.curve_filter_threshold.setEnabled)
         signal_form.addRow("Signal ID", self.signal_id)
         signal_form.addRow("Predictor", self.predictor)
         signal_form.addRow("Signal space", self.signal_space)
@@ -662,6 +922,8 @@ class StrategyEditorWindow(QMainWindow):
         signal_form.addRow("Weight", self.weight)
         signal_form.addRow("History lookback (days)", self.lookback_days)
         signal_form.addRow("Minimum history points", self.minimum_history)
+        signal_form.addRow("Curve input filter", self.curve_filter_enabled)
+        signal_form.addRow("Outlier threshold (MADs)", self.curve_filter_threshold)
         self.node_pages.addWidget(signal_page)
         self.bond_list_path.textChanged.connect(self._refresh_bond_list_fields)
         self._refresh_bond_list_fields()
@@ -815,7 +1077,11 @@ class StrategyEditorWindow(QMainWindow):
                     weight = component.weight
                     lookback = component.parameters.get("lookback_days")
                     if component.predictor_id == "nelson_siegel_residual":
+                        group = "bond curve ticker"
                         description = f"Bond level vs. {group} curve.\nPositive score means cheap."
+                        if component.parameters.get("curve_outlier_filter_enabled", False):
+                            threshold = float(component.parameters.get("curve_outlier_filter_mad", 4.5))
+                            description += f"\nRobust input filter: {threshold:g} MADs"
                     elif component.predictor_id == "historical_partition_percentile":
                         description = "Group median vs. own history.\nHigher percentile means cheaper."
                     else:
@@ -940,6 +1206,15 @@ class StrategyEditorWindow(QMainWindow):
             }
             self.lookback_days.setVisible(is_partition)
             self.minimum_history.setVisible(is_partition)
+            is_nelson_siegel = component.predictor_id == "nelson_siegel_residual"
+            self.curve_filter_enabled.setVisible(is_nelson_siegel)
+            self.curve_filter_threshold.setVisible(is_nelson_siegel)
+            self.curve_filter_enabled.setChecked(bool(
+                component.parameters.get("curve_outlier_filter_enabled", False)
+            ))
+            self.curve_filter_threshold.setValue(float(
+                component.parameters.get("curve_outlier_filter_mad", 4.5)
+            ))
             self.lookback_days.setValue(int(component.parameters.get("lookback_days", 1095)))
             self.minimum_history.setValue(int(component.parameters.get("minimum_history_observations", 20)))
             self.node_pages.setCurrentIndex(1)
@@ -976,7 +1251,7 @@ class StrategyEditorWindow(QMainWindow):
             self.node_status.setText(f"Combiner node {node.name}. Select one or more incoming graph nodes.")
         else:
             self.node_pages.setCurrentIndex(0)
-            self.node_status.setText("Final combined strategy score.")
+        self.node_status.setText("Final combined signal model score.")
 
     def _transform_type_changed(self, *_args: Any) -> None:
         is_winsorize = hasattr(self, "transform_type") and self.transform_type.currentData() == "winsorize"
@@ -1015,6 +1290,11 @@ class StrategyEditorWindow(QMainWindow):
                     component.parameters.update({
                         "lookback_days": self.lookback_days.value(),
                         "minimum_history_observations": self.minimum_history.value(),
+                    })
+                elif component.predictor_id == "nelson_siegel_residual":
+                    component.parameters.update({
+                        "curve_outlier_filter_enabled": self.curve_filter_enabled.isChecked(),
+                        "curve_outlier_filter_mad": self.curve_filter_threshold.value(),
                     })
                 if old_id != new_id:
                     old_node_id, new_node_id = f"signal:{old_id}", f"signal:{new_id}"
@@ -1225,12 +1505,12 @@ class StrategyEditorWindow(QMainWindow):
             self.strategy.name = self.strategy_name.text().strip()
             self.strategy.validate()
         except (ValueError, TypeError, KeyError) as error:
-            QMessageBox.warning(self, "Strategy invalid", str(error))
+            QMessageBox.warning(self, "Signal model invalid", str(error))
             return
-        QMessageBox.information(self, "Strategy valid", f"{self.strategy.name}: {len(self.strategy.signals)} signal branches.")
+        QMessageBox.information(self, "Signal model valid", f"{self.strategy.name}: {len(self.strategy.signals)} signal branches.")
 
     def _open(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open strategy", str(STRATEGIES_DIR), "Strategy JSON (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open signal model", str(STRATEGIES_DIR), "Signal model JSON (*.json)")
         if not path:
             return
         self._load_strategy_file(Path(path))
@@ -1276,11 +1556,11 @@ class StrategyEditorWindow(QMainWindow):
         try:
             self.strategy.validate()
         except (ValueError, TypeError, KeyError) as error:
-            QMessageBox.warning(self, "Strategy invalid", str(error))
+            QMessageBox.warning(self, "Signal model invalid", str(error))
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save strategy", str(STRATEGIES_DIR / f"{self.strategy.strategy_id or 'strategy'}.json"),
-            "Strategy JSON (*.json)",
+            self, "Save signal model", str(STRATEGIES_DIR / f"{self.strategy.strategy_id or 'signal_model'}.json"),
+            "Signal model JSON (*.json)",
         )
         if not path:
             return
@@ -1289,9 +1569,9 @@ class StrategyEditorWindow(QMainWindow):
         try:
             self.strategy.save(Path(path))
         except OSError as error:
-            QMessageBox.warning(self, "Could not save strategy", str(error))
+            QMessageBox.warning(self, "Could not save signal model", str(error))
             return
-        QMessageBox.information(self, "Strategy saved", f"Saved {self.strategy.name}.")
+        QMessageBox.information(self, "Signal model saved", f"Saved {self.strategy.name}.")
 
     def _strategy_cache_path(self) -> Path:
         return STRATEGY_RUNS_DIR / f"{self.strategy.strategy_id or 'unsaved'}.inputs.json"
@@ -1305,7 +1585,7 @@ class StrategyEditorWindow(QMainWindow):
         try:
             self.strategy.validate()
         except (ValueError, TypeError, KeyError) as error:
-            QMessageBox.warning(self, "Strategy invalid", str(error))
+            QMessageBox.warning(self, "Signal model invalid", str(error))
             return
         dialog = StrategyInputsDialog(self, self.bond_list_path.text())
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1317,7 +1597,7 @@ class StrategyEditorWindow(QMainWindow):
             return
         self._run_progress = QProgressDialog("Calculating signal inputs…", "", 0,
                                              len(self.strategy.signals) * 100, self)
-        self._run_progress.setWindowTitle("Strategy inputs")
+        self._run_progress.setWindowTitle("Signal model inputs")
         self._run_progress.setCancelButton(None)
         self._run_progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._run_progress.setMinimumDuration(0)
@@ -1354,7 +1634,7 @@ class StrategyEditorWindow(QMainWindow):
             rows = recombine_cached_signals(self.strategy, self._strategy_cache_path())
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
             QMessageBox.warning(
-                self, "Strategy inputs unavailable",
+                self, "Signal model inputs unavailable",
                 f"{error}\n\nUse Calculate inputs to create or refresh the signal cache.",
             )
             return
@@ -1367,7 +1647,7 @@ class StrategyEditorWindow(QMainWindow):
             "rows": rows,
         }, indent=2) + "\n", encoding="utf-8")
         QMessageBox.information(
-            self, "Strategy run complete",
+            self, "Signal model run complete",
             f"Combined {len(rows):,} dated bond scores.\nSaved results to {result_path}",
         )
 
@@ -1377,23 +1657,13 @@ class StrategyEditorWindow(QMainWindow):
         self.strategy.name = self.strategy_name.text().strip()
         try:
             self.strategy.validate()
-            rows = recombine_cached_signals(self.strategy, self._strategy_cache_path())
-            cache = json.loads(self._strategy_cache_path().read_text(encoding="utf-8"))
+            show_saved_strategy_inspector(self.strategy, self._strategy_cache_path())
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
             QMessageBox.warning(
-                self, "Strategy inputs unavailable",
+                self, "Signal model inputs unavailable",
                 f"{error}\n\nUse Calculate inputs to create or refresh the signal cache.",
             )
             return
-        bond_list_path = cache.get("evaluation_parameters", {}).get("bond_list_path")
-        details: dict[str, dict[str, str]] = {}
-        if bond_list_path and Path(bond_list_path).is_file():
-            with Path(bond_list_path).open("r", encoding="utf-8-sig", newline="") as handle:
-                for bond in csv.DictReader(handle):
-                    if bond.get("isin"):
-                        details[str(bond["isin"])] = bond
-        inspector = StrategyInspectorDialog(self.strategy, rows, details, self)
-        inspector.exec()
 
     def _export_latest_scores(self) -> None:
         if self.apply_button.isEnabled() and not self._apply_node_settings():
@@ -1404,7 +1674,7 @@ class StrategyEditorWindow(QMainWindow):
             rows = recombine_cached_signals(self.strategy, self._strategy_cache_path())
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
             QMessageBox.warning(
-                self, "Strategy inputs unavailable",
+                self, "Signal model inputs unavailable",
                 f"{error}\n\nUse Calculate inputs to create or refresh the signal cache.",
             )
             return
@@ -1431,7 +1701,8 @@ class StrategyEditorWindow(QMainWindow):
                     if isin:
                         bond_details[str(isin)] = bond
         metadata_aliases = {
-            "ticker": ("equity_ticker", "ticker", "issuer_ticker", "bloomberg_ticker"),
+            "bond_ticker": ("bond_ticker",),
+            "equity_ticker": ("equity_ticker", "ticker", "issuer_ticker", "bloomberg_ticker"),
             "coupon": ("coupon", "coupon_pct", "coupon_rate", "coupon_rate_pct", "coupon_percent"),
             "maturity_date": ("maturity_date", "maturity"),
             "sector": ("sector", "industry_sector", "gics_sector", "industry"),
@@ -1454,7 +1725,7 @@ class StrategyEditorWindow(QMainWindow):
             for input_id in combiner.input_node_ids
         }
         output_path, _ = QFileDialog.getSaveFileName(
-            self, "Export latest strategy scores",
+            self, "Export latest signal model scores",
             str(STRATEGY_RUNS_DIR / f"{self.strategy.strategy_id}_latest_scores_{latest_date}.csv"),
             "CSV files (*.csv)",
         )
@@ -1493,11 +1764,19 @@ class StrategyEditorWindow(QMainWindow):
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Build and run signal strategies")
-    parser.add_argument("--strategy", type=Path, help="Open a saved strategy file on launch")
-    parser.add_argument("--action", choices=("edit", "calculate", "run"), default="edit")
+    parser = argparse.ArgumentParser(description="Build and run signal models")
+    parser.add_argument("--strategy", type=Path, help="Open a saved signal model file on launch")
+    parser.add_argument("--action", choices=("edit", "calculate", "run", "inspect"), default="edit")
     args = parser.parse_args()
     app = QApplication(sys.argv)
+    if args.action == "inspect" and args.strategy is not None:
+        try:
+            strategy = Strategy.load(args.strategy)
+            strategy.strategy_id = stable_strategy_id(args.strategy, strategy.strategy_id)
+            show_saved_strategy_inspector(strategy, strategy_cache_path(strategy.strategy_id))
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+            QMessageBox.warning(None, "Could not inspect signal model", str(error))
+        return
     window = StrategyEditorWindow(args.strategy, args.action)
     window.show()
     sys.exit(app.exec())

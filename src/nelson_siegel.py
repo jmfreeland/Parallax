@@ -1,4 +1,4 @@
-"""Cross-sectional, issuer-ticker Nelson-Siegel yield curve fits."""
+"""Cross-sectional bond-curve-ticker Nelson-Siegel yield curve fits."""
 
 from __future__ import annotations
 
@@ -60,6 +60,31 @@ def _fit_curve(
     return tau, beta, rmse, loo_rmse, tau_min, tau_max
 
 
+def _fit_curve_with_outlier_filter(
+    maturities: np.ndarray,
+    values: np.ndarray,
+    threshold_mad: float | None = None,
+) -> tuple[float, np.ndarray, float, float, float, float, np.ndarray]:
+    """Fit NS and optionally remove cross-sectional residual outliers by MAD."""
+    initial = _fit_curve(maturities, values)
+    included = np.ones(len(values), dtype=bool)
+    if threshold_mad is None or len(values) < 5:
+        return (*initial, included)
+    tau, beta, *_ = initial
+    residuals = values - _basis(maturities, tau) @ beta
+    center = float(np.median(residuals))
+    mad = float(np.median(np.abs(residuals - center)))
+    robust_scale = 1.4826 * mad
+    if not np.isfinite(robust_scale) or robust_scale <= 1e-10:
+        return (*initial, included)
+    included = np.abs(residuals - center) <= threshold_mad * robust_scale
+    distinct = {round(float(value), 6) for value in maturities[included]}
+    if int(included.sum()) < 4 or len(distinct) < 4:
+        return (*initial, np.ones(len(values), dtype=bool))
+    filtered = _fit_curve(maturities[included], values[included])
+    return (*filtered, included)
+
+
 def fit_ticker_curves(
     *,
     as_of_date: date,
@@ -67,7 +92,7 @@ def fit_ticker_curves(
     database_path: Path,
     minimum_bonds: int = 5,
 ) -> list[dict[str, Any]]:
-    """Fit one yield curve per equity issuer ticker using latest valid yields.
+    """Fit one yield curve per bond curve ticker using latest valid yields.
 
     All TRACE observations are filtered to ``trade_date <= as_of_date``. A
     ticker's cross-section must contain at least ``minimum_bonds`` bonds and
@@ -83,11 +108,11 @@ def fit_ticker_curves(
     bonds: dict[str, dict[str, str]] = {}
     with bond_list_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        if not reader.fieldnames or not {"isin", "equity_ticker", "maturity_date"}.issubset(reader.fieldnames):
-            raise ValueError("Bond list must contain isin, equity_ticker, and maturity_date columns")
+        if not reader.fieldnames or not {"isin", "bond_ticker", "maturity_date"}.issubset(reader.fieldnames):
+            raise ValueError("Bond list must contain isin, bond_ticker, and maturity_date columns")
         for raw in reader:
             isin = (raw.get("isin") or "").strip().upper()
-            ticker = (raw.get("equity_ticker") or "").strip().upper()
+            ticker = (raw.get("bond_ticker") or "").strip().upper()
             maturity_text = (raw.get("maturity_date") or "").strip()
             if not isin or not ticker or not maturity_text:
                 continue
@@ -100,9 +125,9 @@ def fit_ticker_curves(
                 bonds[isin] = {"ticker": ticker, "maturity_date": maturity_text, "maturity_years": str(years),
                                "issuer_name": (raw.get("issuer_name") or "").strip(), "sector": (raw.get("sector") or "").strip()}
     if not bonds:
-        raise ValueError("No unmatured bonds with a mapped equity_ticker and maturity date")
+        raise ValueError("No unmatured bonds with a mapped bond_ticker and maturity date")
     provenance = {
-        "model_version": "nelson_siegel_loo_tau_v2",
+        "model_version": "nelson_siegel_loo_tau_bond_ticker_v3",
         "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bond_list_path": str(bond_list_path.resolve()),
         "trace_database_path": str(database_path.resolve()),

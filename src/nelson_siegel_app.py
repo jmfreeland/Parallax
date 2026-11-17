@@ -198,7 +198,7 @@ class NelsonSiegelWindow(QMainWindow):
         layout.addLayout(controls)
 
         self.summary = QLabel(
-            f"Database: {DATABASE_PATH}\nFits mapped equity issuer tickers cross-sectionally using latest valid TRACE yields."
+            f"Database: {DATABASE_PATH}\nFits mapped bond curve tickers cross-sectionally using latest valid TRACE yields."
         )
         self.summary.setWordWrap(True)
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)

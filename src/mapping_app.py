@@ -59,12 +59,12 @@ HEADERS = [
     "Issuer / company",
     "Issuer LEI",
     "Representative bond ISIN",
-    "Bond ticker",
-    "Automated candidate",
-    "Manual override",
-    "Final ticker",
-    "Snapshot ticker",
-    "Snapshot status",
+    "Bond curve ticker (editable)",
+    "Automated equity ticker candidate",
+    "Equity ticker override",
+    "Final equity ticker",
+    "Snapshot equity ticker",
+    "Equity snapshot status",
     "Equity exchange",
     "Equity country",
     "Source",
@@ -78,7 +78,11 @@ HEADERS = [
 TICKER_FIELD_INDEX = FIELDS.index("equity_ticker")
 TABLE_FIELDS = [
     "isin_count",
-    *FIELDS[: TICKER_FIELD_INDEX + 1],
+    *FIELDS[:3],
+    "bond_ticker",
+    "automated_equity_ticker",
+    "equity_ticker_override",
+    "equity_ticker",
     "snapshot_ticker",
     "snapshot_status",
     *FIELDS[TICKER_FIELD_INDEX + 1 :],
@@ -321,6 +325,15 @@ class MappingWindow(QMainWindow):
         self.table = QTableWidget(len(self.records), len(FIELDS))
         self.table.setColumnCount(len(TABLE_FIELDS))
         self.table.setHorizontalHeaderLabels(HEADERS)
+        header_tooltips = {
+            "Bond curve ticker (editable)": "Primary issuer curve grouping ticker used by Nelson–Siegel. Edit this to assign bonds to a bond curve.",
+            "Automated equity ticker candidate": "Automated suggestion for the issuer or parent company's listed equity. Used separately when joining equity data.",
+            "Equity ticker override": "Editable issuer-to-equity mapping. This value takes precedence over the automatic candidate.",
+            "Final equity ticker": "Effective issuer equity ticker used when the bond snapshot is rebuilt.",
+        }
+        for column, label in enumerate(HEADERS):
+            if label in header_tooltips:
+                self.table.horizontalHeaderItem(column).setToolTip(header_tooltips[label])
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(False)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -334,11 +347,10 @@ class MappingWindow(QMainWindow):
         layout.addWidget(self.table, 1)
 
         help_text = QLabel(
-            "The bond ISIN and optional bond ticker identify the debt security. "
-            "Equity ticker is a separate issuer or parent listing. Automated parent matches are suggestions; "
-            "enter an override only when the relationship is clear. Final ticker combines the automatic "
-            "candidate and manual override. Snapshot ticker shows the current CSV; save your map and rebuild "
-            "the snapshot to apply changes."
+            "Bond curve ticker is the primary mapping used to group bonds when fitting issuer curves. Enter or "
+            "correct it first. Automated equity ticker candidate is a separate suggestion for linking the issuer "
+            "to equity data; use Equity ticker override when that suggestion is wrong. Final equity ticker is "
+            "used for equity joins. Save your map and rebuild the snapshot to apply changes."
         )
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
@@ -370,6 +382,10 @@ class MappingWindow(QMainWindow):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if field == "isin_count":
                     item.setToolTip("Number of bond ISINs for this issuer in the current snapshot.")
+                if field == "bond_ticker":
+                    item.setToolTip(
+                        "Primary bond-curve grouping ticker. This editable value is copied to each bond in the issuer when the snapshot is rebuilt."
+                    )
                 if field == "confidence":
                     item.setToolTip("Use high, medium, low, or unrated. This is your confidence in the issuer-to-equity link.")
                 self.table.setItem(row_index, column, item)
@@ -389,7 +405,9 @@ class MappingWindow(QMainWindow):
         if self._loading:
             return
         field = TABLE_FIELDS[column]
-        if field == "equity_ticker_override":
+        if field == "bond_ticker":
+            self._set_cell(row, column, self.table.item(row, column).text().strip().upper())
+        elif field == "equity_ticker_override":
             override = self.table.item(row, column).text().strip().upper()
             self._set_cell(row, column, override)
 
@@ -512,6 +530,7 @@ class MappingWindow(QMainWindow):
                 for field in FIELDS
             }
             override = record["equity_ticker_override"].upper()
+            record["bond_ticker"] = record["bond_ticker"].upper()
             record["automated_equity_ticker"] = record["automated_equity_ticker"].upper()
             record["equity_ticker_override"] = override
             if override:

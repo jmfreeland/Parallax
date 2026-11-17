@@ -15,7 +15,7 @@ For successive valid observations, $r^P_{i,t_0,t_1}=\log(P_{i,t_1}/P_{i,t_0})$. 
 \section{Cross-sectional residual}
 Estimate $\Delta y_{i,t}=\alpha_t+\beta_t^\top x_{i,t^-}+u_{i,t}$ using only contemporaneously available sector, rating, maturity/duration, and liquidity inputs. A candidate dislocation is $z_{i,t}=u_{i,t}/(1.4826\,\mathrm{MAD}(u_{\cdot,t}))$. It becomes a forecast only after out-of-sample estimation of sign and horizon.
 \section{Nelson--Siegel ticker curve}
-The implemented first candidate groups bonds by the reviewed equity issuer ticker, since rating data are unavailable. For each ticker and as-of date, use each unmatured bond's latest policy-valid TRACE yield with trade date no later than the as-of date. Let $m$ be remaining maturity in years. Fit
+The implemented first candidate groups bonds by the manually mapped bond curve ticker, since rating data are unavailable. The equity ticker remains a separate mapping for joining issuer equity data. For each bond curve ticker and as-of date, use each unmatured bond's latest policy-valid TRACE yield with trade date no later than the as-of date. Let $m$ be remaining maturity in years. Fit
 \[
 y(m)=\beta_0+\beta_1\frac{1-e^{-m/\tau}}{m/\tau}+\beta_2\left(\frac{1-e^{-m/\tau}}{m/\tau}-e^{-m/\tau}\right)
 \]

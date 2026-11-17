@@ -18,7 +18,7 @@ from .bond_returns import (
     calculate_historical_bond_total_return,
     calculate_modified_duration_from_yield,
 )
-from .nelson_siegel import METHODOLOGY, _basis, _fit_curve
+from .nelson_siegel import METHODOLOGY, _basis, _fit_curve, _fit_curve_with_outlier_filter
 from .trace_cleaning import TRACE_POLICY_VERSION, TRACE_SERIES_CLEANING_VERSION, clean_trace_value
 
 
@@ -184,6 +184,7 @@ def evaluate_nelson_siegel_signal(
     partition_field: str = "sector",
     percentile_lookback_days: int = 1095,
     minimum_history_observations: int = 20,
+    curve_outlier_filter_mad: float | None = None,
     include_financing_cost: bool = False,
     maximum_financing_rate_age_days: int = 7,
     on_progress: ProgressCallback | None = None,
@@ -217,6 +218,8 @@ def evaluate_nelson_siegel_signal(
         raise ValueError("long_short_quantile must be between 0 and 0.5")
     if percentile_lookback_days < 1 or minimum_history_observations < 1:
         raise ValueError("percentile lookback and minimum history must be positive")
+    if curve_outlier_filter_mad is not None and curve_outlier_filter_mad < 1:
+        raise ValueError("curve_outlier_filter_mad must be at least 1")
     if maximum_financing_rate_age_days < 0:
         raise ValueError("maximum_financing_rate_age_days must be non-negative")
     if not bond_list_path.exists():
@@ -253,14 +256,14 @@ def evaluate_nelson_siegel_signal(
         reader = csv.DictReader(handle)
         required = {"isin", "maturity_date"}
         if predictor_id == PREDICTOR_NELSON_SIEGEL:
-            required.add("equity_ticker")
+            required.add("bond_ticker")
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             raise ValueError(f"Bond list must contain {', '.join(sorted(required))} columns")
         if predictor_id in PARTITION_PREDICTORS and partition_field not in reader.fieldnames:
             raise ValueError(f"Partition field {partition_field!r} is not in the bond list")
         for raw in reader:
             isin = (raw.get("isin") or "").strip().upper()
-            ticker = (raw.get("equity_ticker") or "").strip().upper()
+            ticker = (raw.get("bond_ticker") or "").strip().upper()
             try:
                 maturity = date.fromisoformat((raw.get("maturity_date") or "").strip())
             except ValueError:
@@ -479,11 +482,16 @@ def evaluate_nelson_siegel_signal(
                     continue
                 yields_pct = np.asarray([row["observed_yield_pct"] for row in rows], dtype=float)
                 try:
-                    tau, beta, curve_rmse, loo_rmse, _tau_min, _tau_max = _fit_curve(maturities, yields_pct)
+                    tau, beta, curve_rmse, loo_rmse, _tau_min, _tau_max, included = (
+                        _fit_curve_with_outlier_filter(
+                            maturities, yields_pct, curve_outlier_filter_mad
+                        )
+                    )
                 except ValueError:
                     continue
-                fitted = _basis(maturities, tau) @ beta
-                for row, fitted_yield in zip(rows, fitted):
+                fitted = _basis(maturities[included], tau) @ beta
+                filtered_rows = [row for row, keep in zip(rows, included) if keep]
+                for row, fitted_yield in zip(filtered_rows, fitted):
                     signals.append({
                         **row,
                         "as_of_date": as_of,
@@ -1040,12 +1048,13 @@ def evaluate_nelson_siegel_signal(
         ),
         "signal_space": signal_space,
         "spread_snapshot_id": spread_snapshot_id,
-        "model_version": "nelson_siegel_loo_tau_v2" if predictor_id == PREDICTOR_NELSON_SIEGEL
+        "model_version": "nelson_siegel_loo_tau_bond_ticker_v3" if predictor_id == PREDICTOR_NELSON_SIEGEL
         else "partition_yield_percentile_trailing_v1"
         if predictor_id == PREDICTOR_PARTITION_PERCENTILE else "partition_level_zscore_trailing_v1",
         "evaluation_version": "daily_demeaned_side_adjusted_v2"
         if predictor_id == PREDICTOR_NELSON_SIEGEL else "daily_raw_yield_change_side_adjusted_v1",
         "trace_cleaning_policy_version": TRACE_POLICY_VERSION,
+        "curve_outlier_filter_mad": curve_outlier_filter_mad,
         "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "test_start_date": start_date.isoformat(),
         "test_end_date": end_date.isoformat(),
