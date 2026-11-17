@@ -288,11 +288,11 @@ def transform_scores(
     return output
 
 
-def combine_signal_scores(
+def evaluate_strategy_nodes(
     strategy: Strategy,
     scores_by_signal: Mapping[str, Mapping[str, float | None]],
-) -> dict[str, float | None]:
-    """Combine component score maps keyed by signal_id, renormalizing available inputs."""
+) -> dict[str, dict[str, float | None]]:
+    """Return the score map for every signal, transformer, and combiner node."""
     strategy.validate()
     components = {f"signal:{item.signal_id}": item for item in strategy.signals}
     transformers = {item.node_id: item for item in strategy.transformer_nodes}
@@ -350,4 +350,15 @@ def combine_signal_scores(
         cache[node_id] = result
         return result
 
-    return calculate(strategy.output_node_id)
+    for node_id in [*components, *transformers, *combiners]:
+        calculate(node_id)
+    return cache
+
+
+def combine_signal_scores(
+    strategy: Strategy,
+    scores_by_signal: Mapping[str, Mapping[str, float | None]],
+) -> dict[str, float | None]:
+    """Combine component score maps keyed by signal_id."""
+    node_scores = evaluate_strategy_nodes(strategy, scores_by_signal)
+    return node_scores[strategy.output_node_id]

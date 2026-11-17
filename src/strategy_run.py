@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .signal_evaluation import evaluate_nelson_siegel_signal
-from .strategy import Strategy, combine_signal_scores
+from .strategy import Strategy, evaluate_strategy_nodes
+
+
+STRATEGY_INPUT_CACHE_VERSION = 2
 
 
 def _json_value(value: Any) -> Any:
@@ -28,6 +31,14 @@ def _json_value(value: Any) -> Any:
 def _digest(payload: Any) -> str:
     encoded = json.dumps(_json_value(payload), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _signal_calculation_signature(signal: Any) -> str:
+    definition = asdict(signal)
+    if signal.predictor_id in {"historical_partition_percentile", "historical_partition_zscore"}:
+        # The ISIN partition minimum-bond handling changed from five to one.
+        definition["calculation_version"] = 2
+    return _digest(definition)
 
 
 def run_strategy_signals(
@@ -55,14 +66,14 @@ def run_strategy_signals(
     if cache_path.is_file():
         try:
             candidate = json.loads(cache_path.read_text(encoding="utf-8"))
-            if (candidate.get("cache_schema_version") == 1
+            if (candidate.get("cache_schema_version") in {1, STRATEGY_INPUT_CACHE_VERSION}
                     and candidate.get("input_signature") == _digest(base_parameters)):
                 old_cache = candidate
         except (OSError, json.JSONDecodeError):
             old_cache = {}
     signal_signatures: dict[str, str] = {}
     for index, signal in enumerate(strategy.signals, start=1):
-        signal_signature = _digest(asdict(signal))
+        signal_signature = _signal_calculation_signature(signal)
         signal_signatures[signal.signal_id] = signal_signature
         cached_rows = old_cache.get("signals", {}).get(signal.signal_id)
         if (cached_rows is not None
@@ -83,6 +94,11 @@ def run_strategy_signals(
         })
         if signal.predictor_id == "nelson_siegel_residual":
             parameters["minimum_bonds"] = max(5, int(parameters.get("minimum_bonds", 5)))
+        else:
+            parameters["minimum_bonds"] = int(signal.parameters.get(
+                "minimum_bonds",
+                1 if signal.group_field == "isin" else int(parameters.get("minimum_bonds", 5)),
+            ))
         def report_signal_progress(current: int, total: int) -> None:
             if on_progress is not None:
                 progress = (index - 1) * 100 + int(100 * current / max(total, 1))
@@ -104,7 +120,7 @@ def run_strategy_signals(
 
     signal_definitions = [asdict(signal) for signal in strategy.signals]
     cache = {
-        "cache_schema_version": 1,
+        "cache_schema_version": STRATEGY_INPUT_CACHE_VERSION,
         "signal_signature": _digest(signal_definitions),
         "signal_signatures": signal_signatures,
         "input_signature": _digest(base_parameters),
@@ -123,9 +139,9 @@ def recombine_cached_signals(strategy: Strategy, cache_path: Path) -> list[dict[
     strategy.validate()
     cache = json.loads(Path(cache_path).read_text(encoding="utf-8"))
     expected_signatures = {
-        signal.signal_id: _digest(asdict(signal)) for signal in strategy.signals
+        signal.signal_id: _signal_calculation_signature(signal) for signal in strategy.signals
     }
-    if cache.get("cache_schema_version") != 1:
+    if cache.get("cache_schema_version") != STRATEGY_INPUT_CACHE_VERSION:
         raise ValueError("Unsupported strategy signal cache version")
     cached_signatures = cache.get("signal_signatures", {})
     cached_signal_ids = set(cache.get("signals", {}))
@@ -146,13 +162,18 @@ def recombine_cached_signals(strategy: Strategy, cache_path: Path) -> list[dict[
     output: list[dict[str, Any]] = []
     for as_of_date in sorted(by_date):
         date_scores = by_date[as_of_date]
-        combined = combine_signal_scores(strategy, date_scores)
-        isins = set().union(*(set(values) for values in date_scores.values()), set(combined))
+        node_scores = evaluate_strategy_nodes(strategy, date_scores)
+        combined = node_scores[strategy.output_node_id]
+        isins = set().union(*(set(values) for values in node_scores.values()), set(combined))
         for isin in sorted(isins):
             row: dict[str, Any] = {"as_of_date": as_of_date, "isin": isin}
             row.update({
                 f"signal:{signal_id}": scores.get(isin)
                 for signal_id, scores in date_scores.items()
+            })
+            row.update({
+                f"node:{node_id}": scores.get(isin)
+                for node_id, scores in node_scores.items()
             })
             row["strategy_score"] = combined.get(isin)
             output.append(row)

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QMessageBox, QPushButton, QSplitter, QStackedWidget,
     QSpinBox, QDoubleSpinBox, QListWidget, QListWidgetItem, QAbstractItemView,
     QVBoxLayout, QWidget, QDialog, QDateEdit, QDialogButtonBox, QProgressDialog,
+    QTableWidget, QTableWidgetItem,
 )
 
 from .strategy import (
@@ -174,6 +175,139 @@ def _transform_description(transform: dict[str, Any]) -> str:
         "percentile": "Maps ranks onto a 0–1 scale.",
         "minmax": "Rescales the cross-section to 0–1.",
     }.get(str(transform.get("type")), "Transforms the incoming score.")
+
+
+class HeatmapItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = self.data(Qt.ItemDataRole.UserRole)
+        right = other.data(Qt.ItemDataRole.UserRole)
+        if isinstance(left, (float, int)) and isinstance(right, (float, int)):
+            return left < right
+        return super().__lt__(other)
+
+
+class StrategyInspectorDialog(QDialog):
+    METADATA_ALIASES = {
+        "Ticker": ("equity_ticker", "ticker", "issuer_ticker", "bloomberg_ticker"),
+        "Coupon": ("coupon", "coupon_pct", "coupon_rate", "coupon_rate_pct", "coupon_percent"),
+        "Maturity": ("maturity_date", "maturity"),
+        "Sector": ("sector", "industry_sector", "gics_sector", "industry"),
+        "Issuer": ("issuer", "issuer_name", "company_name"),
+        "Rating": ("rating", "composite_rating", "credit_rating"),
+    }
+
+    def __init__(self, strategy: Strategy, rows: list[dict[str, Any]],
+                 bond_details: dict[str, dict[str, str]], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Strategy inspector · {strategy.name}")
+        self.resize(1450, 820)
+        self.strategy = strategy
+        self.rows_by_date: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            self.rows_by_date.setdefault(str(row["as_of_date"]), []).append(row)
+        layout = QVBoxLayout(self)
+        date_row = QHBoxLayout()
+        date_row.addWidget(QLabel("Signal date"))
+        self.date_choice = QComboBox()
+        self.date_choice.addItems(sorted(self.rows_by_date, reverse=True))
+        self.date_choice.currentTextChanged.connect(self._show_date)
+        date_row.addWidget(self.date_choice)
+        date_row.addStretch(1)
+        self.legend = QLabel("Heatmap by date: low values  ←  red · neutral · green  →  high values")
+        date_row.addWidget(self.legend)
+        layout.addLayout(date_row)
+        self.table = QTableWidget()
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(False)
+        self.table.setSortingEnabled(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        layout.addWidget(self.table, 1)
+        self.bond_details = bond_details
+
+        node_names = {f"signal:{signal.signal_id}": signal.signal_id for signal in strategy.signals}
+        node_names.update({node.node_id: node.name for node in strategy.transformer_nodes})
+        node_names.update({node.node_id: node.name for node in strategy.combiners})
+        metadata_columns: list[tuple[str, str]] = [("ISIN", "isin")]
+        for label, candidates in self.METADATA_ALIASES.items():
+            selected = next((field for field in candidates
+                             if any(field in bond for bond in bond_details.values())), None)
+            if selected:
+                metadata_columns.append((label, f"metadata:{selected}"))
+        score_columns: list[tuple[str, str]] = [
+            (f"Signal · {signal.signal_id}", f"signal:{signal.signal_id}")
+            for signal in strategy.signals
+        ]
+        direct_combiner_inputs = {
+            input_id for combiner in strategy.combiners for input_id in combiner.input_node_ids
+        }
+        for node in strategy.transformer_nodes:
+            if node.node_id not in direct_combiner_inputs:
+                score_columns.append((f"Node · {node.name}", f"node:{node.node_id}"))
+        for combiner in strategy.combiners:
+            for input_id in combiner.input_node_ids:
+                score_columns.append((
+                    f"Input · {combiner.name} ← {node_names.get(input_id, input_id)}",
+                    f"signal:{input_id.split(':', 1)[1]}" if input_id.startswith("signal:") else f"node:{input_id}",
+                ))
+        for combiner in strategy.combiners:
+            if combiner.node_id != strategy.output_node_id:
+                score_columns.append((f"Node · {combiner.name}", f"node:{combiner.node_id}"))
+        output_name = node_names.get(strategy.output_node_id, strategy.output_node_id)
+        score_columns.append((f"Strategy score · {output_name}", f"node:{strategy.output_node_id}"))
+        self.metadata_columns = metadata_columns
+        self.score_columns = score_columns
+        self._show_date(self.date_choice.currentText())
+
+    @staticmethod
+    def _heat_color(value: float, low: float, high: float) -> QColor:
+        if high <= low:
+            fraction = 0.5
+        else:
+            fraction = (value - low) / (high - low)
+        red = QColor("#ef6a68")
+        neutral = QColor("#f1f5f9")
+        green = QColor("#4ade80")
+        start, end, local = (red, neutral, fraction * 2) if fraction <= 0.5 else (neutral, green, (fraction - 0.5) * 2)
+        return QColor(*(round(start.getRgb()[index] * (1 - local) + end.getRgb()[index] * local)
+                        for index in range(3)))
+
+    def _show_date(self, as_of_date: str) -> None:
+        rows = self.rows_by_date.get(as_of_date, [])
+        columns = [*self.metadata_columns, *self.score_columns]
+        self.table.setSortingEnabled(False)
+        self.table.clear()
+        self.table.setColumnCount(len(columns))
+        self.table.setHorizontalHeaderLabels([label for label, _key in columns])
+        self.table.setRowCount(len(rows))
+        score_values: dict[str, list[float]] = {}
+        for _label, key in self.score_columns:
+            values = [float(row[key]) for row in rows
+                      if row.get(key) is not None and math.isfinite(float(row[key]))]
+            score_values[key] = values
+        bounds = {key: (min(values), max(values)) for key, values in score_values.items() if values}
+        for row_index, row in enumerate(rows):
+            details = self.bond_details.get(str(row.get("isin", "")), {})
+            for column_index, (_label, key) in enumerate(columns):
+                if key.startswith("metadata:"):
+                    value: Any = details.get(key.split(":", 1)[1], "")
+                elif key == "isin":
+                    value = row.get("isin", "")
+                else:
+                    value = row.get(key)
+                item = HeatmapItem("" if value is None else f"{value:.5f}" if isinstance(value, (int, float)) else str(value))
+                item.setData(Qt.ItemDataRole.UserRole, value)
+                if key in bounds and value is not None and math.isfinite(float(value)):
+                    low, high = bounds[key]
+                    item.setBackground(QBrush(self._heat_color(float(value), low, high)))
+                    item.setForeground(QBrush(QColor("#111827")))
+                    item.setToolTip(f"{float(value):.6f} · date range column min {low:.6f}, max {high:.6f}")
+                self.table.setItem(row_index, column_index, item)
+        self.table.resizeColumnsToContents()
+        self.table.setSortingEnabled(True)
+        combined_column = len(columns) - 1
+        self.table.sortItems(combined_column, Qt.SortOrder.DescendingOrder)
 
 
 class NodeItem(QGraphicsRectItem):
@@ -339,6 +473,7 @@ class StrategyEditorWindow(QMainWindow):
         run_toolbar = QHBoxLayout()
         for label, handler in (("Calculate inputs…", self._calculate_inputs),
                                ("Run strategy", self._run_strategy),
+                               ("Inspect strategy", self._inspect_strategy),
                                ("Export latest scores…", self._export_latest_scores)):
             button = QPushButton(label)
             button.clicked.connect(handler)
@@ -1147,6 +1282,30 @@ class StrategyEditorWindow(QMainWindow):
             f"Combined {len(rows):,} dated bond scores.\nSaved results to {result_path}",
         )
 
+    def _inspect_strategy(self) -> None:
+        if self.apply_button.isEnabled() and not self._apply_node_settings():
+            return
+        self.strategy.name = self.strategy_name.text().strip()
+        try:
+            self.strategy.validate()
+            rows = recombine_cached_signals(self.strategy, self._strategy_cache_path())
+            cache = json.loads(self._strategy_cache_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+            QMessageBox.warning(
+                self, "Strategy inputs unavailable",
+                f"{error}\n\nUse Calculate inputs to create or refresh the signal cache.",
+            )
+            return
+        bond_list_path = cache.get("evaluation_parameters", {}).get("bond_list_path")
+        details: dict[str, dict[str, str]] = {}
+        if bond_list_path and Path(bond_list_path).is_file():
+            with Path(bond_list_path).open("r", encoding="utf-8-sig", newline="") as handle:
+                for bond in csv.DictReader(handle):
+                    if bond.get("isin"):
+                        details[str(bond["isin"])] = bond
+        inspector = StrategyInspectorDialog(self.strategy, rows, details, self)
+        inspector.exec()
+
     def _export_latest_scores(self) -> None:
         if self.apply_button.isEnabled() and not self._apply_node_settings():
             return
@@ -1182,12 +1341,29 @@ class StrategyEditorWindow(QMainWindow):
                     isin = bond.get("isin")
                     if isin:
                         bond_details[str(isin)] = bond
-        details = [
-            field for field in ("equity_ticker", "issuer", "coupon", "coupon_pct", "maturity_date",
-                                "sector", "industry", "rating")
-            if any(field in bond for bond in bond_details.values())
-        ]
+        metadata_aliases = {
+            "ticker": ("equity_ticker", "ticker", "issuer_ticker", "bloomberg_ticker"),
+            "coupon": ("coupon", "coupon_pct", "coupon_rate", "coupon_rate_pct", "coupon_percent"),
+            "maturity_date": ("maturity_date", "maturity"),
+            "sector": ("sector", "industry_sector", "gics_sector", "industry"),
+            "issuer": ("issuer", "issuer_name", "company_name"),
+            "rating": ("rating", "composite_rating", "credit_rating"),
+        }
+        metadata_sources = {
+            output_field: next((candidate for candidate in candidates
+                                if any(candidate in bond for bond in bond_details.values())), None)
+            for output_field, candidates in metadata_aliases.items()
+        }
+        details = [field for field, source in metadata_sources.items() if source is not None]
         signal_fields = [f"signal:{signal.signal_id}" for signal in self.strategy.signals]
+        node_names = {f"signal:{signal.signal_id}": signal.signal_id for signal in self.strategy.signals}
+        node_names.update({node.node_id: node.name for node in self.strategy.transformer_nodes})
+        node_names.update({node.node_id: node.name for node in self.strategy.combiners})
+        pre_combiner_fields = {
+            f"pre_combiner:{combiner.name}:{node_names.get(input_id, input_id)}": f"node:{input_id}"
+            for combiner in self.strategy.combiners
+            for input_id in combiner.input_node_ids
+        }
         output_path, _ = QFileDialog.getSaveFileName(
             self, "Export latest strategy scores",
             str(STRATEGY_RUNS_DIR / f"{self.strategy.strategy_id}_latest_scores_{latest_date}.csv"),
@@ -1195,7 +1371,10 @@ class StrategyEditorWindow(QMainWindow):
         )
         if not output_path:
             return
-        fieldnames = ["as_of_date", "rank", "isin", *details, "strategy_score", *signal_fields]
+        fieldnames = [
+            "as_of_date", "rank", "isin", *details, "strategy_score",
+            *signal_fields, *pre_combiner_fields,
+        ]
         with Path(output_path).open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
@@ -1205,11 +1384,16 @@ class StrategyEditorWindow(QMainWindow):
                 if score is not None and math.isfinite(float(score)):
                     rank += 1
                 detail = bond_details.get(str(row["isin"]), {})
+                normalized_details = {
+                    field: detail.get(source, "")
+                    for field, source in metadata_sources.items() if source is not None
+                }
                 writer.writerow({
                     **row,
                     "rank": rank if score is not None else "",
                     "strategy_score": score,
-                    **{field: detail.get(field, "") for field in details},
+                    **normalized_details,
+                    **{field: row.get(node_field) for field, node_field in pre_combiner_fields.items()},
                 })
         QMessageBox.information(
             self, "Latest scores exported",

@@ -220,8 +220,17 @@ cached inputs and saves the combined dated bond scores alongside the cache.
 Changing only a combiner or transformer does not require recalculating signal
 inputs. **Export latest scores** writes a CSV for the latest date present in
 the cache, including component scores, the combined score, bond details from
-the reference list, and a descending score rank. This is a ranked signal
+the reference list (ticker, coupon, maturity, sector, issuer, and rating where
+available), the values entering each combiner, and a descending score rank.
+The CSV includes both raw component scores and transformed graph-node inputs
+so the path into the final score can be inspected. This is a ranked signal
 output; it does not assign position sizes.
+
+**Inspect strategy** opens a date-selectable heatmap table. It shows bond
+metadata, each raw signal, each non-signal value entering a combiner, and the
+final strategy score. Cells are colored from low (red) to high (green) within
+each date and column; columns can be sorted to find the largest and smallest
+scores.
 
 Use **Signal vs. outcome** to inspect a bond-level cross-section. After an
 evaluation completes, change the signal date or forward horizon directly in
