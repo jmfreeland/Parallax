@@ -25,6 +25,8 @@ dist/
 data/reference/
 data/trace/
 data/task_history/
+data/strategies/runs/*.json
+data/portfolio_archive/*.json
 
 
 # Local editor and operating system files
