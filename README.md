@@ -8,6 +8,7 @@ Parallax is an internal Python platform for systematic research, risk, alpha, an
 - [Architecture](docs/architecture.md) — current data flow and target structure.
 - [Signal methodology (PDF)](docs/signal_methodology.pdf) — research note; [LaTeX source](docs/signal_methodology.tex).
 - [Signal evaluation guide](docs/signal_evaluation.md) — research inputs, outcome definitions, and limitations.
+- [Strategy research guide](docs/strategy_research.md) — graph semantics, combination constraints, and research safeguards.
 - [Development review](docs/development_review.md) — prioritized findings.
 
 ## Research frame
