@@ -16,6 +16,10 @@ from urllib.request import Request, urlopen
 
 from .portfolio_archive import ARCHIVE_DIR, load_archive
 from .signal_registry import SIGNALS
+from .strategy_run import (
+    run_saved_strategy, saved_strategy_info, strategy_cache_path,
+    strategy_results_path, stable_strategy_id,
+)
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QThread, Qt, Signal
 from PySide6.QtGui import QTextCursor
@@ -27,9 +31,12 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -47,6 +54,7 @@ MAPPINGS_PATH = DATA_DIR / "issuer_ticker_map.csv"
 DOWNLOAD_STATUS_PATH = DATA_DIR / "reference" / "last_lqd_download.json"
 REQUIREMENTS_PATH = ROOT / "requirements.txt"
 TASK_HISTORY_DIR = DATA_DIR / "task_history"
+STRATEGIES_DIR = DATA_DIR / "strategies"
 
 
 def _requirement_names() -> list[str]:
@@ -93,6 +101,24 @@ class DependencyChecker(QThread):
         self.checked.emit(results)
 
 
+class SavedStrategyRunner(QThread):
+    progress = Signal(int, int)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, strategy_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.strategy_path = strategy_path
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(
+                run_saved_strategy(self.strategy_path, on_progress=self.progress.emit)
+            )
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
 class LauncherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -112,6 +138,7 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self.status)
 
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._tab_changed)
         security_page = QWidget()
         security_layout = QVBoxLayout(security_page)
         security_actions = QGridLayout()
@@ -227,20 +254,43 @@ class LauncherWindow(QMainWindow):
         self.tabs.addTab(signal_page, "Signals")
 
         strategy_page = QWidget()
+        self.strategy_page = strategy_page
         strategy_layout = QVBoxLayout(strategy_page)
         strategy_layout.addWidget(QLabel(
-            "Build reusable strategies, calculate and cache their signal inputs, combine the current graph, and export the latest ranked scores. "
-            "Open the editor to find these actions on its second toolbar row."
+            "Select a saved strategy to edit its graph, calculate cached signal inputs, or run the current combination."
         ))
-        strategy_actions = QGridLayout()
-        edit_strategy = QPushButton("Open strategy builder")
-        edit_strategy.setToolTip("Build, calculate inputs, run, and inspect a multi-signal strategy.")
-        edit_strategy.clicked.connect(lambda: self._launch("src.strategy_editor_app"))
-        self.buttons.append(edit_strategy)
-        strategy_actions.addWidget(edit_strategy, 0, 0)
+        strategy_list_tools = QHBoxLayout()
+        strategy_list_tools.addWidget(QLabel("Saved strategies"))
+        strategy_list_tools.addStretch(1)
+        refresh_strategies = QPushButton("Refresh list")
+        refresh_strategies.clicked.connect(self._refresh_strategies)
+        strategy_list_tools.addWidget(refresh_strategies)
+        strategy_layout.addLayout(strategy_list_tools)
+        self.strategy_list = QListWidget()
+        self.strategy_list.currentItemChanged.connect(self._strategy_selection_changed)
+        self.strategy_list.itemDoubleClicked.connect(lambda _item: self._launch_selected_strategy("edit"))
+        strategy_layout.addWidget(self.strategy_list, 1)
+        self.strategy_run_progress = QProgressBar()
+        self.strategy_run_progress.setVisible(False)
+        strategy_layout.addWidget(self.strategy_run_progress)
+        strategy_actions = QHBoxLayout()
+        self.edit_selected_strategy = QPushButton("Edit")
+        self.calculate_selected_strategy = QPushButton("Calculate inputs")
+        self.run_selected_strategy = QPushButton("Run")
+        self.clear_strategy_cache = QPushButton("Clear cache")
+        self.create_strategy = QPushButton("New strategy")
+        self.edit_selected_strategy.clicked.connect(lambda: self._launch_selected_strategy("edit"))
+        self.calculate_selected_strategy.clicked.connect(lambda: self._launch_selected_strategy("calculate"))
+        self.run_selected_strategy.clicked.connect(self._run_selected_strategy)
+        self.clear_strategy_cache.clicked.connect(self._clear_selected_strategy_cache)
+        self.create_strategy.clicked.connect(lambda: self._launch("src.strategy_editor_app"))
+        for button in (self.edit_selected_strategy, self.calculate_selected_strategy,
+                       self.run_selected_strategy, self.clear_strategy_cache, self.create_strategy):
+            self.buttons.append(button)
+            strategy_actions.addWidget(button)
         strategy_layout.addLayout(strategy_actions)
-        strategy_layout.addStretch(1)
         self.tabs.addTab(strategy_page, "Strategies")
+        self._refresh_strategies()
 
         self.diagnostics = QTextEdit()
         self.diagnostics.setReadOnly(True)
@@ -482,7 +532,136 @@ class LauncherWindow(QMainWindow):
             self._set_dependency_row(row, package, installed, latest, status)
         self.dependencies_status.setText("Version check complete. Latest versions are read from PyPI.")
 
-    def _launch(self, module: str) -> None:
+    def _refresh_strategies(self) -> None:
+        if not hasattr(self, "strategy_list"):
+            return
+        current_path = self._selected_strategy_path()
+        self.strategy_list.clear()
+        STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
+        files = sorted(STRATEGIES_DIR.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+        for path in files:
+            try:
+                info = saved_strategy_info(path)
+                name = str(info["name"] or path.stem)
+                item = QListWidgetItem(f"{name}  ·  Inputs: {info['cache_status']}  ·  {path.name}")
+                item.setData(Qt.ItemDataRole.UserRole, str(path.resolve()))
+                item.setToolTip(
+                    f"{path.resolve()}\nSignals: {info['signal_count']}\n"
+                    f"Cached score rows: {info['cached_rows']:,}\nCache: {info['cache_path']}"
+                )
+                self.strategy_list.addItem(item)
+                if current_path and Path(current_path).resolve() == path.resolve():
+                    self.strategy_list.setCurrentItem(item)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+                continue
+        if self.strategy_list.count() and self.strategy_list.currentRow() < 0:
+            self.strategy_list.setCurrentRow(0)
+        self._strategy_selection_changed()
+
+    def _selected_strategy_path(self) -> str | None:
+        if not hasattr(self, "strategy_list") or self.strategy_list.currentItem() is None:
+            return None
+        value = self.strategy_list.currentItem().data(Qt.ItemDataRole.UserRole)
+        return str(value) if value else None
+
+    def _strategy_selection_changed(self, *_args: object) -> None:
+        selected = self._selected_strategy_path() is not None
+        for button in (getattr(self, "edit_selected_strategy", None),
+                       getattr(self, "calculate_selected_strategy", None),
+                       getattr(self, "run_selected_strategy", None),
+                       getattr(self, "clear_strategy_cache", None)):
+            if button is not None:
+                button.setEnabled(selected)
+
+    def _tab_changed(self, _index: int) -> None:
+        if hasattr(self, "strategy_page") and self.tabs.currentWidget() is self.strategy_page:
+            self._refresh_strategies()
+
+    def _launch_selected_strategy(self, action: str) -> None:
+        path = self._selected_strategy_path()
+        if not path:
+            return
+        self._launch(
+            "src.strategy_editor_app",
+            ["--strategy", path, "--action", action],
+        )
+
+    def _run_selected_strategy(self) -> None:
+        path = self._selected_strategy_path()
+        if not path:
+            return
+        if hasattr(self, "strategy_runner") and self.strategy_runner.isRunning():
+            return
+        self.strategy_run_progress.setRange(0, 0)
+        self.strategy_run_progress.setFormat("Running strategy…")
+        self.strategy_run_progress.setVisible(True)
+        self.status.setText(f"Calculating strategy: {Path(path).name}")
+        self.strategy_runner = SavedStrategyRunner(Path(path), self)
+        self.strategy_runner.progress.connect(self._strategy_run_progress)
+        self.strategy_runner.completed.connect(self._strategy_run_complete)
+        self.strategy_runner.failed.connect(self._strategy_run_failed)
+        for button in self.buttons:
+            button.setEnabled(False)
+        self.strategy_runner.start()
+
+    def _strategy_run_progress(self, current: int, total: int) -> None:
+        self.strategy_run_progress.setRange(0, max(total, 1))
+        self.strategy_run_progress.setFormat("Calculating signal date %v of %m")
+        self.strategy_run_progress.setValue(current)
+
+    def _strategy_run_complete(self, result: dict[str, object]) -> None:
+        self.strategy_run_progress.setVisible(False)
+        for button in self.buttons:
+            button.setEnabled(True)
+        self._refresh_strategies()
+        self._strategy_selection_changed()
+        self.status.setText(f"Strategy run complete: {result['strategy_name']} ({result['row_count']:,} bond-date rows)")
+        QMessageBox.information(
+            self, "Strategy run complete",
+            f"Combined {result['row_count']:,} dated bond scores.\nSaved to {result['result_path']}",
+        )
+
+    def _strategy_run_failed(self, message: str) -> None:
+        self.strategy_run_progress.setVisible(False)
+        for button in self.buttons:
+            button.setEnabled(True)
+        self._strategy_selection_changed()
+        self.status.setText("Strategy run failed")
+        QMessageBox.warning(
+            self, "Could not run strategy",
+            f"{message}\n\nIf inputs are missing or stale, choose Calculate inputs first.",
+        )
+
+    def _clear_selected_strategy_cache(self) -> None:
+        path = self._selected_strategy_path()
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            strategy_id = stable_strategy_id(Path(path), str(payload.get("strategy_id", "")))
+        except (OSError, json.JSONDecodeError, TypeError) as error:
+            QMessageBox.warning(self, "Could not read strategy", str(error))
+            return
+        cache_path = strategy_cache_path(strategy_id)
+        result_path = strategy_results_path(strategy_id)
+        existing = [item for item in (cache_path, result_path) if item.is_file()]
+        if not existing:
+            QMessageBox.information(self, "No cache", "This strategy has no cached inputs or saved run result.")
+            return
+        answer = QMessageBox.question(
+            self, "Clear strategy cache?",
+            f"Delete cached signal inputs and the last combined result for {payload.get('name', Path(path).stem)}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for item in existing:
+            item.unlink()
+        self._refresh_strategies()
+        self.status.setText("Strategy cache cleared")
+
+    def _launch(self, module: str, arguments: list[str] | None = None) -> None:
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             return
 
@@ -526,7 +705,7 @@ class LauncherWindow(QMainWindow):
         process.setWorkingDirectory(str(ROOT))
         process.setProcessEnvironment(environment)
         process.setProgram(sys.executable)
-        process.setArguments(["-m", module])
+        process.setArguments(["-m", module, *(arguments or [])])
         process.readyReadStandardOutput.connect(self._read_output)
         process.readyReadStandardError.connect(self._read_output)
         process.finished.connect(self._finished)
@@ -560,6 +739,8 @@ class LauncherWindow(QMainWindow):
         self.status.setText("Finished" if exit_code == 0 else f"Finished with errors (exit code {exit_code})")
         for button in self.buttons:
             button.setEnabled(True)
+        self._refresh_strategies()
+        self._strategy_selection_changed()
         self._refresh_diagnostics()
 
     def _process_error(self, _error: QProcess.ProcessError) -> None:
@@ -571,6 +752,7 @@ class LauncherWindow(QMainWindow):
             self.status.setText("Could not start Python. Check the active uv environment.")
             for button in self.buttons:
                 button.setEnabled(True)
+            self._strategy_selection_changed()
 
 
 def main() -> None:

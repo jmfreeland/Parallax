@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
@@ -14,6 +15,20 @@ from .strategy import Strategy, evaluate_strategy_nodes
 
 
 STRATEGY_INPUT_CACHE_VERSION = 2
+STRATEGY_RUNS_DIR = Path(__file__).resolve().parents[1] / "data" / "strategies" / "runs"
+
+
+def stable_strategy_id(strategy_path: Path, declared_id: str = "") -> str:
+    """Return the saved ID, or a stable path-based ID for older JSON files."""
+    return declared_id or uuid.uuid5(uuid.NAMESPACE_URL, str(Path(strategy_path).resolve())).hex
+
+
+def strategy_cache_path(strategy_id: str) -> Path:
+    return STRATEGY_RUNS_DIR / f"{strategy_id}.inputs.json"
+
+
+def strategy_results_path(strategy_id: str) -> Path:
+    return STRATEGY_RUNS_DIR / f"{strategy_id}.results.json"
 
 
 def _json_value(value: Any) -> Any:
@@ -134,7 +149,12 @@ def run_strategy_signals(
     return cache
 
 
-def recombine_cached_signals(strategy: Strategy, cache_path: Path) -> list[dict[str, Any]]:
+def recombine_cached_signals(
+    strategy: Strategy,
+    cache_path: Path,
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[dict[str, Any]]:
     """Apply the current strategy graph to cached component scores by date."""
     strategy.validate()
     cache = json.loads(Path(cache_path).read_text(encoding="utf-8"))
@@ -160,7 +180,8 @@ def recombine_cached_signals(strategy: Strategy, cache_path: Path) -> list[dict[
                 row["isin"]
             ] = row["score"]
     output: list[dict[str, Any]] = []
-    for as_of_date in sorted(by_date):
+    ordered_dates = sorted(by_date)
+    for index, as_of_date in enumerate(ordered_dates, start=1):
         date_scores = by_date[as_of_date]
         node_scores = evaluate_strategy_nodes(strategy, date_scores)
         combined = node_scores[strategy.output_node_id]
@@ -177,4 +198,63 @@ def recombine_cached_signals(strategy: Strategy, cache_path: Path) -> list[dict[
             })
             row["strategy_score"] = combined.get(isin)
             output.append(row)
+        if on_progress is not None:
+            on_progress(index, len(ordered_dates))
     return output
+
+
+def cached_input_status(strategy: Strategy, cache_path: Path) -> tuple[str, int]:
+    """Describe whether a strategy has reusable, current signal inputs."""
+    cache_path = Path(cache_path)
+    if not cache_path.is_file():
+        return "No cached inputs", 0
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "Cache unreadable", 0
+    signal_ids = {signal.signal_id for signal in strategy.signals}
+    if cache.get("cache_schema_version") != STRATEGY_INPUT_CACHE_VERSION:
+        return "Needs recalculation", 0
+    if set(cache.get("signals", {})) != signal_ids:
+        return "Needs recalculation", 0
+    signatures = cache.get("signal_signatures", {})
+    if any(signatures.get(signal.signal_id) != _signal_calculation_signature(signal)
+           for signal in strategy.signals):
+        return "Needs recalculation", 0
+    rows = sum(len(values) for values in cache.get("signals", {}).values())
+    return ("Ready" if rows else "No signal rows"), rows
+
+
+def saved_strategy_info(strategy_path: Path) -> dict[str, Any]:
+    strategy_path = Path(strategy_path)
+    strategy = Strategy.load(strategy_path)
+    strategy.strategy_id = stable_strategy_id(strategy_path, strategy.strategy_id)
+    cache_path = strategy_cache_path(strategy.strategy_id)
+    status, row_count = cached_input_status(strategy, cache_path)
+    return {
+        "name": strategy.name,
+        "strategy_id": strategy.strategy_id,
+        "cache_status": status,
+        "cached_rows": row_count,
+        "signal_count": len(strategy.signals),
+        "cache_path": str(cache_path),
+        "result_path": str(strategy_results_path(strategy.strategy_id)),
+    }
+
+
+def run_saved_strategy(strategy_path: Path, *, on_progress: Callable[[int, int], None] | None = None) -> dict[str, Any]:
+    """Recombine the selected saved strategy's cache and persist the run result."""
+    strategy_path = Path(strategy_path)
+    strategy = Strategy.load(strategy_path)
+    strategy.strategy_id = stable_strategy_id(strategy_path, strategy.strategy_id)
+    cache_path = strategy_cache_path(strategy.strategy_id)
+    rows = recombine_cached_signals(strategy, cache_path, on_progress=on_progress)
+    result_path = strategy_results_path(strategy.strategy_id)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps({
+        "strategy_id": strategy.strategy_id,
+        "strategy_name": strategy.name,
+        "strategy": strategy.to_dict(),
+        "rows": rows,
+    }, indent=2) + "\n", encoding="utf-8")
+    return {"strategy_name": strategy.name, "result_path": str(result_path), "row_count": len(rows)}

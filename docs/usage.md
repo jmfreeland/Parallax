@@ -210,9 +210,15 @@ and combiner. Add signal blocks, insert transformer blocks on a branch, and
 select the combiner node to set how branches are aggregated. Definitions can
 be saved independently of a test run.
 
-Use **Calculate inputs** in the strategy editor to evaluate and cache the
-individual bond/date scores for the selected date range and TRACE source. The
-cache is stored under `data/strategies/runs/`. Recalculating with the same
+The launcher's **Strategies** tab lists saved strategy files and shows whether
+their component inputs are ready, absent, or stale. **Edit** opens the selected
+strategy in the graph editor, **Calculate inputs** opens its date/source setup,
+**Run** recombines cached inputs directly from the launcher and shows progress,
+and **Clear cache** removes its signal-input cache and latest combined result.
+
+Use **Calculate inputs** to evaluate and cache the individual bond/date scores
+for the selected date range and TRACE source. The cache is stored under
+`data/strategies/runs/`. Recalculating with the same
 date range and data source reuses unchanged signal components; newly added or
 edited signal components are calculated, while a changed date range or source
 refreshes all inputs. **Run strategy** applies the current graph to those
@@ -228,9 +234,10 @@ output; it does not assign position sizes.
 
 **Inspect strategy** opens a date-selectable heatmap table. It shows bond
 metadata, each raw signal, each non-signal value entering a combiner, and the
-final strategy score. Cells are colored from low (red) to high (green) within
-each date and column; columns can be sorted to find the largest and smallest
-scores.
+final strategy score. The final score is the leftmost column, followed by its
+inputs and upstream values. Cells are colored from low (red) to high (green)
+within each date and column. Click any header or use the **Sort by** and
+**Order** controls to find the largest and smallest scores.
 
 Use **Signal vs. outcome** to inspect a bond-level cross-section. After an
 evaluation completes, change the signal date or forward horizon directly in

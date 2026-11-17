@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QThread, Signal, QDate
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, QThread, Signal, QDate
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -212,10 +212,22 @@ class StrategyInspectorDialog(QDialog):
         self.date_choice.addItems(sorted(self.rows_by_date, reverse=True))
         self.date_choice.currentTextChanged.connect(self._show_date)
         date_row.addWidget(self.date_choice)
-        date_row.addStretch(1)
         self.legend = QLabel("Heatmap by date: low values  ←  red · neutral · green  →  high values")
         date_row.addWidget(self.legend)
         layout.addLayout(date_row)
+        sort_row = QHBoxLayout()
+        sort_row.addWidget(QLabel("Sort by"))
+        self.sort_by = QComboBox()
+        self.sort_by.currentIndexChanged.connect(self._apply_sort)
+        sort_row.addWidget(self.sort_by)
+        sort_row.addWidget(QLabel("Order"))
+        self.sort_order = QComboBox()
+        self.sort_order.addItem("Descending", Qt.SortOrder.DescendingOrder.value)
+        self.sort_order.addItem("Ascending", Qt.SortOrder.AscendingOrder.value)
+        self.sort_order.currentIndexChanged.connect(self._apply_sort)
+        sort_row.addWidget(self.sort_order)
+        sort_row.addStretch(1)
+        layout.addLayout(sort_row)
         self.table = QTableWidget()
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -223,6 +235,9 @@ class StrategyInspectorDialog(QDialog):
         self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionsClickable(True)
+        self.table.horizontalHeader().setSortIndicatorShown(True)
+        self.table.horizontalHeader().sortIndicatorChanged.connect(self._sync_sort_controls)
         layout.addWidget(self.table, 1)
         self.bond_details = bond_details
 
@@ -235,27 +250,37 @@ class StrategyInspectorDialog(QDialog):
                              if any(field in bond for bond in bond_details.values())), None)
             if selected:
                 metadata_columns.append((label, f"metadata:{selected}"))
-        score_columns: list[tuple[str, str]] = [
-            (f"Signal · {signal.signal_id}", f"signal:{signal.signal_id}")
-            for signal in strategy.signals
-        ]
-        direct_combiner_inputs = {
-            input_id for combiner in strategy.combiners for input_id in combiner.input_node_ids
-        }
-        for node in strategy.transformer_nodes:
-            if node.node_id not in direct_combiner_inputs:
-                score_columns.append((f"Node · {node.name}", f"node:{node.node_id}"))
-        for combiner in strategy.combiners:
-            for input_id in combiner.input_node_ids:
-                score_columns.append((
-                    f"Input · {combiner.name} ← {node_names.get(input_id, input_id)}",
-                    f"signal:{input_id.split(':', 1)[1]}" if input_id.startswith("signal:") else f"node:{input_id}",
-                ))
-        for combiner in strategy.combiners:
-            if combiner.node_id != strategy.output_node_id:
-                score_columns.append((f"Node · {combiner.name}", f"node:{combiner.node_id}"))
+        node_parents = {node.node_id: [node.input_node_id] for node in strategy.transformer_nodes}
+        node_parents.update({node.node_id: list(node.input_node_ids) for node in strategy.combiners})
+
+        def score_key(node_id: str) -> str:
+            return f"signal:{node_id.split(':', 1)[1]}" if node_id.startswith("signal:") else f"node:{node_id}"
+
         output_name = node_names.get(strategy.output_node_id, strategy.output_node_id)
-        score_columns.append((f"Strategy score · {output_name}", f"node:{strategy.output_node_id}"))
+        score_columns: list[tuple[str, str]] = [
+            (f"Strategy score · {output_name}", score_key(strategy.output_node_id))
+        ]
+        seen_score_keys = {score_columns[0][1]}
+        pending = [(parent_id, output_name) for parent_id in node_parents.get(strategy.output_node_id, [])]
+        while pending:
+            node_id, child_name = pending.pop(0)
+            key = score_key(node_id)
+            if key in seen_score_keys:
+                continue
+            seen_score_keys.add(key)
+            score_columns.append((
+                f"Input · {child_name} ← {node_names.get(node_id, node_id)}", key
+            ))
+            pending.extend((parent_id, node_names.get(node_id, node_id))
+                           for parent_id in node_parents.get(node_id, []))
+        all_node_ids = [*(f"signal:{signal.signal_id}" for signal in strategy.signals),
+                        *(node.node_id for node in strategy.transformer_nodes),
+                        *(node.node_id for node in strategy.combiners)]
+        for node_id in all_node_ids:
+            key = score_key(node_id)
+            if key not in seen_score_keys:
+                score_columns.append((f"Unconnected · {node_names.get(node_id, node_id)}", key))
+                seen_score_keys.add(key)
         self.metadata_columns = metadata_columns
         self.score_columns = score_columns
         self._show_date(self.date_choice.currentText())
@@ -275,11 +300,17 @@ class StrategyInspectorDialog(QDialog):
 
     def _show_date(self, as_of_date: str) -> None:
         rows = self.rows_by_date.get(as_of_date, [])
-        columns = [*self.metadata_columns, *self.score_columns]
+        columns = [*self.score_columns, *self.metadata_columns]
         self.table.setSortingEnabled(False)
         self.table.clear()
         self.table.setColumnCount(len(columns))
         self.table.setHorizontalHeaderLabels([label for label, _key in columns])
+        self.sort_by.blockSignals(True)
+        self.sort_by.clear()
+        for column, (label, _key) in enumerate(columns):
+            self.sort_by.addItem(label, column)
+        self.sort_by.setCurrentIndex(0)
+        self.sort_by.blockSignals(False)
         self.table.setRowCount(len(rows))
         score_values: dict[str, list[float]] = {}
         for _label, key in self.score_columns:
@@ -306,8 +337,25 @@ class StrategyInspectorDialog(QDialog):
                 self.table.setItem(row_index, column_index, item)
         self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)
-        combined_column = len(columns) - 1
-        self.table.sortItems(combined_column, Qt.SortOrder.DescendingOrder)
+        self._apply_sort()
+
+    def _apply_sort(self, *_args: Any) -> None:
+        if not self.table.isSortingEnabled() or self.sort_by.currentData() is None:
+            return
+        direction = Qt.SortOrder(int(self.sort_order.currentData()))
+        self.table.sortItems(int(self.sort_by.currentData()), direction)
+
+    def _sync_sort_controls(self, section: int, order: Qt.SortOrder) -> None:
+        self.sort_by.blockSignals(True)
+        index = self.sort_by.findData(section)
+        if index >= 0:
+            self.sort_by.setCurrentIndex(index)
+        self.sort_by.blockSignals(False)
+        self.sort_order.blockSignals(True)
+        self.sort_order.setCurrentIndex(
+            self.sort_order.findData(order.value)
+        )
+        self.sort_order.blockSignals(False)
 
 
 class NodeItem(QGraphicsRectItem):
@@ -376,6 +424,7 @@ class EdgeItem(QGraphicsPathItem):
         self.setPen(QPen(QColor("#64748b"), 2.0))
         self.setBrush(QBrush(QColor("#94a3b8")))
         self.setZValue(-1)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         source.edges.append(self)
         target.edges.append(self)
         self.update_path()
@@ -412,15 +461,44 @@ class NodeGraphView(QGraphicsView):
     def __init__(self, scene: QGraphicsScene) -> None:
         super().__init__(scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setMinimumWidth(700)
-        # Blank-space drags pan the canvas; movable nodes still handle drags
-        # that start on a node unless the explicit pan mode is enabled.
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self._pan_anchor: QPoint | None = None
+        self.pan_all = False
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if self.pan_all or item is None or isinstance(item, EdgeItem):
+                self._pan_anchor = event.position().toPoint()
+                self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if self._pan_anchor is not None:
+            current = event.position().toPoint()
+            anchor_scene = self.mapToScene(self._pan_anchor)
+            current_scene = self.mapToScene(current)
+            center_scene = self.mapToScene(self.viewport().rect().center())
+            self.centerOn(center_scene + anchor_scene - current_scene)
+            self._pan_anchor = current
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._pan_anchor is not None:
+            self._pan_anchor = None
+            self.viewport().unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: Any) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -439,7 +517,7 @@ class NodeGraphView(QGraphicsView):
 
 
 class StrategyEditorWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, startup_strategy: Path | None = None, startup_action: str = "edit") -> None:
         super().__init__()
         self.setWindowTitle("Credit Strategy Node Editor")
         self.resize(1360, 850)
@@ -645,6 +723,10 @@ class StrategyEditorWindow(QMainWindow):
         self.setCentralWidget(central)
         self._draw_graph()
         QTimer.singleShot(0, self.view.fit_graph)
+        if startup_strategy is not None:
+            QTimer.singleShot(
+                0, lambda: self._load_strategy_file(startup_strategy, startup_action)
+            )
 
     def _refresh_bond_list_fields(self, *_args: Any, selected_value: str | None = None) -> None:
         if not hasattr(self, "group_field"):
@@ -802,7 +884,7 @@ class StrategyEditorWindow(QMainWindow):
 
     def _set_pan_mode(self, enabled: bool) -> None:
         self.pan_mode = enabled
-        self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.view.pan_all = enabled
         for item in self.scene.items():
             if isinstance(item, NodeItem):
                 item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not enabled)
@@ -1151,14 +1233,17 @@ class StrategyEditorWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open strategy", str(STRATEGIES_DIR), "Strategy JSON (*.json)")
         if not path:
             return
+        self._load_strategy_file(Path(path))
+
+    def _load_strategy_file(self, path: Path, action: str = "edit") -> None:
         try:
-            strategy = Strategy.load(Path(path))
+            strategy = Strategy.load(path)
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
             QMessageBox.warning(self, "Could not open strategy", str(error))
             return
         self.strategy = strategy
         if not self.strategy.strategy_id:
-            self.strategy.strategy_id = uuid.uuid4().hex
+            self.strategy.strategy_id = uuid.uuid5(uuid.NAMESPACE_URL, str(path.resolve())).hex
         self.strategy_name.setText(strategy.name)
         self.combination.blockSignals(True)
         self.combination.setCurrentIndex(self.combination.findData(strategy.combiners[0].method))
@@ -1171,6 +1256,10 @@ class StrategyEditorWindow(QMainWindow):
         }
         self.selected_node_id = None
         self._draw_graph()
+        if action == "calculate":
+            QTimer.singleShot(0, self._calculate_inputs)
+        elif action == "run":
+            QTimer.singleShot(0, self._run_strategy)
 
     def _save(self) -> None:
         # Include any edits still present in the node controls before writing.
@@ -1402,8 +1491,14 @@ class StrategyEditorWindow(QMainWindow):
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build and run signal strategies")
+    parser.add_argument("--strategy", type=Path, help="Open a saved strategy file on launch")
+    parser.add_argument("--action", choices=("edit", "calculate", "run"), default="edit")
+    args = parser.parse_args()
     app = QApplication(sys.argv)
-    window = StrategyEditorWindow()
+    window = StrategyEditorWindow(args.strategy, args.action)
     window.show()
     sys.exit(app.exec())
 
