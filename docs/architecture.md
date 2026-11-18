@@ -31,7 +31,7 @@ flowchart LR
 
 The stable analysis key is `(instrument_id, trade_date, retrieval_id)`. TRACE versions are stored append-only, with retrieval time, source run, and a normalized-record hash. The existing `observations` table remains a latest-value compatibility table while older readers migrate.
 
-Every TRACE run archives and hashes its exact holdings snapshot. Preprocessing selects the observation versions known at the run cutoff and records the cleaning policy. Treasury curve runs are stored separately. Each spread snapshot names both input vintages, records the interpolation policy and hashes, and has an immutable manifest and Parquet output. Keep instrument master, as-of-dated universe membership, vendor observations, derived datasets, and research outputs separate.
+TRACE runs archive and hash their input holdings snapshot. The interactive LQD build itself currently writes a replaceable `lqd_bonds.csv`; treat its source date and content hash as required run metadata until it too writes content-addressed baseline/final manifests. Preprocessing selects the observation versions known at the run cutoff and records the cleaning policy. Treasury curve runs are stored separately. Each spread snapshot names both input vintages, records the interpolation policy and hashes, and has an immutable manifest and Parquet output. Keep instrument master, as-of-dated universe membership, vendor observations, derived datasets, and research outputs separate.
 
 ## Target shape
 
