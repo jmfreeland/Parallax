@@ -66,6 +66,8 @@ class HoldingsWindow(QMainWindow):
         self.source = QComboBox()
         self.source.addItem("Latest iShares holdings", "latest")
         self.source.addItem("Built bond snapshot", "snapshot")
+        if SNAPSHOT_PATH.exists():
+            self.source.setCurrentIndex(self.source.findData("snapshot"))
         self.source.currentIndexChanged.connect(lambda _index: self.refresh())
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search holdings...")
@@ -76,7 +78,8 @@ class HoldingsWindow(QMainWindow):
         toolbar.addWidget(self.refresh_button)
         layout.addLayout(toolbar)
 
-        self.summary = QLabel("Loading latest LQD holdings...")
+        initial_source = "built snapshot" if self.source.currentData() == "snapshot" else "latest LQD holdings"
+        self.summary = QLabel(f"Loading {initial_source}...")
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.summary)
 

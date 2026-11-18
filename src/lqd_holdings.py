@@ -25,15 +25,26 @@ DOWNLOAD_STATUS_PATH = ROOT / "data" / "reference" / "last_lqd_download.json"
 def _record_download(source_as_of_date: str | None, holdings: pd.DataFrame) -> None:
     """Keep local metadata for the launcher diagnostics panel."""
     DOWNLOAD_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    isin_column = next(column for column in holdings.columns if column.strip().upper() == "ISIN")
+    isin_values = holdings[isin_column].astype("string").fillna("").str.strip()
+    has_isin = isin_values.ne("")
+    asset_class_column = next(
+        (column for column in holdings.columns if column.strip().casefold() == "asset class"),
+        None,
+    )
+    if asset_class_column is not None:
+        is_fixed_income = (
+            holdings[asset_class_column].astype("string").fillna("").str.strip().str.casefold()
+            == "fixed income"
+        )
+    else:
+        is_fixed_income = pd.Series(True, index=holdings.index)
     payload = {
         "downloaded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source_as_of_date": source_as_of_date or "",
         "rows_returned": len(holdings),
-        "rows_with_isin": int(
-            holdings[next(column for column in holdings.columns if column.strip().upper() == "ISIN")]
-            .notna()
-            .sum()
-        ),
+        "rows_with_isin": int(has_isin.sum()),
+        "bond_count": int((has_isin & is_fixed_income).sum()),
     }
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=DOWNLOAD_STATUS_PATH.parent, delete=False

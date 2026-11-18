@@ -144,18 +144,63 @@ class LauncherWindow(QMainWindow):
         security_page = QWidget()
         security_layout = QVBoxLayout(security_page)
         security_actions = QGridLayout()
-        security_master_tools = (
-            ("Review issuer mappings", "src.mapping_app"),
-            ("Inspect latest holdings", "src.lqd_inspector"),
-            ("Refresh issuer candidates", "src.resolve_lqd_tickers"),
-            ("Build bond snapshot", "src.build_lqd_snapshot"),
+        security_steps = (
+            (
+                "Build baseline snapshot",
+                "src.build_lqd_snapshot",
+                "Creates the bond snapshot used as input to issuer candidate resolution.",
+            ),
+            (
+                "Refresh issuer & bond ticker candidates",
+                "src.resolve_lqd_tickers",
+                "Uses the current snapshot; resolves issuer candidates and checks SEC fund filings for ticker suggestions.",
+            ),
+            (
+                "Review and save issuer mappings",
+                "src.mapping_app",
+                "Check suggested tickers, edit bond curve tickers, then save the mapping file.",
+            ),
+            (
+                "Rebuild final snapshot",
+                "src.build_lqd_snapshot",
+                "Downloads the latest holdings again and applies the saved mappings to the final snapshot.",
+            ),
         )
-        for index, (label, module) in enumerate(security_master_tools):
+        security_layout.addWidget(QLabel("Snapshot workflow — follow the numbered steps"))
+        for index, (label, module, description) in enumerate(security_steps, start=1):
             button = QPushButton(label)
             button.clicked.connect(lambda checked=False, name=module: self._launch(name))
             self.buttons.append(button)
-            security_actions.addWidget(button, index // 2, index % 2)
+            number = QLabel(f"{index}.")
+            number.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+            detail = QLabel(description)
+            detail.setWordWrap(True)
+            security_actions.addWidget(number, index - 1, 0)
+            security_actions.addWidget(button, index - 1, 1)
+            security_actions.addWidget(detail, index - 1, 2)
+        security_actions.setColumnStretch(2, 1)
         security_layout.addLayout(security_actions)
+        inspect_row = QHBoxLayout()
+        inspect_holdings = QPushButton("Inspect holdings")
+        inspect_holdings.setToolTip(
+            "Opens the latest built snapshot when available; choose Latest iShares holdings in the inspector to compare the source list."
+        )
+        inspect_holdings.clicked.connect(lambda: self._launch("src.lqd_inspector"))
+        self.buttons.append(inspect_holdings)
+        inspect_row.addWidget(inspect_holdings)
+        inspect_row.addWidget(QLabel("Optional review after the final snapshot; the inspector can also show the live iShares list."), 1)
+        security_layout.addLayout(inspect_row)
+        security_diag_header = QHBoxLayout()
+        security_diag_header.addWidget(QLabel("Security master diagnostics"))
+        security_diag_header.addStretch(1)
+        refresh_security_diagnostics = QPushButton("Refresh")
+        refresh_security_diagnostics.clicked.connect(self._refresh_security_diagnostics)
+        security_diag_header.addWidget(refresh_security_diagnostics)
+        security_layout.addLayout(security_diag_header)
+        self.security_diagnostics = QTextEdit()
+        self.security_diagnostics.setReadOnly(True)
+        self.security_diagnostics.setMaximumHeight(210)
+        security_layout.addWidget(self.security_diagnostics)
         security_layout.addStretch(1)
         self.tabs.addTab(security_page, "Security Master")
 
@@ -177,6 +222,17 @@ class LauncherWindow(QMainWindow):
             self.buttons.append(button)
             data_actions.addWidget(button, index // 2, index % 2)
         data_layout.addLayout(data_actions)
+        data_diag_header = QHBoxLayout()
+        data_diag_header.addWidget(QLabel("Data diagnostics"))
+        data_diag_header.addStretch(1)
+        refresh_data_diagnostics = QPushButton("Refresh")
+        refresh_data_diagnostics.clicked.connect(self._refresh_data_diagnostics)
+        data_diag_header.addWidget(refresh_data_diagnostics)
+        data_layout.addLayout(data_diag_header)
+        self.data_diagnostics = QTextEdit()
+        self.data_diagnostics.setReadOnly(True)
+        self.data_diagnostics.setMaximumHeight(125)
+        data_layout.addWidget(self.data_diagnostics)
         data_layout.addStretch(1)
         self.tabs.addTab(data_page, "Data")
 
@@ -449,52 +505,93 @@ class LauncherWindow(QMainWindow):
                 break
 
     def _refresh_diagnostics(self) -> None:
-        snapshots = sorted(SNAPSHOTS_DIR.rglob("*.csv")) if SNAPSHOTS_DIR.exists() else []
-        versions = sorted(VERSIONS_DIR.rglob("*.csv")) if VERSIONS_DIR.exists() else []
+        self.diagnostics.setPlainText(
+            f"Application version: {self.version}\n"
+            "Detailed security-master and data health checks are on their respective tabs."
+        )
+        self._refresh_security_diagnostics()
+        self._refresh_data_diagnostics()
+
+    def _refresh_security_diagnostics(self) -> None:
         snapshot_path = SNAPSHOTS_DIR / "lqd_bonds.csv"
-        source_date = "Not available"
+        candidates_path = DATA_DIR / "issuer_ticker_candidates.csv"
+        download_path = DOWNLOAD_STATUS_PATH
+        suggestion_cache = DATA_DIR / "reference" / "sec_nport_bond_ticker_cache.csv"
+        mapping_versions = sorted(VERSIONS_DIR.rglob("*.csv")) if VERSIONS_DIR.exists() else []
+        lines = []
+        lines.append("Most recent LQD download")
+        download = {}
+        if download_path.exists():
+            try:
+                download = json.loads(download_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                download = {}
+        if download:
+            lines.append(
+                f"  Source date: {download.get('source_as_of_date') or 'not recorded'} · "
+                f"bonds: {download.get('bond_count', 'not recorded')} · "
+                f"downloaded: {download.get('downloaded_at_utc', 'unknown')}"
+            )
+        else:
+            lines.append("  No successful download recorded.")
+
+        lines.append("Current bond snapshot")
         if snapshot_path.exists():
             try:
                 with snapshot_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                    source_date = next(csv.DictReader(handle), {}).get("source_as_of_date") or "Not available"
-            except (OSError, csv.Error):
-                pass
-
-        download = {}
-        if DOWNLOAD_STATUS_PATH.exists():
-            try:
-                download = json.loads(DOWNLOAD_STATUS_PATH.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                download = {}
-
-        lines = [f"Application version: {self.version}", "", "Most recent successful holdings download"]
-        if download:
-            lines.extend(
-                [
-                    f"  Downloaded (UTC): {download.get('downloaded_at_utc', 'Unknown')}",
-                    f"  Holdings source date: {download.get('source_as_of_date') or 'Unavailable'}",
-                    f"  Rows returned: {download.get('rows_returned', 'Unknown')}",
-                    f"  Rows with ISIN: {download.get('rows_with_isin', 'Unknown')}",
-                ]
-            )
+                    snapshot_rows = list(csv.DictReader(handle))
+                bond_count = sum(bool(row.get("isin", "").strip()) for row in snapshot_rows)
+                snapshot_date = snapshot_rows[0].get("source_as_of_date", "") if snapshot_rows else "not recorded"
+                lines.append(
+                    f"  Source date: {snapshot_date or 'not recorded'} · bonds: {bond_count:,} · "
+                    f"built: {datetime.fromtimestamp(snapshot_path.stat().st_mtime).astimezone().isoformat(timespec='minutes')}"
+                )
+            except (OSError, csv.Error) as error:
+                lines.append(f"  Available, but could not read its bond count: {error}")
         else:
-            lines.append("  No successful download recorded yet.")
-        lines.extend(
-            [
-                "",
-                "Local data files",
-                f"  Snapshot files: {len(snapshots)}",
-                f"  Current snapshot: {snapshot_path.name if snapshot_path.exists() else 'Not built'}",
-                f"  Snapshot holdings date: {source_date}",
-                f"  Mapping versions: {len(versions)}",
-                f"  Current map: {'Available' if MAPPINGS_PATH.exists() else 'Not found'}",
-            ]
-        )
-        if snapshot_path.exists():
-            modified = snapshot_path.stat().st_mtime
-            last_built = datetime.fromtimestamp(modified).astimezone().isoformat(timespec="minutes")
-            lines.append(f"  Snapshot last built: {last_built}")
-        self.diagnostics.setPlainText("\n".join(lines))
+            lines.append("  Not built.")
+
+        for label, path in (("Issuer candidates", candidates_path),
+                            ("SEC N-PORT cache", suggestion_cache),
+                            ("Saved mapping versions", VERSIONS_DIR)):
+            if path.exists():
+                if label == "Saved mapping versions":
+                    lines.append(f"{label}: {len(mapping_versions):,}")
+                else:
+                    stamp = datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="minutes")
+                    lines.append(f"{label}: available · updated {stamp}")
+            else:
+                lines.append(f"{label}: not found")
+        try:
+            with candidates_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                candidates = list(csv.DictReader(handle))
+            lines.append(f"  Candidate issuers: {len(candidates):,}")
+            matched = sum(bool(row.get("suggested_bond_ticker", "").strip()) for row in candidates)
+            failures = sum(row.get("suggested_ticker_status", "").startswith("lookup_failed") for row in candidates)
+            lines.append(f"  SEC bond ticker suggestions: {matched:,} · lookup failures {failures:,}")
+        except (OSError, csv.Error):
+            pass
+        self.security_diagnostics.setPlainText("\n".join(lines))
+
+    def _refresh_data_diagnostics(self) -> None:
+        trace_root = DATA_DIR / "trace"
+        history_path = trace_root / "history.duckdb"
+        parquet_files = sorted(trace_root.glob("preprocessed/**/observations.parquet"), key=lambda p: p.stat().st_mtime)
+        clean_files = [path for path in parquet_files if any(part.startswith("clean_id=") for part in path.parts)]
+        preprocess_files = [path for path in parquet_files if not any(part.startswith("clean_id=") for part in path.parts)]
+        lines = []
+        if history_path.exists():
+            lines.append(f"TRACE history database: available · {history_path.stat().st_size / (1024 ** 3):.2f} GB")
+        else:
+            lines.append("TRACE history database: not found")
+        for label, files in (("Preprocessed datasets", preprocess_files), ("Cleaned datasets", clean_files)):
+            if files:
+                latest = files[-1]
+                stamp = datetime.fromtimestamp(latest.stat().st_mtime).astimezone().isoformat(timespec="minutes")
+                lines.append(f"{label}: {len(files):,} · latest updated {stamp}")
+            else:
+                lines.append(f"{label}: none found")
+        self.data_diagnostics.setPlainText("\n".join(lines))
 
     def _populate_dependencies(self) -> None:
         packages = _requirement_names()

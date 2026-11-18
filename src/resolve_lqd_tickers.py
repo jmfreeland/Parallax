@@ -21,8 +21,10 @@ import requests
 
 try:
     from .build_lqd_snapshot import normalize_issuer_name
+    from .sec_nport_ticker_suggestions import suggest_bond_tickers
 except ImportError:
     from build_lqd_snapshot import normalize_issuer_name
+    from sec_nport_ticker_suggestions import suggest_bond_tickers
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -257,10 +259,56 @@ def main() -> None:
             "exchange": exchange,
             "mapping_status": status,
             "reviewed_equity_ticker": "",
+            "suggested_bond_ticker": "",
+            "suggested_ticker_filings": "0",
+            "suggested_ticker_date": "",
+            "suggested_ticker_source": "SEC N-PORT",
+            "suggested_ticker_status": "not_checked",
         })
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     output = pd.DataFrame(candidates).sort_values("issuer_name")
+    representative_isins = output["representative_isin"].fillna("").astype(str).tolist()
+    print("Searching recent SEC N-PORT filings for bond ticker identifiers...", flush=True)
+    try:
+        ticker_suggestions = suggest_bond_tickers(
+            representative_isins,
+            user_agent=args.sec_user_agent.strip(),
+            on_progress=lambda current, total: print(
+                f"SEC bond ticker suggestions: {current:,}/{total:,}", flush=True
+            ) if current % 25 == 0 or current == total else None,
+        )
+    except Exception as error:
+        print(
+            f"SEC N-PORT suggestions unavailable ({type(error).__name__}); "
+            "continuing with issuer/equity candidates.",
+            flush=True,
+        )
+        ticker_suggestions = pd.DataFrame({
+            "isin": representative_isins,
+            "suggested_bond_ticker": [""] * len(representative_isins),
+            "supporting_filings": ["0"] * len(representative_isins),
+            "latest_filing_date": [""] * len(representative_isins),
+            "suggestion_source": ["SEC N-PORT"] * len(representative_isins),
+            "suggestion_status": [f"lookup_failed: {type(error).__name__}"] * len(representative_isins),
+        })
+    suggestion_columns = {
+        "suggested_bond_ticker": "suggested_bond_ticker",
+        "supporting_filings": "suggested_ticker_filings",
+        "latest_filing_date": "suggested_ticker_date",
+        "suggestion_source": "suggested_ticker_source",
+        "suggestion_status": "suggested_ticker_status",
+    }
+    ticker_suggestions = ticker_suggestions.rename(columns=suggestion_columns)
+    output = output.drop(columns=list(suggestion_columns.values()), errors="ignore")
+    output = output.merge(
+        ticker_suggestions[["isin", *suggestion_columns.values()]],
+        left_on="representative_isin",
+        right_on="isin",
+        how="left",
+    ).drop(columns=["isin"])
+    for column in suggestion_columns.values():
+        output[column] = output[column].fillna("")
 
     # Automatically persist only exact issuer-entity matches. Parent matches
     # and ambiguous listings remain candidates for a human decision.
@@ -359,6 +407,7 @@ def main() -> None:
     print(f"Direct-parent candidates for review: {(output['candidate_relationship'] == 'gleif_direct_parent').sum():,}")
     print(f"Ambiguous issuer or parent matches: {output['mapping_status'].str.startswith('ambiguous').sum():,}")
     print(f"No exact or parent candidate: {(output['mapping_status'] == 'no_exact_sec_match_review_required').sum():,}")
+    print(f"SEC N-PORT bond ticker suggestions: {output['suggested_bond_ticker'].astype(bool).sum():,}")
     print(f"Fixture bonds with exact or reviewed ticker mapping: {fixture['equity_ticker'].astype(bool).sum():,}/{len(fixture):,}")
 
 

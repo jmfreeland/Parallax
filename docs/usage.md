@@ -30,6 +30,13 @@ export SEC_USER_AGENT='Parallax research contact@example.com'
 uv run python -m src.resolve_lqd_tickers
 ```
 
+Refreshing issuer candidates also checks recent SEC N-PORT fund filings for
+bond ticker identifiers against each representative US ISIN/CUSIP. The result
+is a review-only suggestion with filing count and latest filing date; it never
+overwrites the editable bond curve ticker. Suggestions are cached locally for
+90 days. SEC filings may omit tickers when another identifier is reported, so
+an empty suggestion is not evidence that a bond has no market ticker.
+
 Automatic mappings are limited to unique, exact legal-entity matches. Parent and ambiguous matches are review candidates, never automatic assignments.
 
 ## TRACE history

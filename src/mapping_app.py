@@ -63,6 +63,10 @@ HEADERS = [
     "Issuer / company",
     "Issuer LEI",
     "Representative bond ISIN",
+    "SEC fund filing suggestion",
+    "SEC filings",
+    "Latest SEC filing",
+    "SEC lookup status",
     "LQD ticker suggestion",
     "Bond curve ticker (editable)",
     "Automated equity ticker candidate",
@@ -84,6 +88,10 @@ TICKER_FIELD_INDEX = FIELDS.index("equity_ticker")
 TABLE_FIELDS = [
     "isin_count",
     *FIELDS[:3],
+    "suggested_bond_ticker",
+    "suggested_ticker_filings",
+    "suggested_ticker_date",
+    "suggested_ticker_status",
     "lqd_ticker_suggestion",
     "bond_ticker",
     "automated_equity_ticker",
@@ -243,6 +251,10 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
             "issuer_name": name,
             "issuer_lei": lei,
             "representative_isin": candidate.get("representative_isin", ""),
+            "suggested_bond_ticker": candidate.get("suggested_bond_ticker", "").strip().upper(),
+            "suggested_ticker_filings": candidate.get("suggested_ticker_filings", ""),
+            "suggested_ticker_date": candidate.get("suggested_ticker_date", ""),
+            "suggested_ticker_status": candidate.get("suggested_ticker_status", ""),
             "lqd_ticker_suggestion": "",
             "bond_ticker": bond_ticker_source.get("bond_ticker", "").strip().upper(),
             "automated_equity_ticker": auto_ticker,
@@ -287,6 +299,10 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
                 "issuer_name": name,
                 "issuer_lei": old.get("issuer_lei", ""),
                 "representative_isin": old.get("representative_isin", ""),
+                "suggested_bond_ticker": "",
+                "suggested_ticker_filings": "",
+                "suggested_ticker_date": "",
+                "suggested_ticker_status": "",
                 "lqd_ticker_suggestion": "",
                 "bond_ticker": old.get("bond_ticker", ""),
                 "automated_equity_ticker": old.get("automated_equity_ticker", ""),
@@ -388,6 +404,7 @@ class MappingWindow(QMainWindow):
             ["All snapshot tickers", "Missing snapshot ticker", "Has snapshot ticker"]
         )
         self.save_button = QPushButton("Save mappings")
+        self.reload_sec_suggestions_button = QPushButton("Reload SEC suggestions")
         self.suggestions_button = QPushButton("Refresh LQD ticker suggestions")
         self.refresh_lqd_button = QPushButton("Review new LQD ISINs")
         self.dirty_label = QLabel()
@@ -396,6 +413,7 @@ class MappingWindow(QMainWindow):
         toolbar.addWidget(self.snapshot_filter)
         toolbar.addWidget(self.dirty_label)
         toolbar.addWidget(self.save_button)
+        toolbar.addWidget(self.reload_sec_suggestions_button)
         toolbar.addWidget(self.suggestions_button)
         toolbar.addWidget(self.refresh_lqd_button)
         layout.addLayout(toolbar)
@@ -407,6 +425,7 @@ class MappingWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(HEADERS)
         header_tooltips = {
             "Bond curve ticker (editable)": "Primary issuer curve grouping ticker used by Nelson–Siegel. Edit this to assign bonds to a bond curve.",
+            "SEC fund filing suggestion": "Candidate bond ticker reported for this representative ISIN in recent SEC N-PORT fund filings. Review its filing evidence before using it.",
             "LQD ticker suggestion": "Ticker reported by iShares for this issuer's representative bond ISIN. This is a source suggestion, not a verified curve assignment.",
             "Automated equity ticker candidate": "Automated suggestion for the issuer or parent company's listed equity. Used separately when joining equity data.",
             "Equity ticker override": "Editable issuer-to-equity mapping. This value takes precedence over the automatic candidate.",
@@ -446,6 +465,7 @@ class MappingWindow(QMainWindow):
         self.status_filter.currentTextChanged.connect(self._apply_filters)
         self.snapshot_filter.currentTextChanged.connect(self._apply_filters)
         self.save_button.clicked.connect(self._save)
+        self.reload_sec_suggestions_button.clicked.connect(self._reload_sec_suggestions)
         self.suggestions_button.clicked.connect(self._refresh_lqd_ticker_suggestions)
         self.refresh_lqd_button.clicked.connect(self._review_new_lqd_holdings)
         self._set_dirty_state(False)
@@ -469,6 +489,17 @@ class MappingWindow(QMainWindow):
                     item.setToolTip(
                         "Primary bond-curve grouping ticker. This editable value is copied to each bond in the issuer when the snapshot is rebuilt."
                     )
+                if field == "suggested_bond_ticker":
+                    count = record.get("suggested_ticker_filings", "0") or "0"
+                    latest = record.get("suggested_ticker_date", "") or "not reported"
+                    status = record.get("suggested_ticker_status", "unknown") or "unknown"
+                    item.setToolTip(
+                        f"SEC N-PORT ticker identifier; found in {count} recent filing(s). "
+                        f"Latest filing date: {latest}; lookup status: {status}. "
+                        "This is a suggestion, not a verified curve assignment."
+                    )
+                if field == "suggested_ticker_status":
+                    item.setToolTip("SEC N-PORT lookup result for the representative bond ISIN. Blank means no lookup result was saved.")
                 if field == "confidence":
                     item.setToolTip("Use high, medium, low, or unrated. This is your confidence in the issuer-to-equity link.")
                 self.table.setItem(row_index, column, item)
@@ -477,6 +508,10 @@ class MappingWindow(QMainWindow):
         self.table.setColumnWidth(TABLE_FIELDS.index("issuer_name"), 260)
         self.table.setColumnWidth(TABLE_FIELDS.index("issuer_lei"), 190)
         self.table.setColumnWidth(TABLE_FIELDS.index("representative_isin"), 180)
+        self.table.setColumnWidth(TABLE_FIELDS.index("suggested_bond_ticker"), 155)
+        self.table.setColumnWidth(TABLE_FIELDS.index("suggested_ticker_filings"), 90)
+        self.table.setColumnWidth(TABLE_FIELDS.index("suggested_ticker_date"), 130)
+        self.table.setColumnWidth(TABLE_FIELDS.index("suggested_ticker_status"), 155)
         self.table.setColumnWidth(TABLE_FIELDS.index("lqd_ticker_suggestion"), 150)
         self.table.setColumnWidth(TABLE_FIELDS.index("mapping_source"), 320)
         self.table.setColumnWidth(TABLE_FIELDS.index("notes"), 240)
@@ -749,6 +784,33 @@ class MappingWindow(QMainWindow):
 
     def _refresh_lqd_ticker_suggestions(self) -> None:
         self._start_lqd_download("suggestions")
+
+    def _reload_sec_suggestions(self) -> None:
+        try:
+            records = load_mapping_records()
+            def identity(record: dict[str, str]) -> tuple[str, str]:
+                lei = record.get("issuer_lei", "").strip()
+                return ("LEI", lei) if lei else ("NAME", normalize_issuer_name(record.get("issuer_name", "")))
+
+            suggestions_by_identity = {identity(record): record for record in records}
+            populated = 0
+            self._loading = True
+            for row in range(self.table.rowCount()):
+                lei = self.table.item(row, TABLE_FIELDS.index("issuer_lei")).text().strip()
+                name = self.table.item(row, TABLE_FIELDS.index("issuer_name")).text()
+                suggestion = suggestions_by_identity.get(("LEI", lei) if lei else ("NAME", normalize_issuer_name(name)), {})
+                for field in ("suggested_bond_ticker", "suggested_ticker_filings", "suggested_ticker_date", "suggested_ticker_status"):
+                    self.table.item(row, TABLE_FIELDS.index(field)).setText(suggestion.get(field, ""))
+                if suggestion.get("suggested_bond_ticker", "").strip():
+                    populated += 1
+            self._loading = False
+            self.statusBar().showMessage(
+                f"Reloaded SEC N-PORT results: {populated:,} representative ISIN suggestions in the current issuer list.",
+                9000,
+            )
+        except Exception as error:
+            self._loading = False
+            QMessageBox.critical(self, "Could not reload SEC suggestions", str(error))
 
     def _apply_lqd_ticker_suggestions(self, holdings: pd.DataFrame) -> None:
         try:
