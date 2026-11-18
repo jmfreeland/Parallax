@@ -161,6 +161,8 @@ class StrategyInputsDialog(QDialog):
 
 def _transform_label(transform: dict[str, Any]) -> str:
     kind = transform.get("type", "transform")
+    if kind == "exclude_reversal_spikes":
+        return f"Filter confirmed reversals · {transform.get('series', 'either').title()}"
     if kind == "winsorize":
         lower = 100 * float(transform.get("lower", 0.01))
         upper = 100 * float(transform.get("upper", 0.99))
@@ -169,6 +171,7 @@ def _transform_label(transform: dict[str, Any]) -> str:
         "zscore": "Z-score normalization",
         "percentile": "Percentile rank · 0–1",
         "minmax": "Min–max scaling · 0–1",
+        "exclude_reversal_spikes": "Filter confirmed reversal spikes",
     }.get(kind, str(kind).replace("_", " ").title())
 
 
@@ -178,6 +181,12 @@ def _transform_description(transform: dict[str, Any]) -> str:
         "zscore": "Centers and scales the cross-section.",
         "percentile": "Maps ranks onto a 0–1 scale.",
         "minmax": "Rescales the cross-section to 0–1.",
+        "exclude_reversal_spikes": (
+            "Removes bonds whose large price or yield move was quickly reversed (current cleaner defaults: "
+            "50 bp yield / 5 price points, reversal within 3 business days). TRACE size is not retained, "
+            "so this cannot target small prints specifically. Confirmation uses later observations; this "
+            "retrospective filter introduces look-ahead in historical backtests."
+        ),
     }.get(str(transform.get("type")), "Transforms the incoming score.")
 
 
@@ -783,11 +792,12 @@ class StrategyEditorWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addWidget(QLabel(
-            "Start with signal nodes, insert transformer nodes on any connection, and configure the combiner node. "
-            "Each transformer processes the output of its input node."
+            "Start with signal nodes, add transforms or data-quality filters on a branch, and configure the combiner. "
+            "Each node processes the output from its incoming connection."
         ))
         graph_toolbar = QHBoxLayout()
         for label, handler in (("Add signal", self._add_signal), ("Add transformer", self._append_transform),
+                               ("Add filter", lambda: self._append_transform({"type": "exclude_reversal_spikes", "series": "either"})),
                                ("Add combiner", self._add_combiner),
                                ("Remove selected", self._remove_selected), ("New graph", self._new_graph),
                                ("Open…", self._open), ("Validate", self._validate), ("Save as…", self._save)):
@@ -935,7 +945,8 @@ class StrategyEditorWindow(QMainWindow):
         transformer_form.addRow("Node name", self.transform_name)
         self.transform_type = QComboBox()
         for label, value in (("Winsorize", "winsorize"), ("Z-score", "zscore"),
-                             ("Percentile rank", "percentile"), ("Min-max", "minmax")):
+                             ("Percentile rank", "percentile"), ("Min-max", "minmax"),
+                             ("Filter confirmed reversal spikes", "exclude_reversal_spikes")):
             self.transform_type.addItem(label, value)
         self.transform_type.currentIndexChanged.connect(self._transform_type_changed)
         transformer_form.addRow("Transform", self.transform_type)
@@ -951,6 +962,17 @@ class StrategyEditorWindow(QMainWindow):
         self.winsor_upper.setSingleStep(0.01)
         self.winsor_upper.setValue(0.98)
         transformer_form.addRow("Upper quantile (0–1)", self.winsor_upper)
+        self.filter_series = QComboBox()
+        for label, value in (("Yield moves", "yield"), ("Price moves", "price"), ("Either", "either")):
+            self.filter_series.addItem(label, value)
+        transformer_form.addRow("Filter on", self.filter_series)
+        self.filter_warning = QLabel(
+            "Requires Cleaned Parquet. Uses the cleaner’s confirmed reversal flags (default: 50 bp yield / "
+            "5 price points reversed within 3 business days). Trade size is unavailable. Since confirmation "
+            "uses later observations, this retrospective filter introduces look-ahead in historical backtests."
+        )
+        self.filter_warning.setWordWrap(True)
+        transformer_form.addRow(self.filter_warning)
         transformer_form.addRow(QLabel("This transformer processes the value coming from its input connection."))
         self._transform_type_changed()
         self.node_pages.addWidget(transformer_page)
@@ -1097,7 +1119,11 @@ class StrategyEditorWindow(QMainWindow):
                         f"Input: {names.get(node.input_node_id, node.input_node_id)}\n"
                         f"{_transform_label(node.transform)}\n{_transform_description(node.transform)}"
                     )
-                    title, color = f"TRANSFORMER  /  {node.name}", "#6d28d9"
+                    is_filter = node.transform.get("type") == "exclude_reversal_spikes"
+                    title, color = (
+                        (f"FILTER  /  {node.name}", "#c2410c") if is_filter
+                        else (f"TRANSFORMER  /  {node.name}", "#6d28d9")
+                    )
                 else:
                     node = combiners[node_id]
                     input_names = ", ".join(names.get(item, item) for item in node.input_node_ids)
@@ -1226,9 +1252,13 @@ class StrategyEditorWindow(QMainWindow):
             self.transform_type.setCurrentIndex(self.transform_type.findData(str(node.transform.get("type", "zscore"))))
             self.winsor_lower.setValue(float(node.transform.get("lower", 0.02)))
             self.winsor_upper.setValue(float(node.transform.get("upper", 0.98)))
+            self.filter_series.setCurrentIndex(
+                self.filter_series.findData(str(node.transform.get("series", "either")))
+            )
             self.node_pages.setCurrentIndex(2)
             self.apply_button.setEnabled(True)
-            self.node_status.setText(f"Transformer node {node.name}; input: {node.input_node_id}.")
+            node_label = "Filter" if node.transform.get("type") == "exclude_reversal_spikes" else "Transformer"
+            self.node_status.setText(f"{node_label} node {node.name}; input: {node.input_node_id}.")
         elif node_id in {node.node_id for node in self.strategy.combiners}:
             node = next(item for item in self.strategy.combiners if item.node_id == node_id)
             self.combiner_name.setText(node.name)
@@ -1255,9 +1285,12 @@ class StrategyEditorWindow(QMainWindow):
 
     def _transform_type_changed(self, *_args: Any) -> None:
         is_winsorize = hasattr(self, "transform_type") and self.transform_type.currentData() == "winsorize"
+        is_filter = hasattr(self, "transform_type") and self.transform_type.currentData() == "exclude_reversal_spikes"
         if hasattr(self, "winsor_lower"):
             self.winsor_lower.setVisible(is_winsorize)
             self.winsor_upper.setVisible(is_winsorize)
+            self.filter_series.setVisible(is_filter)
+            self.filter_warning.setVisible(is_filter)
 
     def _signal_predictor_changed(self, *_args: Any) -> None:
         is_partition = self.predictor.currentData() in {
@@ -1318,6 +1351,8 @@ class StrategyEditorWindow(QMainWindow):
                 node.transform = {"type": kind}
                 if kind == "winsorize":
                     node.transform.update({"lower": self.winsor_lower.value(), "upper": self.winsor_upper.value()})
+                elif kind == "exclude_reversal_spikes":
+                    node.transform["series"] = self.filter_series.currentData()
             elif self.selected_node_id in {node.node_id for node in self.strategy.combiners}:
                 node = next(item for item in self.strategy.combiners if item.node_id == self.selected_node_id)
                 node.name = self.combiner_name.text().strip()
@@ -1335,7 +1370,7 @@ class StrategyEditorWindow(QMainWindow):
         self.node_status.setText("Settings applied to the strategy graph.")
         return True
 
-    def _append_transform(self) -> None:
+    def _append_transform(self, initial_transform: dict[str, Any] | None = None) -> None:
         if not self.selected_node_id:
             self.node_status.setText("Select a signal, transformer, or combiner, then add a transformer node.")
             return
@@ -1353,13 +1388,14 @@ class StrategyEditorWindow(QMainWindow):
         input_node_id = self.selected_node_id
         # New nodes use a simple default; select the transformer after insertion
         # to change its method or parameters.
-        transform = {"type": "zscore"}
+        transform = dict(initial_transform or {"type": "zscore"})
         index = 1
         existing = {node.node_id for node in self.strategy.transformer_nodes}
         while f"transform_{index}" in existing:
             index += 1
         new_id = f"transform_{index}"
-        inserted = TransformerNode(new_id, input_node_id, transform, name=f"Transformer {index}")
+        node_name = f"Filter {index}" if transform.get("type") == "exclude_reversal_spikes" else f"Transformer {index}"
+        inserted = TransformerNode(new_id, input_node_id, transform, name=node_name)
         # Insert into the selected connection, preserving any downstream chain.
         for node in self.strategy.transformer_nodes:
             if node.input_node_id == input_node_id:

@@ -13,7 +13,7 @@ import numpy as np
 
 STRATEGY_SCHEMA_VERSION = 3
 SUPPORTED_COMBINATIONS = {"mean", "weighted_mean", "sum", "rank_mean"}
-SUPPORTED_TRANSFORMS = {"winsorize", "zscore", "percentile", "minmax"}
+SUPPORTED_TRANSFORMS = {"winsorize", "zscore", "percentile", "minmax", "exclude_reversal_spikes"}
 
 
 @dataclass
@@ -249,21 +249,31 @@ def validate_transform(transform: Mapping[str, Any]) -> None:
         upper = float(transform.get("upper", 0.99))
         if not 0 <= lower < upper <= 1:
             raise ValueError("winsorize lower/upper must satisfy 0 <= lower < upper <= 1")
+    if kind == "exclude_reversal_spikes" and transform.get("series", "either") not in {"price", "yield", "either"}:
+        raise ValueError("reversal-spike filter series must be price, yield, or either")
 
 
 def transform_scores(
     values: Mapping[str, float | None],
     transformers: Sequence[Mapping[str, Any]],
+    *,
+    reversal_flags: Mapping[str, set[str]] | None = None,
 ) -> dict[str, float | None]:
     """Apply cross-sectional transforms while retaining missing bond scores."""
     output = dict(values)
     for transform in transformers:
         validate_transform(transform)
+        kind = transform["type"]
+        if kind == "exclude_reversal_spikes":
+            flagged = reversal_flags or {}
+            series = transform.get("series", "either")
+            excluded = set(flagged.get("price", set())) | set(flagged.get("yield", set())) if series == "either" else set(flagged.get(series, set()))
+            output = {key: None if key in excluded else value for key, value in output.items()}
+            continue
         keys = [key for key, value in output.items() if value is not None and math.isfinite(float(value))]
         if not keys:
             continue
         array = np.asarray([float(output[key]) for key in keys], dtype=float)
-        kind = transform["type"]
         if kind == "winsorize":
             array = np.clip(array, np.quantile(array, float(transform.get("lower", 0.01))),
                             np.quantile(array, float(transform.get("upper", 0.99))))
@@ -291,6 +301,8 @@ def transform_scores(
 def evaluate_strategy_nodes(
     strategy: Strategy,
     scores_by_signal: Mapping[str, Mapping[str, float | None]],
+    *,
+    reversal_flags: Mapping[str, set[str]] | None = None,
 ) -> dict[str, dict[str, float | None]]:
     """Return the score map for every signal, transformer, and combiner node."""
     strategy.validate()
@@ -340,7 +352,9 @@ def evaluate_strategy_nodes(
             component_weights[node_id] = components[node_id].weight
         elif node_id in transformers:
             node = transformers[node_id]
-            result = transform_scores(calculate(node.input_node_id), [node.transform])
+            result = transform_scores(
+                calculate(node.input_node_id), [node.transform], reversal_flags=reversal_flags
+            )
             component_weights[node_id] = component_weights[node.input_node_id]
         elif node_id in combiners:
             result = combine(node_id)

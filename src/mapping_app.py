@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -26,7 +29,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.build_lqd_snapshot import normalize_issuer_name
+from src.build_lqd_snapshot import _load_ticker_map, build_snapshot, normalize_issuer_name
+from src.lqd_holdings import get_lqd_holdings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +63,7 @@ HEADERS = [
     "Issuer / company",
     "Issuer LEI",
     "Representative bond ISIN",
+    "LQD ticker suggestion",
     "Bond curve ticker (editable)",
     "Automated equity ticker candidate",
     "Equity ticker override",
@@ -79,6 +84,7 @@ TICKER_FIELD_INDEX = FIELDS.index("equity_ticker")
 TABLE_FIELDS = [
     "isin_count",
     *FIELDS[:3],
+    "lqd_ticker_suggestion",
     "bond_ticker",
     "automated_equity_ticker",
     "equity_ticker_override",
@@ -104,6 +110,72 @@ class CountTableWidgetItem(QTableWidgetItem):
         return int(self.data(Qt.ItemDataRole.UserRole) or 0) < int(
             other.data(Qt.ItemDataRole.UserRole) or 0
         )
+
+
+class LqdDownloadWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(get_lqd_holdings(isin_only=False))
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
+class NewLqdHoldingsDialog(QDialog):
+    """Review new ISINs from the latest LQD list before adding them locally."""
+
+    COLUMNS = ["Add", "ISIN", "Issuer", "Sector", "Coupon", "Maturity", "LQD ticker suggestion", "Bond curve ticker"]
+
+    def __init__(self, rows: list[dict[str, str]], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Review new LQD holdings")
+        self.resize(1300, 600)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"{len(rows):,} ISINs are in the latest LQD download but not in the current snapshot. "
+            "Review the suggested ticker, edit the bond curve ticker, and uncheck any rows to skip."
+        ))
+        self.table = QTableWidget(len(rows), len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.rows = rows
+        for row_index, row in enumerate(rows):
+            checkbox = QCheckBox()
+            checkbox.setChecked(True)
+            cell = QWidget()
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cell_layout.addWidget(checkbox)
+            self.table.setCellWidget(row_index, 0, cell)
+            for column, field in enumerate(("isin", "issuer_name", "sector", "coupon_pct", "maturity_date", "suggested_ticker", "bond_ticker"), start=1):
+                item = QTableWidgetItem(str(row.get(field, "")))
+                if field != "bond_ticker":
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(row_index, column, item)
+        self.table.resizeColumnsToContents()
+        self.table.setColumnWidth(2, 300)
+        self.table.setColumnWidth(6, 160)
+        self.table.setColumnWidth(7, 170)
+        layout.addWidget(self.table, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Append selected")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_rows(self) -> list[dict[str, str]]:
+        selected: list[dict[str, str]] = []
+        for row_index, row in enumerate(self.rows):
+            checkbox = self.table.cellWidget(row_index, 0).findChild(QCheckBox)
+            if checkbox and checkbox.isChecked():
+                updated = dict(row)
+                updated["bond_ticker"] = self.table.item(row_index, 7).text().strip().upper()
+                selected.append(updated)
+        return selected
 
 
 def _candidate_confidence(status: str) -> str:
@@ -139,7 +211,9 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
     for candidate in candidates.to_dict(orient="records"):
         name = candidate.get("issuer_name", "").strip()
         lei = candidate.get("issuer_lei", "").strip()
-        old = saved_by_lei.get(lei) or saved_by_name.get(normalize_issuer_name(name), {})
+        old_by_exact_name = saved_by_name.get(normalize_issuer_name(name), {})
+        old = saved_by_lei.get(lei) or old_by_exact_name
+        bond_ticker_source = old_by_exact_name if "bond_ticker" in old_by_exact_name else old
         candidate_status = candidate.get("mapping_status", "unresolved")
         auto_ticker = candidate.get("ticker_candidate", "").strip().upper()
         override = old.get("equity_ticker_override", "").strip().upper()
@@ -169,7 +243,8 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
             "issuer_name": name,
             "issuer_lei": lei,
             "representative_isin": candidate.get("representative_isin", ""),
-            "bond_ticker": old.get("bond_ticker", "").strip().upper(),
+            "lqd_ticker_suggestion": "",
+            "bond_ticker": bond_ticker_source.get("bond_ticker", "").strip().upper(),
             "automated_equity_ticker": auto_ticker,
             "equity_ticker_override": override,
             "equity_ticker": effective,
@@ -212,6 +287,7 @@ def load_mapping_records(candidates_path: Path = CANDIDATES_PATH, mappings_path:
                 "issuer_name": name,
                 "issuer_lei": old.get("issuer_lei", ""),
                 "representative_isin": old.get("representative_isin", ""),
+                "lqd_ticker_suggestion": "",
                 "bond_ticker": old.get("bond_ticker", ""),
                 "automated_equity_ticker": old.get("automated_equity_ticker", ""),
                 "equity_ticker_override": override,
@@ -312,12 +388,16 @@ class MappingWindow(QMainWindow):
             ["All snapshot tickers", "Missing snapshot ticker", "Has snapshot ticker"]
         )
         self.save_button = QPushButton("Save mappings")
+        self.suggestions_button = QPushButton("Refresh LQD ticker suggestions")
+        self.refresh_lqd_button = QPushButton("Review new LQD ISINs")
         self.dirty_label = QLabel()
         toolbar.addWidget(self.search, 1)
         toolbar.addWidget(self.status_filter)
         toolbar.addWidget(self.snapshot_filter)
         toolbar.addWidget(self.dirty_label)
         toolbar.addWidget(self.save_button)
+        toolbar.addWidget(self.suggestions_button)
+        toolbar.addWidget(self.refresh_lqd_button)
         layout.addLayout(toolbar)
         self.coverage_label = QLabel()
         layout.addWidget(self.coverage_label)
@@ -327,6 +407,7 @@ class MappingWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(HEADERS)
         header_tooltips = {
             "Bond curve ticker (editable)": "Primary issuer curve grouping ticker used by Nelson–Siegel. Edit this to assign bonds to a bond curve.",
+            "LQD ticker suggestion": "Ticker reported by iShares for this issuer's representative bond ISIN. This is a source suggestion, not a verified curve assignment.",
             "Automated equity ticker candidate": "Automated suggestion for the issuer or parent company's listed equity. Used separately when joining equity data.",
             "Equity ticker override": "Editable issuer-to-equity mapping. This value takes precedence over the automatic candidate.",
             "Final equity ticker": "Effective issuer equity ticker used when the bond snapshot is rebuilt.",
@@ -365,6 +446,8 @@ class MappingWindow(QMainWindow):
         self.status_filter.currentTextChanged.connect(self._apply_filters)
         self.snapshot_filter.currentTextChanged.connect(self._apply_filters)
         self.save_button.clicked.connect(self._save)
+        self.suggestions_button.clicked.connect(self._refresh_lqd_ticker_suggestions)
+        self.refresh_lqd_button.clicked.connect(self._review_new_lqd_holdings)
         self._set_dirty_state(False)
         self.statusBar().showMessage(
             f"ISIN counts are from snapshot date {snapshot_date}; build a new snapshot to refresh them."
@@ -394,6 +477,7 @@ class MappingWindow(QMainWindow):
         self.table.setColumnWidth(TABLE_FIELDS.index("issuer_name"), 260)
         self.table.setColumnWidth(TABLE_FIELDS.index("issuer_lei"), 190)
         self.table.setColumnWidth(TABLE_FIELDS.index("representative_isin"), 180)
+        self.table.setColumnWidth(TABLE_FIELDS.index("lqd_ticker_suggestion"), 150)
         self.table.setColumnWidth(TABLE_FIELDS.index("mapping_source"), 320)
         self.table.setColumnWidth(TABLE_FIELDS.index("notes"), 240)
         self.table.setColumnWidth(TABLE_FIELDS.index("snapshot_ticker"), 120)
@@ -570,6 +654,201 @@ class MappingWindow(QMainWindow):
         self._set_dirty_state(False)
         self.statusBar().showMessage(
             f"Saved current map and version {version_path.relative_to(ROOT)}", 7000
+        )
+
+    def _review_new_lqd_holdings(self) -> None:
+        if self.dirty_label.text() == "Unsaved changes":
+            QMessageBox.information(
+                self,
+                "Save mapping edits first",
+                "Save your current ticker edits before reviewing new LQD holdings.",
+            )
+            return
+        self._start_lqd_download("review")
+
+    def _start_lqd_download(self, purpose: str) -> None:
+        self.refresh_lqd_button.setEnabled(False)
+        self.suggestions_button.setEnabled(False)
+        self.statusBar().showMessage("Downloading the latest LQD holdings…")
+        worker = LqdDownloadWorker(self)
+        self._lqd_worker = worker
+        worker.completed.connect(lambda holdings: self._handle_lqd_download(purpose, holdings))
+        worker.failed.connect(lambda message: self._handle_lqd_download_error(message))
+        worker.start()
+
+    def _handle_lqd_download(self, purpose: str, holdings: pd.DataFrame) -> None:
+        try:
+            if purpose == "suggestions":
+                self._apply_lqd_ticker_suggestions(holdings)
+                return
+            candidates_path = ROOT / "data" / "issuer_ticker_candidates.csv"
+            lei_by_name: dict[str, str] = {}
+            if candidates_path.exists():
+                candidates = pd.read_csv(candidates_path, dtype="string").fillna("")
+                lei_by_name = dict(zip(candidates["issuer_name"], candidates["issuer_lei"]))
+            current_isins: set[str] = set()
+            if SNAPSHOT_PATH.exists():
+                current = pd.read_csv(SNAPSHOT_PATH, dtype="string").fillna("")
+                current_isins = set(current.get("isin", pd.Series(dtype="string")).str.strip().str.upper())
+
+            source = holdings.copy()
+            isin_col = next((column for column in source.columns if column.strip().upper() == "ISIN"), None)
+            name_col = next((column for column in source.columns if column.strip().casefold() == "name"), None)
+            ticker_col = next((column for column in source.columns if column.strip().casefold() == "ticker"), None)
+            if isin_col is None or name_col is None:
+                raise ValueError("The downloaded LQD table is missing its ISIN or Name column.")
+            source["_isin_key"] = source[isin_col].astype("string").str.strip().str.upper()
+            source = source[source["_isin_key"].ne("") & ~source["_isin_key"].isin(current_isins)]
+            if source.empty:
+                QMessageBox.information(self, "No new LQD ISINs", "The latest holdings contain no ISINs missing from the current snapshot.")
+                self.statusBar().showMessage("LQD holdings checked; no new ISINs found.", 7000)
+                return
+            new_holdings = source.drop(columns=["_isin_key"])
+            new_holdings.attrs["source_as_of_date"] = holdings.attrs.get("source_as_of_date") or ""
+            proposed = build_snapshot(new_holdings, {}, lei_by_name)
+            suggested_by_isin = dict(zip(
+                source["_isin_key"], source[ticker_col].astype("string").fillna("").str.strip().str.upper()
+            )) if ticker_col else {}
+            suggested_name = dict(zip(source["_isin_key"], source[name_col].astype("string").fillna("")))
+            suggestion_map: dict[str, str] = {}
+            for isin in source["_isin_key"]:
+                name = suggested_name.get(isin, "")
+                suggestion_map[isin] = suggested_by_isin.get(isin, "")
+            staged: list[dict[str, str]] = []
+            for row in proposed.to_dict(orient="records"):
+                isin = row["isin"]
+                suggestion = suggestion_map.get(isin, "")
+                row["suggested_ticker"] = suggestion
+                row["bond_ticker"] = suggestion
+                for field in ("coupon_pct",):
+                    row[field] = "" if pd.isna(row[field]) else str(row[field])
+                for field in ("maturity_date", "sector", "issuer_name"):
+                    row[field] = "" if pd.isna(row[field]) else str(row[field])
+                staged.append(row)
+            dialog = NewLqdHoldingsDialog(staged, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.statusBar().showMessage("LQD review cancelled; no snapshot or mapping changes saved.", 7000)
+                return
+            selected = dialog.selected_rows()
+            if not selected:
+                self.statusBar().showMessage("No rows selected; nothing appended.", 7000)
+                return
+            self._append_lqd_rows(selected, new_holdings, lei_by_name)
+        except Exception as error:
+            QMessageBox.critical(self, "Could not review LQD holdings", str(error))
+            self.statusBar().showMessage("Could not complete LQD review.", 7000)
+        finally:
+            self.refresh_lqd_button.setEnabled(True)
+            self.suggestions_button.setEnabled(True)
+
+    def _handle_lqd_download_error(self, message: str) -> None:
+        self.refresh_lqd_button.setEnabled(True)
+        self.suggestions_button.setEnabled(True)
+        QMessageBox.critical(self, "Could not download LQD holdings", message)
+        self.statusBar().showMessage("LQD download failed; the window is responsive and can be retried.", 8000)
+
+    def _refresh_lqd_ticker_suggestions(self) -> None:
+        self._start_lqd_download("suggestions")
+
+    def _apply_lqd_ticker_suggestions(self, holdings: pd.DataFrame) -> None:
+        try:
+            isin_column = next((column for column in holdings.columns if column.strip().upper() == "ISIN"), None)
+            ticker_column = next((column for column in holdings.columns if column.strip().casefold() == "ticker"), None)
+            if isin_column is None or ticker_column is None:
+                raise ValueError("The downloaded LQD table is missing its ISIN or Ticker column.")
+            suggestions = dict(zip(
+                holdings[isin_column].astype("string").fillna("").str.strip().str.upper(),
+                holdings[ticker_column].astype("string").fillna("").str.strip().str.upper(),
+            ))
+            suggestion_column = TABLE_FIELDS.index("lqd_ticker_suggestion")
+            isin_column_index = TABLE_FIELDS.index("representative_isin")
+            populated = 0
+            self._loading = True
+            for row in range(self.table.rowCount()):
+                isin = self.table.item(row, isin_column_index).text().strip().upper()
+                suggestion = suggestions.get(isin, "")
+                self.table.item(row, suggestion_column).setText(suggestion)
+                if suggestion:
+                    populated += 1
+            self._loading = False
+            self.statusBar().showMessage(
+                f"Loaded iShares ticker suggestions for {populated:,} of {self.table.rowCount():,} representative ISINs. "
+                "Review them before copying anything into Bond curve ticker.", 10000
+            )
+        except Exception as error:
+            self._loading = False
+            QMessageBox.critical(self, "Could not refresh LQD suggestions", str(error))
+            self.statusBar().showMessage("Could not refresh LQD ticker suggestions.", 7000)
+
+    def _append_lqd_rows(
+        self,
+        selected: list[dict[str, str]],
+        holdings: pd.DataFrame,
+        lei_by_name: dict[str, str],
+    ) -> None:
+        selected_by_isin = {row["isin"].strip().upper(): row for row in selected}
+        selected_names = {normalize_issuer_name(row["issuer_name"]): row for row in selected}
+        mappings = pd.read_csv(MAPPINGS_PATH, dtype="string").fillna("") if MAPPINGS_PATH.exists() else pd.DataFrame(columns=FIELDS)
+        for field in FIELDS:
+            if field not in mappings:
+                mappings[field] = ""
+        mappings["_normalized_name"] = mappings["issuer_name"].map(normalize_issuer_name)
+        for normalized_name, staged_row in selected_names.items():
+            name = staged_row["issuer_name"].strip()
+            mask = mappings["_normalized_name"] == normalized_name
+            if mask.any():
+                mappings.loc[mask, "bond_ticker"] = staged_row["bond_ticker"]
+            else:
+                new_record = {field: "" for field in FIELDS}
+                new_record.update({
+                    "issuer_name": name,
+                    "issuer_lei": lei_by_name.get(name, ""),
+                    "representative_isin": staged_row["isin"],
+                    "bond_ticker": staged_row["bond_ticker"],
+                    "candidate_status": "unresolved",
+                    "mapping_status": "unresolved",
+                    "review_status": "unresolved",
+                    "mapping_relationship": "issuer",
+                    "confidence": "unrated",
+                    "mapping_source": "LQD holdings review",
+                })
+                mappings = pd.concat([mappings, pd.DataFrame([new_record])], ignore_index=True)
+        mappings = mappings.drop(columns=["_normalized_name"], errors="ignore")
+        # Keep the legacy columns first for the snapshot builder and existing tools.
+        leading = ["issuer_name", "equity_ticker", "mapping_source", "review_status"]
+        mappings = mappings[[*leading, *[field for field in mappings.columns if field not in leading]]]
+        with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", suffix=".csv", delete=False) as temp:
+            staged_map_path = Path(temp.name)
+            mappings.to_csv(temp, index=False, na_rep="")
+        try:
+            ticker_map = _load_ticker_map(staged_map_path)
+        finally:
+            staged_map_path.unlink(missing_ok=True)
+        fresh = build_snapshot(holdings, ticker_map, lei_by_name)
+        fresh = fresh[fresh["isin"].isin(selected_by_isin)].copy()
+        for index, row in fresh.iterrows():
+            reviewed = selected_by_isin[row["isin"]]
+            fresh.at[index, "bond_ticker"] = reviewed["bond_ticker"]
+        if SNAPSHOT_PATH.exists():
+            existing = pd.read_csv(SNAPSHOT_PATH, dtype="string").fillna("")
+            existing = existing[~existing["isin"].isin(selected_by_isin)]
+            combined = pd.concat([existing, fresh], ignore_index=True)
+        else:
+            combined = fresh
+        for column in fresh.columns:
+            if column not in combined:
+                combined[column] = ""
+        combined = combined[fresh.columns].sort_values("isin").reset_index(drop=True)
+        _atomic_csv(mappings, MAPPINGS_PATH)
+        _atomic_csv(combined, SNAPSHOT_PATH)
+        self.records = load_mapping_records()
+        self.table.setRowCount(len(self.records))
+        self._populate_table()
+        _, _, self.snapshot_tickers = _load_snapshot_details()
+        self._update_snapshot_coverage()
+        self.statusBar().showMessage(
+            f"Appended {len(fresh):,} new LQD ISINs and saved their issuer bond tickers. "
+            "Use Save mappings to retain the changes in the mapping version history.", 10000
         )
 
 

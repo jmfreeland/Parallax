@@ -134,8 +134,10 @@ fits and diagnostics.
 
 In the issuer mapping table, edit **Bond curve ticker** as the primary grouping
 key. **Equity ticker** remains separate and is used to link bonds to issuer
-equity data. Save the map, rebuild the bond snapshot, and refresh the TRACE
-preprocessed dataset before recalculating signal inputs.
+equity data. Save the map and rebuild the bond snapshot. Then use **Calculate
+inputs** for each signal model whose Nelson–Siegel inputs should use the new
+grouping. TRACE preprocessing is only needed to refresh bond ticker labels in
+the enriched TRACE history views; downloading TRACE again is not required.
 
 After fitting, use the **Curve explorer** tab to choose a fitted ticker. The
 upper chart overlays observed bond yields with the fitted curve; the lower chart

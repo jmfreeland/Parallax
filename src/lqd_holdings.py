@@ -53,7 +53,7 @@ def get_lqd_holdings(isin_only: bool = True) -> pd.DataFrame:
     response = requests.get(
         HOLDINGS_URL,
         headers={"User-Agent": "Mozilla/5.0 (compatible; LQD-holdings-fetcher/1.0)"},
-        timeout=30,
+        timeout=(5, 15),
     )
     response.raise_for_status()
     response.encoding = response.apparent_encoding or "utf-8"

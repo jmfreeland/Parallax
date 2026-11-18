@@ -10,11 +10,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import duckdb
+
 from .signal_evaluation import evaluate_nelson_siegel_signal
 from .strategy import Strategy, evaluate_strategy_nodes
 
 
-STRATEGY_INPUT_CACHE_VERSION = 2
+STRATEGY_INPUT_CACHE_VERSION = 3
 STRATEGY_RUNS_DIR = Path(__file__).resolve().parents[1] / "data" / "strategies" / "runs"
 
 
@@ -59,6 +61,47 @@ def _signal_calculation_signature(signal: Any) -> str:
     return _digest(definition)
 
 
+def _load_reversal_flags(parameters: Mapping[str, Any], required: bool) -> dict[str, dict[str, list[str]]]:
+    """Read retrospective reversal labels from the selected cleaned TRACE file."""
+    if not required:
+        return {}
+    if parameters.get("data_source") != "cleaned_parquet":
+        raise ValueError(
+            "The reversal filter node requires Cleaned Parquet TRACE data, which contains the "
+            "confirmed price/yield reversal flags."
+        )
+    path = Path(parameters.get("data_path", "")).expanduser()
+    if not path.is_file():
+        raise ValueError("The cleaned TRACE dataset for the reversal filter is unavailable.")
+    connection = duckdb.connect(":memory:")
+    try:
+        query = """SELECT upper(isin), cast(trade_date AS VARCHAR),
+                          bool_or(coalesce(price_series_clean_action = 'reversal_spike_flagged', false)),
+                          bool_or(coalesce(yield_series_clean_action = 'reversal_spike_flagged', false))
+                   FROM read_parquet(?)
+                   WHERE trade_date BETWEEN ? AND ?
+                   GROUP BY upper(isin), trade_date"""
+        rows = connection.execute(
+            query,
+            [str(path), parameters["start_date"], parameters["end_date"]],
+        ).fetchall()
+    except duckdb.Error as error:
+        raise ValueError(
+            "The selected cleaned TRACE dataset does not include reversal labels. "
+            "Run the TRACE cleaner and select its cleaned Parquet output."
+        ) from error
+    finally:
+        connection.close()
+    flags: dict[str, dict[str, list[str]]] = {}
+    for isin, observed_date, price_flag, yield_flag in rows:
+        day = flags.setdefault(str(observed_date), {"price": [], "yield": []})
+        if price_flag:
+            day["price"].append(str(isin))
+        if yield_flag:
+            day["yield"].append(str(isin))
+    return flags
+
+
 def run_strategy_signals(
     strategy: Strategy,
     evaluation_parameters: Mapping[str, Any],
@@ -78,6 +121,11 @@ def run_strategy_signals(
     base_parameters = dict(evaluation_parameters)
     if "start_date" not in base_parameters or "end_date" not in base_parameters:
         raise ValueError("Strategy runs require start_date and end_date")
+    needs_reversal_flags = any(
+        node.transform.get("type") == "exclude_reversal_spikes"
+        for node in strategy.transformer_nodes
+    )
+    reversal_flags = _load_reversal_flags(base_parameters, needs_reversal_flags)
     score_rows: dict[str, list[dict[str, Any]]] = {}
     cache_path = Path(cache_path)
     old_cache: dict[str, Any] = {}
@@ -149,6 +197,8 @@ def run_strategy_signals(
         "signal_definitions": signal_definitions,
         "evaluation_parameters": _json_value(base_parameters),
         "signals": score_rows,
+        "reversal_flags": reversal_flags,
+        "reversal_filter_available": needs_reversal_flags,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,6 +220,10 @@ def recombine_cached_signals(
     }
     if cache.get("cache_schema_version") != STRATEGY_INPUT_CACHE_VERSION:
         raise ValueError("Unsupported strategy signal cache version")
+    if (any(node.transform.get("type") == "exclude_reversal_spikes"
+            for node in strategy.transformer_nodes)
+            and not cache.get("reversal_filter_available", False)):
+        raise ValueError("Cached inputs do not include reversal flags; recalculate strategy inputs.")
     cached_signatures = cache.get("signal_signatures", {})
     cached_signal_ids = set(cache.get("signals", {}))
     expected_signal_ids = {signal.signal_id for signal in strategy.signals}
@@ -190,7 +244,12 @@ def recombine_cached_signals(
     ordered_dates = sorted(by_date)
     for index, as_of_date in enumerate(ordered_dates, start=1):
         date_scores = by_date[as_of_date]
-        node_scores = evaluate_strategy_nodes(strategy, date_scores)
+        cached_flags = cache.get("reversal_flags", {}).get(as_of_date, {})
+        node_scores = evaluate_strategy_nodes(
+            strategy,
+            date_scores,
+            reversal_flags={field: set(isins) for field, isins in cached_flags.items()},
+        )
         combined = node_scores[strategy.output_node_id]
         isins = set().union(*(set(values) for values in node_scores.values()), set(combined))
         for isin in sorted(isins):
@@ -221,6 +280,10 @@ def cached_input_status(strategy: Strategy, cache_path: Path) -> tuple[str, int]
         return "Cache unreadable", 0
     signal_ids = {signal.signal_id for signal in strategy.signals}
     if cache.get("cache_schema_version") != STRATEGY_INPUT_CACHE_VERSION:
+        return "Needs recalculation", 0
+    if (any(node.transform.get("type") == "exclude_reversal_spikes"
+            for node in strategy.transformer_nodes)
+            and not cache.get("reversal_filter_available", False)):
         return "Needs recalculation", 0
     if set(cache.get("signals", {})) != signal_ids:
         return "Needs recalculation", 0

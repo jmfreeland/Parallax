@@ -63,7 +63,7 @@ def _numeric(series: pd.Series) -> pd.Series:
 
 
 def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str, str, str, str]]:
-    """Load mappings by LEI, falling back to normalized issuer name."""
+    """Load exact issuer-name mappings and only unambiguous LEI fallbacks."""
     if not path.exists():
         return {}
     mappings = pd.read_csv(path, dtype="string").fillna("")
@@ -73,14 +73,16 @@ def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str, str, str, str
         raise ValueError(f"Ticker map is missing required columns: {', '.join(sorted(missing))}")
 
     result: dict[str, tuple[str, str, str, str, str, str]] = {}
+    lei_rows: dict[str, list[tuple[str, str, str, str, str, str]]] = {}
     for row in mappings.to_dict(orient="records"):
         lei = row.get("issuer_lei", "").strip().upper()
-        key = f"LEI:{lei}" if lei else f"NAME:{normalize_issuer_name(row['issuer_name'])}"
+        normalized_name = normalize_issuer_name(row["issuer_name"])
+        name_key = f"NAME:{normalized_name}"
         ticker = row["equity_ticker"].strip().upper()
         status = row["review_status"].strip().casefold()
         equity_is_valid = bool(ticker) and status in {"reviewed", "automated_exact_entity_match"}
         bond_ticker = row.get("bond_ticker", "").strip().upper()
-        if not key or not (equity_is_valid or bond_ticker):
+        if not normalized_name or not (equity_is_valid or bond_ticker):
             continue
         current = (
             ticker if equity_is_valid else "",
@@ -90,16 +92,16 @@ def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str, str, str, str
             row.get("equity_country", "").strip(),
             bond_ticker,
         )
-        if key in result:
-            previous = result[key]
+        if name_key in result:
+            previous = result[name_key]
             if previous[0] and current[0] and previous[0] != current[0]:
-                raise ValueError(f"Conflicting ticker mappings for the same issuer identity: {row['issuer_name']!r}.")
+                raise ValueError(f"Conflicting equity ticker mappings for issuer {row['issuer_name']!r}.")
             if previous[5] and current[5] and previous[5] != current[5]:
-                raise ValueError(f"Conflicting bond curve tickers for the same issuer identity: {row['issuer_name']!r}.")
+                raise ValueError(f"Conflicting bond curve tickers for issuer {row['issuer_name']!r}.")
             prefer_current_equity = bool(current[0]) and (
                 not previous[0] or (current[2] == "reviewed" and previous[2] != "reviewed")
             )
-            result[key] = (
+            result[name_key] = (
                 current[0] if prefer_current_equity else previous[0],
                 current[1] if prefer_current_equity else previous[1],
                 current[2] if prefer_current_equity else previous[2],
@@ -107,8 +109,21 @@ def _load_ticker_map(path: Path) -> dict[str, tuple[str, str, str, str, str, str
                 current[4] if prefer_current_equity else previous[4],
                 current[5] or previous[5],
             )
-            continue
-        result[key] = current
+        else:
+            result[name_key] = current
+        if lei:
+            lei_rows.setdefault(lei, []).append(current)
+
+    for lei, rows in lei_rows.items():
+        equities = {row[0] for row in rows if row[0]}
+        if len(equities) > 1:
+            raise ValueError(f"Conflicting equity ticker mappings for LEI {lei}.")
+        selected = next((row for row in rows if row[0]), rows[0])
+        bond_tickers = {row[5] for row in rows if row[5]}
+        result[f"LEI:{lei}"] = (
+            selected[0], selected[1], selected[2], selected[3], selected[4],
+            next(iter(bond_tickers)) if len(bond_tickers) == 1 else "",
+        )
     return result
 
 
@@ -133,11 +148,33 @@ def build_snapshot(
     result["issuer_name"] = bonds["Name"].astype("string").str.strip()
     result["issuer_lei"] = result["issuer_name"].map(issuer_lei_by_name or {}).fillna("")
     source_bond_ticker = bonds["Ticker"].astype("string").str.strip() if "Ticker" in bonds else pd.Series("", index=bonds.index, dtype="string")
-    identity_keys = result.apply(
-        lambda row: f"LEI:{row['issuer_lei']}" if row["issuer_lei"] else f"NAME:{normalize_issuer_name(row['issuer_name'])}",
-        axis=1,
+    name_keys = result["issuer_name"].map(
+        lambda name: f"NAME:{normalize_issuer_name(name)}"
     )
-    matched = identity_keys.map(ticker_map)
+    lei_keys = result["issuer_lei"].map(
+        lambda lei: f"LEI:{str(lei).strip().upper()}" if lei else ""
+    )
+    name_matches = name_keys.map(ticker_map)
+    lei_matches = lei_keys.map(ticker_map)
+    matched = pd.Series(index=result.index, dtype=object)
+    for index in result.index:
+        exact = name_matches.at[index]
+        fallback = lei_matches.at[index]
+        equity_match = exact if isinstance(exact, tuple) and exact[0] else fallback
+        if not isinstance(equity_match, tuple):
+            equity_match = exact if isinstance(exact, tuple) else fallback
+        bond_ticker = (
+            exact[5] if isinstance(exact, tuple) and exact[5]
+            else fallback[5] if isinstance(fallback, tuple) else ""
+        )
+        if isinstance(equity_match, tuple):
+            matched.at[index] = (*equity_match[:5], bond_ticker)
+        elif isinstance(exact, tuple):
+            matched.at[index] = (*exact[:5], bond_ticker)
+        elif isinstance(fallback, tuple):
+            matched.at[index] = (*fallback[:5], bond_ticker)
+        else:
+            matched.at[index] = None
     mapped_bond_ticker = matched.map(
         lambda item: item[5] if isinstance(item, tuple) and len(item) > 5 else ""
     )
