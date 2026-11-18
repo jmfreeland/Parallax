@@ -20,6 +20,7 @@ from .strategy_run import (
     run_saved_strategy, saved_strategy_info, strategy_cache_path,
     strategy_results_path, stable_strategy_id,
 )
+from .version import version_label
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QThread, Qt, Signal
 from PySide6.QtGui import QTextCursor
@@ -122,7 +123,8 @@ class SavedStrategyRunner(QThread):
 class LauncherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Parallax")
+        self.version = version_label()
+        self.setWindowTitle(f"Parallax · {self.version}")
         self.resize(1500, 760)
         self.process: QProcess | None = None
         self.dependency_checker: DependencyChecker | None = None
@@ -130,7 +132,7 @@ class LauncherWindow(QMainWindow):
 
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.addWidget(QLabel("LQD research tools"))
+        layout.addWidget(QLabel(f"LQD research tools · {self.version}"))
         self.buttons: list[QPushButton] = []
 
         self.status = QLabel("Ready")
@@ -465,7 +467,7 @@ class LauncherWindow(QMainWindow):
             except (OSError, json.JSONDecodeError):
                 download = {}
 
-        lines = ["Most recent successful holdings download"]
+        lines = [f"Application version: {self.version}", "", "Most recent successful holdings download"]
         if download:
             lines.extend(
                 [
