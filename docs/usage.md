@@ -39,6 +39,8 @@ an empty suggestion is not evidence that a bond has no market ticker.
 
 Automatic mappings are limited to unique, exact legal-entity matches. Parent and ambiguous matches are review candidates, never automatic assignments.
 
+For an auditable snapshot, treat the four launcher steps as one review cycle: do not replace the holdings file between candidate review and final build without repeating the review. The current CSV is overwritten on rebuild; record its source-as-of date and a content hash with any downstream TRACE or signal run.
+
 ## TRACE history
 
 Create or resume a run in **Download TRACE history**. The downloader derives a CUSIP only from US ISINs; correct or supply other CUSIPs in the GUI before retrying. It stores run status and normalized raw observations in `data/trace/history.duckdb`, then writes a run export under `data/trace/parquet/`.
