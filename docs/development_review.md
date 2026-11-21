@@ -1,4 +1,4 @@
-# Development review — 16 November 2026
+# Development review — 21 November 2026
 
 Parallax now has versioned TRACE data, G-spread snapshots, exploratory portfolios, and walk-forward signal research. Those additions improve lineage, but default input selection still prevents a result being reproducible unless every input is pinned.
 
@@ -6,10 +6,10 @@ Parallax now has versioned TRACE data, G-spread snapshots, exploratory portfolio
 
 | Priority | Finding | Evidence and consequence | Recommended correction |
 |---|---|---|---|
-| P0 | Strategy graph combination can fail on valid transformed/nested branches. | `combine_signal_scores` looks up `component_weights[input_id]` before evaluating source transformer or nested-combiner nodes, although weights are only propagated during evaluation. This can raise `KeyError`; direct leaves are the only presently reliable combiner inputs. | Evaluate source maps before resolving weights and make weights explicit at each node; test direct, transformed, nested, missing-score, and negative-weight graphs. |
 | P0 | Strategy cache signatures do not hash file contents. | The cache hashes parameter paths and dates, not the contents of CSV/Parquet inputs. Replacing a file in place can reuse stale component scores. | Hash all immutable input bytes/manifests in the cache key and save a ResearchRun manifest alongside the cache. |
 | P0 | Signal evaluation defaults to mutable “latest” artifacts. | Cleaned Parquet is selected by modification time; G-spread and financing inputs select their latest snapshots. Inputs may therefore represent different TRACE or curve vintages and re-runs can differ. | Require a ResearchRun manifest: dataset hash, TRACE run, clean ID, G-spread snapshot, curve vintage, bond-list hash, policies, parameters, and output hashes. Keep “latest” explicitly exploration-only. |
-| P0 | Some return/raw-history paths still read \`observations\`, the latest-value compatibility table. | New TRACE values append to \`trace_observation_versions\`, but raw-DuckDB evaluation and total-return routines query \`observations\`. Later vendor corrections can change retrospective results. | Route all analytical reads through a pinned as-of/run version view; mark pre-migration records as latest-value-only. |
+| P0 | Some return/raw-history paths still read `observations`, the latest-value compatibility table. | New TRACE values append to `trace_observation_versions`, but raw-DuckDB evaluation and total-return routines query `observations`. Later vendor corrections can change retrospective results. | Route all analytical reads through a pinned as-of/run version view; mark pre-migration records as latest-value-only. |
+| P1 | Nested strategy-graph weights are implicit. | A transformed branch inherits its source component’s weight, while a nested-combiner output receives weight 1.0 at its parent. The strategy JSON cannot state a distinct branch/edge weight, so graph nesting can alter economic contribution without an explicit allocation. | Add explicit edge weights to combiner inputs, export effective leaf weights per date, and test graph-equivalent constructions. |
 | P1 | Snapshot workflow has no immutable baseline-to-final lineage. | The guided sequence builds a baseline CSV, generates issuer candidates, then fetches holdings again and overwrites the same final CSV. A holding can enter/leave between calls and no source-file hash, mapping-file hash, or candidate baseline ID is persisted with the final snapshot. | Archive raw holdings under a content hash and write a manifest naming raw-holdings hash/date, candidate artifact hash, mapping hash, and final snapshot hash. Warn when final-universe membership differs from the reviewed baseline. |
 | P1 | Viewer “momentum” and “volatility” are still level statistics. | 63/252-row calculations use group price/yield levels, and their calendar horizon changes with UI interval. | Rename to level change/dispersion; calculate daily return and risk measures in research, then aggregate. |
 | P1 | Signal outcomes intentionally use different estimands. | Nelson–Siegel outcomes are cross-sectionally demeaned; percentile outcomes are raw. Yield/spread changes reverse sign; price uses log returns. | Preserve the distinctions but include them in titles/exports; prohibit pooled comparison across estimands without a common target. |
@@ -21,9 +21,9 @@ Parallax now has versioned TRACE data, G-spread snapshots, exploratory portfolio
 
 ## Architecture priorities
 
-1. Create one immutable \`ResearchRun\` resolver used by every evaluator, portfolio report, and export.
+1. Create one immutable `ResearchRun` resolver used by every evaluator, portfolio report, and export.
 2. Separate repositories (TRACE versions, curves, spreads, manifests) from pure calculations and Qt UI clients.
-3. Consolidate repeated latest-snapshot lookup into explicit \`exploratory_latest\` and \`pinned\` modes.
+3. Consolidate repeated latest-snapshot lookup into explicit `exploratory_latest` and `pinned` modes.
 4. Promote typed models for attributes, observations, quality flags, signals, returns, and portfolio legs.
 5. Continue the package extraction described in [architecture.md](architecture.md), with unit and integration tests.
 
@@ -46,8 +46,9 @@ Parallax now has versioned TRACE data, G-spread snapshots, exploratory portfolio
 - Exports identify raw versus demeaned outcomes.
 - Tail membership, equal weights, missing-price policy, financing coverage, and maturity handling are deterministic.
 - Changing UI interval never changes a research signal’s economic horizon.
+- Nested and flattened strategy graphs report equivalent effective leaf weights when their allocations are equivalent.
 - Pre-migration observations are clearly marked as not vintage-reproducible.
 
 ## Recommended sequence
 
-Ship pinned ResearchRun manifests and versioned analytical reads first. Next add authoritative historical attributes and validate Treasury interpolation and total-return fixtures. Only then use walk-forward results for model selection, transaction-cost modelling, or portfolio construction.
+Ship pinned ResearchRun manifests and versioned analytical reads first. Next add authoritative historical attributes and validate Treasury interpolation and total-return fixtures. Then make strategy-combiner edge weights explicit. Only then use walk-forward results for model selection, transaction-cost modelling, or portfolio construction.
