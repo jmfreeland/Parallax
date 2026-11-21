@@ -31,11 +31,11 @@ Never combine raw yield, G-spread, and price scores without an explicit normaliz
 
 Before interpreting a combined score, record the strategy JSON/hash, component input hashes, TRACE/clean dataset, G-spread snapshot and curve vintage, bond-list hash, as-of date, transform parameters, missing-score policy, and cache signature.
 
-## Current implementation limitation
+## Nested-graph weight semantics
 
-Nested graphs are not yet safe. In `combine_signal_scores`, a combiner constructs its input-weight lookup before evaluating transformer or nested-combiner branches. Such branches do not yet have a propagated `component_weights` entry, despite the following comment saying they should. A valid graph containing a transform or nested combiner can therefore raise `KeyError`.
+Transformed inputs are evaluated before their combiner resolves weights, so transformed and nested branches can be evaluated safely. A transform inherits the weight of the component feeding it. A nested combiner, however, becomes a unit-weight input to its parent. There is no separate edge or branch-weight field in the strategy schema.
 
-Until corrected, use only direct signal-to-combiner connections. The fix is to evaluate all source maps first, then derive each input's propagated weight (or, preferably, make node weights explicit rather than inheriting component weights).
+This makes nesting economically meaningful: an inner combiner may use component weights, while its output is given equal unit weight alongside the parent’s other inputs. Treat the tree shape as part of the allocation specification. Until edge weights and an effective-leaf-weight export exist, keep graphs shallow and verify the score contribution of every branch on representative dates.
 
 ## Research limitations
 
